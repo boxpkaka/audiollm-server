@@ -1,28 +1,36 @@
 /**
  * Emotion recognition panel (independent of the main ASR pipeline).
  *
- * Flow: click Start -> open WS to /emotion-streaming at 16 kHz -> stream PCM
- * -> click Stop -> send {type:"stop"} -> render the single final_emotion reply.
+ * Flow: click Start -> record 16 kHz PCM in the browser -> click Stop ->
+ * POST /api/emotion-spec/jobs (async) -> poll until final_emotion.
+ *
+ * Backend selection: this page targets the AmphionSPEC checkpoint
+ * (cfg.emotion_spec_vllm_*) via /api/emotion-spec/jobs. It exposes ``ser``
+ * (8-way classification) and ``sepc`` (free-form paralinguistic
+ * description) modes. The legacy ``/api/emotion/jobs`` endpoint and the
+ * older SEC mode are still available server-side (used by
+ * /api/audio/analyze and the ASR-page emotion overlay) but no longer
+ * accessible from this UI.
  *
  * Capture warm-up (mic + AudioContext + worklet) is kept alive across
  * sessions so successive Start clicks skip getUserMedia / worklet load. An
  * idle timer (IDLE_RELEASE_MS) releases the warm capture if the panel is
  * left untouched, so the browser's mic indicator doesn't stay on forever.
- *
- * The server does not resample /emotion-streaming input, so the capture
- * AudioContext is forced to 16 kHz. The shared audio-capture-processor
- * worklet is sample-rate agnostic (it groups samples by count, not duration),
- * so we reuse it here.
  */
 (() => {
   'use strict';
+
+  // The emotion page now targets the AmphionSPEC backend. Kept as a
+  // module-level constant so both the live-mic and upload flows agree
+  // on which queue they're feeding.
+  const EMOTION_ENDPOINT = '/api/emotion-spec/jobs';
 
   // Emotion demo page module.
   //
   // Wrapped in an ``init`` factory so the SPA router can mount and tear
   // down this page repeatedly within a single document. ``init``
   // returns a ``dispose`` callback the router calls before swapping the
-  // page out — that aborts uploads, closes the WS, releases the
+  // page out — that aborts in-flight jobs/uploads, releases the
   // microphone + AudioContext, cancels the idle-release timer, and
   // unsubscribes from i18n change events.
   function initEmotion() {
@@ -31,7 +39,10 @@
     const onLangChange = (fn) => (i18n ? i18n.onChange(fn) : () => {});
     let i18nUnsub = null;
 
-  const MODE_LABEL_KEYS = { ser: 'emotion.mode.tag.ser', sec: 'emotion.mode.tag.sec' };
+  // SER stays as the 8-way taxonomy label; SEPC replaces the legacy SEC
+  // mode because the AmphionSPEC backend (which this page now targets) is
+  // trained with the literal ``sepc`` prompt token (see backend/emotion_spec).
+  const MODE_LABEL_KEYS = { ser: 'emotion.mode.tag.ser', sepc: 'emotion.mode.tag.sepc' };
   const modeTag = (mode) => t(MODE_LABEL_KEYS[mode] || 'emotion.mode.tag.ser', {
     defaultValue: (mode || 'ser').toUpperCase(),
   });
@@ -62,10 +73,14 @@
   let isCaptureWarm = false;
   let isGraphAttached = false;
 
-  let ws = null;
   let isRecording = false;
-  let awaitingFinal = false;
+  let isJobRunning = false;
+  let jobController = null;
+  let recordChunks = [];
+  let recordSampleCount = 0;
   let idleReleaseTimer = null;
+  const EMOTION_JOB_POLL_MS = 400;
+  const EMOTION_JOB_MAX_WAIT_MS = 45000;
 
   // Last-known UI state so we can re-derive labels on language change.
   let currentStatus = { state: 'idle', labelKey: 'emotion.status.idle', labelVars: null };
@@ -87,9 +102,7 @@
   const uploadInput = document.getElementById('upload-input');
   const uploadStatus = document.getElementById('upload-status');
 
-  // Upload state. The upload path is now a one-shot REST POST against
-  // /api/emotion/upload, so all we track is whether one is in flight (to
-  // gate the mic button) plus the dynamic status text for re-rendering.
+  // Upload / async job state (shared POST /api/emotion/jobs + poll).
   let isUploading = false;
   let uploadController = null;     // AbortController for in-flight fetch
   let currentUploadDyn = null;     // { key, vars } | null when hidden
@@ -182,7 +195,7 @@
     const durTag = duration > 0 ? duration.toFixed(2) + 's' : '—';
 
     let body = '';
-    if (mode === 'sec') {
+    if (mode === 'sepc') {
       const caption = text || t('emotion.result.empty');
       const labelHint = label
         ? '<div class="mt-2 text-[11px] text-muted">'
@@ -243,7 +256,7 @@
       const ss = String(entry.ts.getSeconds()).padStart(2, '0');
       const tag = modeTag(entry.mode);
       const durTag = entry.duration > 0 ? entry.duration.toFixed(2) + 's' : '—';
-      const primary = entry.mode === 'sec'
+      const primary = entry.mode === 'sepc'
         ? (entry.text || t('emotion.result.empty'))
         : (entry.label || entry.text || t('emotion.result.unparsed'));
       return (
@@ -288,15 +301,11 @@
 
     workletNode.port.onmessage = (evt) => {
       if (!isRecording) return;
-      if (!ws || ws.readyState !== WebSocket.OPEN) return;
       if (evt.data.type !== 'audio') return;
       const float32 = evt.data.samples;
-      const int16 = new Int16Array(float32.length);
-      for (let i = 0; i < float32.length; i++) {
-        const s = Math.max(-1, Math.min(1, float32[i]));
-        int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-      }
-      ws.send(int16.buffer);
+      if (!float32 || !float32.length) return;
+      recordChunks.push(new Float32Array(float32));
+      recordSampleCount += float32.length;
     };
 
     isCaptureWarm = true;
@@ -343,7 +352,7 @@
     if (!isCaptureWarm) return;
     idleReleaseTimer = setTimeout(() => {
       idleReleaseTimer = null;
-      if (!isRecording && !awaitingFinal && !ws) {
+      if (!isRecording && !isJobRunning) {
         releaseCapture();
         setIdleStatus();
       }
@@ -357,20 +366,23 @@
     }
   }
 
-  // --- WebSocket lifecycle ------------------------------------------------
+  function clearRecordingBuffer() {
+    recordChunks = [];
+    recordSampleCount = 0;
+  }
 
-  function closeWsSilently() {
-    if (!ws) return;
-    try {
-      ws.onopen = null;
-      ws.onclose = null;
-      ws.onerror = null;
-      ws.onmessage = null;
-      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-        ws.close();
-      }
-    } catch (_) { /* ignore */ }
-    ws = null;
+  function mergeRecordedPcm() {
+    if (recordSampleCount <= 0) {
+      return new Float32Array(0);
+    }
+    const merged = new Float32Array(recordSampleCount);
+    let offset = 0;
+    for (let i = 0; i < recordChunks.length; i++) {
+      const chunk = recordChunks[i];
+      merged.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return merged;
   }
 
   function finishSession({
@@ -381,9 +393,13 @@
     releaseNow = false,
   } = {}) {
     isRecording = false;
-    awaitingFinal = false;
+    isJobRunning = false;
     detachGraph();
-    closeWsSilently();
+    clearRecordingBuffer();
+    if (jobController) {
+      try { jobController.abort(); } catch (_) { /* ignore */ }
+      jobController = null;
+    }
     setButton('idle');
     if (reasonKey) {
       currentResult = { kind: 'placeholder', key: reasonKey, vars: reasonVars };
@@ -405,47 +421,60 @@
     }
   }
 
-  function handleServerMessage(data) {
-    if (!data || typeof data !== 'object') return;
-    if (data.type === 'ready') {
-      const startMsg = {
-        type: 'start',
-        format: 'pcm_s16le',
-        sample_rate_hz: 16000,
-        channels: 1,
-        mode: modeSelect.value || 'ser',
-      };
-      ws.send(JSON.stringify(startMsg));
-      isRecording = true;
-      setStatus('listening', 'emotion.status.listening');
-      setButton('recording');
-      currentResult = { kind: 'placeholder', key: 'emotion.result.speakNow' };
-      resultBox.innerHTML =
-        '<span class="text-faint">' + escapeHtml(t('emotion.result.speakNow')) + '</span>';
-    } else if (data.type === 'final_emotion') {
-      renderResult(data);
-      pushHistory(data);
-      finishSession({ state: 'done', labelKey: 'emotion.status.done' });
-    } else if (data.type === 'error') {
-      const msg = data.message || t('emotion.error.unknown');
-      finishSession({
-        reasonKey: 'emotion.error.serverPrefix',
-        reasonVars: { msg },
-        state: 'error',
-        labelKey: 'emotion.status.error',
+  async function runEmotionJob(wavBytes, { trimmedNote = null } = {}) {
+    const upload = window.AmphionAudioUpload;
+    if (!upload || !upload.submitEmotionJobAndPoll) {
+      throw new Error('emotion job API unavailable');
+    }
+    isJobRunning = true;
+    jobController = new AbortController();
+    setButton('waiting');
+    setStatus('analyzing', 'emotion.status.analyzing');
+    currentResult = { kind: 'placeholder', key: 'emotion.result.analyzing' };
+    resultBox.innerHTML =
+      '<span class="text-faint">' + escapeHtml(t('emotion.result.analyzing')) + '</span>';
+    btn.disabled = true;
+
+    let result;
+    try {
+      result = await upload.submitEmotionJobAndPoll(
+        wavBytes,
+        { mode: modeSelect.value || 'ser' },
+        {
+          endpoint: EMOTION_ENDPOINT,
+          signal: jobController.signal,
+          pollIntervalMs: EMOTION_JOB_POLL_MS,
+          maxWaitMs: EMOTION_JOB_MAX_WAIT_MS,
+        },
+      );
+    } finally {
+      jobController = null;
+      isJobRunning = false;
+    }
+
+    renderResult(result);
+    pushHistory(result);
+    setStatus('done', 'emotion.status.done');
+    setIdleStatus();
+    setButton('idle');
+    btn.disabled = isUploading;
+    if (trimmedNote !== null && uploadStatus) {
+      setUploadStatus('warn', 'emotion.upload.trimmed', {
+        max: EMOTION_UPLOAD_MAX_SECONDS,
+        actual: trimmedNote,
       });
     }
   }
 
   async function start() {
-    if (isRecording || awaitingFinal || ws) return;
+    if (isRecording || isJobRunning || isUploading) return;
     cancelIdleRelease();
     setButton(isCaptureWarm ? 'connecting' : 'opening');
     btn.disabled = true;
-    setStatus('analyzing', 'emotion.status.connecting');
     const placeholderKey = isCaptureWarm
       ? 'emotion.result.connecting'
       : 'emotion.result.opening';
+    setStatus('ready', isCaptureWarm ? 'emotion.status.ready' : 'emotion.status.idle');
     currentResult = { kind: 'placeholder', key: placeholderKey };
     resultBox.innerHTML =
       '<span class="text-faint">' + escapeHtml(t(placeholderKey)) + '</span>';
@@ -463,68 +492,48 @@
       });
       return;
     }
+
+    clearRecordingBuffer();
     attachGraph();
-
-    try {
-      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      ws = new WebSocket(proto + '//' + location.host + '/emotion-streaming');
-      ws.binaryType = 'arraybuffer';
-    } catch (err) {
-      const msg = err && err.message ? err.message : String(err);
-      finishSession({
-        reasonKey: 'emotion.error.ws',
-        reasonVars: { msg },
-        state: 'error',
-        labelKey: 'emotion.status.wsErr',
-      });
-      return;
-    }
-
-    ws.onmessage = (evt) => {
-      try {
-        handleServerMessage(JSON.parse(evt.data));
-      } catch (_) { /* non-JSON frames are ignored */ }
-    };
-    ws.onerror = () => {
-      if (awaitingFinal || isRecording) {
-        finishSession({
-          reasonKey: 'emotion.error.wsGeneric',
-          state: 'error',
-          labelKey: 'emotion.status.wsErr',
-        });
-      }
-    };
-    ws.onclose = () => {
-      if (awaitingFinal || isRecording) {
-        finishSession({
-          reasonKey: 'emotion.error.closedBeforeFinal',
-          state: 'error',
-          labelKey: 'emotion.status.closed',
-        });
-      }
-    };
+    isRecording = true;
+    setStatus('listening', 'emotion.status.listening');
+    setButton('recording');
+    currentResult = { kind: 'placeholder', key: 'emotion.result.speakNow' };
+    resultBox.innerHTML =
+      '<span class="text-faint">' + escapeHtml(t('emotion.result.speakNow')) + '</span>';
+    btn.disabled = false;
   }
 
-  function stop() {
+  async function stop() {
     if (!isRecording) return;
     isRecording = false;
     detachGraph();
 
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      try {
-        ws.send(JSON.stringify({ type: 'stop' }));
-      } catch (_) { /* ignore */ }
-      awaitingFinal = true;
-      setButton('waiting');
-      setStatus('analyzing', 'emotion.status.analyzing');
-      currentResult = { kind: 'placeholder', key: 'emotion.result.analyzing' };
-      resultBox.innerHTML =
-        '<span class="text-faint">' + escapeHtml(t('emotion.result.analyzing')) + '</span>';
-    } else {
+    const upload = window.AmphionAudioUpload;
+    const pcm = mergeRecordedPcm();
+    clearRecordingBuffer();
+    if (!pcm.length || !upload) {
       finishSession({
-        reasonKey: 'emotion.error.connLost',
+        reasonKey: 'emotion.error.emptyRecording',
         state: 'error',
-        labelKey: 'emotion.status.closed',
+        labelKey: 'emotion.status.error',
+      });
+      return;
+    }
+
+    const wavBytes = upload.encodeWavBytes(pcm, EMOTION_UPLOAD_SAMPLE_RATE);
+    try {
+      await runEmotionJob(wavBytes);
+      scheduleIdleRelease();
+    } catch (err) {
+      console.error('Emotion job failed:', err);
+      const aborted = err && err.name === 'AbortError';
+      const msg = err && err.message ? err.message : String(err);
+      finishSession({
+        reasonKey: aborted ? 'emotion.upload.aborted' : 'emotion.error.serverPrefix',
+        reasonVars: aborted ? null : { msg },
+        state: 'error',
+        labelKey: 'emotion.status.error',
       });
     }
   }
@@ -554,7 +563,7 @@
     if (uploadBtnLabel) {
       uploadBtnLabel.textContent = t(busy ? 'emotion.upload.uploading' : 'emotion.upload.label');
     }
-    btn.disabled = busy || isRecording || awaitingFinal;
+    btn.disabled = busy || isRecording || isJobRunning;
   }
 
   async function handleUploadFile(file) {
@@ -562,7 +571,7 @@
     // The live mic flow shares the result panel and idle-release timer; we
     // refuse uploads while either is active so the two flows can't fight
     // for the same UI slot.
-    if (isRecording || awaitingFinal || ws || isUploading) {
+    if (isRecording || isJobRunning || isUploading) {
       setUploadStatus('error', 'emotion.upload.error.busy');
       return;
     }
@@ -611,17 +620,41 @@
       '<span class="text-faint">' + escapeHtml(t('emotion.result.analyzing')) + '</span>';
 
     uploadController = new AbortController();
-    let result;
+    jobController = uploadController;
+    isJobRunning = true;
     try {
-      result = await upload.postWavToEndpoint(
-        '/api/emotion/upload',
+      const result = await upload.submitEmotionJobAndPoll(
         wavBytes,
         { mode: modeSelect.value || 'ser' },
-        { signal: uploadController.signal, fileName: file.name || 'upload.wav' }
+        {
+          endpoint: EMOTION_ENDPOINT,
+          signal: uploadController.signal,
+          fileName: file.name || 'upload.wav',
+          pollIntervalMs: EMOTION_JOB_POLL_MS,
+          maxWaitMs: EMOTION_JOB_MAX_WAIT_MS,
+        },
       );
-    } catch (err) {
-      console.error('Upload request failed:', err);
       uploadController = null;
+      jobController = null;
+      isJobRunning = false;
+      setUploadBusy(false);
+      renderResult(result);
+      pushHistory(result);
+      setStatus('done', 'emotion.status.done');
+      setIdleStatus();
+      if (trimmedNote !== null) {
+        setUploadStatus('warn', 'emotion.upload.trimmed', {
+          max: EMOTION_UPLOAD_MAX_SECONDS,
+          actual: trimmedNote,
+        });
+      } else {
+        setUploadStatus('success', 'emotion.upload.done');
+      }
+    } catch (err) {
+      console.error('Upload job failed:', err);
+      uploadController = null;
+      jobController = null;
+      isJobRunning = false;
       setUploadBusy(false);
       const aborted = err && err.name === 'AbortError';
       const msg = err && err.message ? err.message : 'Upload failed';
@@ -634,28 +667,12 @@
       setUploadStatus(aborted ? 'info' : 'error',
         aborted ? 'emotion.upload.aborted' : 'emotion.upload.error.serverPrefix',
         aborted ? null : { msg });
-      return;
-    }
-    uploadController = null;
-
-    renderResult(result);
-    pushHistory(result);
-    setStatus('done', 'emotion.status.done');
-    setIdleStatus();
-    setUploadBusy(false);
-    if (trimmedNote !== null) {
-      setUploadStatus('warn', 'emotion.upload.trimmed', {
-        max: EMOTION_UPLOAD_MAX_SECONDS,
-        actual: trimmedNote,
-      });
-    } else {
-      setUploadStatus('success', 'emotion.upload.done');
     }
   }
 
   if (uploadBtn && uploadInput) {
     uploadBtn.addEventListener('click', () => {
-      if (isUploading || isRecording || awaitingFinal) return;
+      if (isUploading || isRecording || isJobRunning) return;
       uploadInput.value = '';
       uploadInput.click();
     });
@@ -669,7 +686,7 @@
     if (isUploading) return;
     if (isRecording) {
       stop();
-    } else if (!awaitingFinal && !ws) {
+    } else if (!isJobRunning) {
       start();
     }
   });
@@ -686,7 +703,6 @@
   // every emotion mount would stack a duplicate listener.
   function onBeforeUnload() {
     try { releaseCapture(); } catch (_) { /* ignore */ }
-    try { closeWsSilently(); } catch (_) { /* ignore */ }
   }
   window.addEventListener('beforeunload', onBeforeUnload);
 
@@ -721,7 +737,7 @@
     // Called by the SPA router before the emotion <main> is swapped
     // out. Release every external resource:
     //   * In-flight upload AbortController
-    //   * Live WebSocket
+    //   * In-flight emotion job
     //   * Microphone + AudioContext + worklet (warm-capture state)
     //   * Idle-release timer that would otherwise fire after we're
     //     gone and try to call setIdleStatus on detached DOM nodes
@@ -734,11 +750,14 @@
         try { uploadController.abort(); } catch (_) { /* ignore */ }
         uploadController = null;
       }
-      try { closeWsSilently(); } catch (_) { /* ignore */ }
+      if (jobController) {
+        try { jobController.abort(); } catch (_) { /* ignore */ }
+        jobController = null;
+      }
       try { releaseCapture(); } catch (_) { /* ignore */ }
       try { cancelIdleRelease(); } catch (_) { /* ignore */ }
       isRecording = false;
-      awaitingFinal = false;
+      isJobRunning = false;
       if (typeof i18nUnsub === 'function') {
         try { i18nUnsub(); } catch (_) { /* ignore */ }
         i18nUnsub = null;

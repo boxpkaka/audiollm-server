@@ -2,7 +2,7 @@
 
 `/emotion-segmented-streaming` 用于长连接场景下的分段情感识别。客户端持续发送 PCM 音频流，服务端按 VAD 切段，并在每个语音段结束后返回一条 `final_emotion`。
 
-如果只需要对一段录音做一次情感判断，请使用 [整段情感识别 API](emotion-streaming-protocol.md) 或 `POST /api/emotion/upload`。
+如果只需要对一段录音做一次情感判断，请使用 [整段情感识别 HTTP API](emotion-streaming-protocol.md)（`POST /api/emotion/jobs` + 轮询）。
 
 ## 接口信息
 
@@ -25,11 +25,12 @@
 
 ## 与整段情感接口的区别
 
-| 维度 | `/emotion-streaming` | `/emotion-segmented-streaming` |
+| 维度 | 整段 HTTP (`/api/emotion/jobs`) | `/emotion-segmented-streaming` |
 |---|---|---|
+| 协议 | HTTP 异步任务 | WebSocket |
 | VAD | 不启用 | 启用 |
-| 结果数量 | 每次 start/stop 一条 | 每个有效语音段一条 |
-| stop 后行为 | 即使空会话也返回一条结果 | 仅 flush 有效尾段；空会话可能无结果 |
+| 结果数量 | 每个任务一条 | 每个有效语音段一条 |
+| 空音频 | 任务仍 `succeeded`，空 `final_emotion` | 空会话可能无结果 |
 | 适用场景 | 单条录音、离线文件 | 实时对话、直播、长录音 |
 
 ## 调用流程
@@ -114,7 +115,7 @@ payload 与整段情感接口一致：
 }
 ```
 
-字段说明见 [整段情感识别 API](emotion-streaming-protocol.md#服务端消息)。其中 `duration_sec` 表示当前 VAD 语音段的推理时长，不是整个连接的累计时长。
+`final_emotion` 字段与 [整段情感 HTTP API](emotion-streaming-protocol.md#查询任务) 的 `result` 一致。此处 `duration_sec` 表示**当前 VAD 语音段**的推理时长，不是整段任务的累计时长。
 
 ### error
 
@@ -140,15 +141,13 @@ payload 与整段情感接口一致：
 
 ## Python WebSocket 示例
 
-完整可运行脚本见 [examples/ws_emotion.py](examples/ws_emotion.py)。
+完整可运行脚本见仓库内 [tests/test_emotion_ws_client.py](../tests/test_emotion_ws_client.py)。
 
 ```bash
 pip install websockets numpy
 
-python docs/examples/ws_emotion.py sample.wav \
+python tests/test_emotion_ws_client.py sample.wav \
   --url ws://172.16.0.3:8080/emotion-segmented-streaming \
-  --segmented \
-  --language zh \
   --mode ser \
 ```
 

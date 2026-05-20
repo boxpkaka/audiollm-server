@@ -2,13 +2,9 @@
 
 The same engine class powers two endpoints with different stream strategies:
 
-- ``streaming=False`` (default) pairs with
-  :class:`backend.streaming.WholeUtteranceStream` to implement
-  ``/emotion-streaming``: the stream accumulates the entire utterance and
-  emits exactly one ``SegmentReady`` on stop / disconnect, which this engine
-  turns into a single ``final_emotion`` message. If no audio was received,
-  ``on_stop`` still emits an empty ``final_emotion`` so callers always get a
-  reply per ``start``/``stop`` cycle.
+- ``streaming=False`` was used by the removed ``/emotion-streaming`` WebSocket;
+  whole-utterance emotion is now ``POST /api/emotion/jobs`` (HTTP). The
+  non-streaming engine path remains available for tests and future reuse.
 - ``streaming=True`` pairs with :class:`backend.streaming.VadSegmentedStream`
   to implement ``/emotion-segmented-streaming``: each VAD-detected speech
   segment triggers an inference and produces its own ``final_emotion``. If

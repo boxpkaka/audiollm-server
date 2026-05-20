@@ -204,6 +204,75 @@
     return payload;
   }
 
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /**
+   * POST an emotion-style job endpoint (202) and poll until succeeded or failed.
+   * Returns the ``final_emotion`` result object.
+   *
+   * ``options.endpoint`` chooses which backend handles the job:
+   *   - ``/api/emotion/jobs`` (default) — baseline emotion model
+   *   - ``/api/emotion-spec/jobs`` — AmphionSPEC paralinguistic model
+   * Both servers return the same {job_id, status, poll_url} envelope so
+   * the polling code below stays endpoint-agnostic (it follows the
+   * ``poll_url`` from the create response when present).
+   */
+  async function submitEmotionJobAndPoll(wavBytes, formFields, options) {
+    const opts = options || {};
+    const pollInterval = opts.pollIntervalMs || 400;
+    const maxWait = opts.maxWaitMs || 45000;
+    const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
+    const endpoint = opts.endpoint || '/api/emotion/jobs';
+
+    const created = await postWavToEndpoint(
+      endpoint,
+      wavBytes,
+      formFields,
+      opts,
+    );
+    const jobId = created && created.job_id;
+    if (!jobId) {
+      throw new Error('emotion job response missing job_id');
+    }
+    const pollUrl = (created && created.poll_url) || `${endpoint}/${jobId}`;
+    const deadline = Date.now() + maxWait;
+
+    while (Date.now() < deadline) {
+      if (onProgress) onProgress();
+      let resp;
+      try {
+        resp = await fetch(pollUrl, { signal: opts.signal });
+      } catch (err) {
+        throw err;
+      }
+      let body = null;
+      const ctype = resp.headers.get('content-type') || '';
+      if (ctype.includes('application/json')) {
+        try { body = await resp.json(); } catch (_) { body = null; }
+      }
+      if (!resp.ok) {
+        const detail = (body && body.detail) || `HTTP ${resp.status}`;
+        const err = new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
+        err.status = resp.status;
+        throw err;
+      }
+      const status = body && body.status;
+      if (status === 'succeeded' && body.result) {
+        return body.result;
+      }
+      if (status === 'failed') {
+        const msg = (body.error && body.error.message) || 'emotion job failed';
+        const err = new Error(msg);
+        err.code = body.error && body.error.code;
+        throw err;
+      }
+      await sleep(pollInterval);
+    }
+    throw new Error('emotion job poll timeout');
+  }
+
   /** Convenience: run decodeFileToMono → encodeWavBytes in one step. */
   async function decodeFileToWavBytes(file, targetSr) {
     const pcm = await decodeFileToMono(file, targetSr);
@@ -227,6 +296,7 @@
     encodeWavBytes,
     bytesToBase64,
     postWavToEndpoint,
+    submitEmotionJobAndPoll,
     formatSamples,
   };
 })();

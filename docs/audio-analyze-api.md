@@ -93,4 +93,4 @@ python docs/examples/rest_upload.py analyze sample.wav \
 
 - [API 总览](api-reference.md)
 - [通用 ASR 上传](transcribe-streaming-protocol.md#rest-上传接口)
-- [情感上传](emotion-streaming-protocol.md#rest-上传接口)
+- [整段情感识别 HTTP](emotion-streaming-protocol.md)

@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
-"""WebSocket test client for /emotion-streaming and /emotion-segmented-streaming.
+"""WebSocket test client for /emotion-segmented-streaming.
 
-Sends an entire audio file through the WS, then ``stop``. With the default
-URL (``/emotion-streaming``) the server replies with one ``final_emotion``
-and the client returns. When pointed at ``/emotion-segmented-streaming``
-(via ``--url`` or ``--segmented``) the client keeps receiving until the
-server closes the connection, so it can print every per-segment
+Sends an entire audio file through the WS, then ``stop``. The client keeps
+receiving until the server closes the connection and prints every per-segment
 ``final_emotion``.
+
+For whole-utterance emotion use ``docs/examples/http_emotion_job.py`` instead.
 
 Usage:
     python test_emotion_ws_client.py <audio_file> [--url URL] [--chunk-ms MS] [--config K=V ...]
 
 Examples:
     python test_emotion_ws_client.py audio.wav
-    python test_emotion_ws_client.py raw.pcm --chunk-ms 80
     python test_emotion_ws_client.py audio.wav --config emotion_request_timeout=20
-    python test_emotion_ws_client.py audio.wav --segmented
     python test_emotion_ws_client.py audio.wav \
-        --url wss://localhost:8443/emotion-segmented-streaming
+        --url ws://172.16.0.3:8080/emotion-segmented-streaming
 """
 
 import argparse
@@ -206,18 +203,14 @@ async def _receive_messages(ws, *, segmented: bool = False):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Test WS client for /emotion-streaming and /emotion-segmented-streaming"
+        description="Test WS client for /emotion-segmented-streaming"
     )
     parser.add_argument("audio_file", help="Path to audio file (WAV or raw PCM s16le 16kHz)")
-    parser.add_argument("--url", default=None,
-                        help="WebSocket URL. Defaults to "
-                             "wss://localhost:8443/emotion-streaming, or "
-                             "wss://localhost:8443/emotion-segmented-streaming "
-                             "when --segmented is set.")
-    parser.add_argument("--segmented", action="store_true",
-                        help="Target the VAD-segmented endpoint and keep "
-                             "receiving until the server closes the WebSocket. "
-                             "Implies the default URL switch shown above.")
+    parser.add_argument(
+        "--url",
+        default="ws://172.16.0.3:8080/emotion-segmented-streaming",
+        help="WebSocket URL",
+    )
     parser.add_argument("--chunk-ms", type=int, default=80, help="Chunk size in ms (default: 80)")
     parser.add_argument("--mode", choices=("ser", "sec"), default=None,
                         help="Emotion task variant. ser=8-class label; "
@@ -232,15 +225,7 @@ def main():
         print(f"Error: file not found: {args.audio_file}", file=sys.stderr)
         sys.exit(1)
 
-    if args.url is None:
-        args.url = (
-            "wss://localhost:8443/emotion-segmented-streaming"
-            if args.segmented
-            else "wss://localhost:8443/emotion-streaming"
-        )
-    # Auto-detect segmented mode from an explicit URL so users don't have to
-    # remember to pass both --url and --segmented.
-    segmented = args.segmented or "segmented" in args.url
+    segmented = True
 
     cfg_overrides: dict | None = None
     if args.config:

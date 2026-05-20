@@ -37,14 +37,49 @@ def command_asr(args: argparse.Namespace) -> dict:
 
 
 def command_emotion(args: argparse.Namespace) -> dict:
-    url = join_url(args.base_url, "/api/emotion/upload")
-    return post_multipart(
-        url,
-        args.audio_file,
-        data={"mode": args.mode, "language": args.language},
-        verify=not args.insecure,
-        timeout=args.timeout,
-    )
+    import time
+
+    create_url = join_url(args.base_url, "/api/emotion/jobs")
+    with open(args.audio_file, "rb") as audio_file:
+        files = {"audio": (Path(args.audio_file).name, audio_file, "audio/wav")}
+        create = requests.post(
+            create_url,
+            files=files,
+            data={"mode": args.mode, "language": args.language},
+            verify=not args.insecure,
+            timeout=args.timeout,
+        )
+    if create.status_code != 202:
+        try:
+            payload = create.json()
+        except ValueError:
+            payload = {"raw_text": create.text}
+        raise SystemExit(
+            f"HTTP {create.status_code} {create.reason}\n"
+            f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+        )
+    meta = create.json()
+    job_id = meta["job_id"]
+    poll_url = join_url(args.base_url, meta.get("poll_url") or f"/api/emotion/jobs/{job_id}")
+    deadline = time.monotonic() + args.timeout
+    while time.monotonic() < deadline:
+        poll = requests.get(poll_url, verify=not args.insecure, timeout=30)
+        try:
+            body = poll.json()
+        except ValueError:
+            body = {"raw_text": poll.text}
+        if poll.status_code >= 400:
+            raise SystemExit(
+                f"HTTP {poll.status_code} {poll.reason}\n"
+                f"{json.dumps(body, ensure_ascii=False, indent=2)}"
+            )
+        if body.get("status") == "succeeded":
+            return body.get("result") or {}
+        if body.get("status") == "failed":
+            err = body.get("error") or {}
+            raise SystemExit(err.get("message") or "emotion job failed")
+        time.sleep(0.4)
+    raise SystemExit(f"emotion job {job_id} timed out after {args.timeout}s")
 
 
 def command_tsasr(args: argparse.Namespace) -> dict:
@@ -100,7 +135,7 @@ def parse_args() -> argparse.Namespace:
     asr.add_argument("--hotwords", default="", help="Comma-separated hotwords")
     asr.set_defaults(func=command_asr)
 
-    emotion = subparsers.add_parser("emotion", help="POST /api/emotion/upload")
+    emotion = subparsers.add_parser("emotion", help="POST /api/emotion/jobs (async)")
     add_common(emotion)
     emotion.add_argument("--mode", choices=("ser", "sec"), default="ser", help="Emotion mode")
     emotion.set_defaults(func=command_emotion)

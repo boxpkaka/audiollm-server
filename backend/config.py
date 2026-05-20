@@ -27,7 +27,7 @@ def _load_json(path: Path) -> dict[str, Any]:
 class Config:
     # ---- ASR: primary / secondary vLLM endpoints --------------------------
     vllm_base_url: str = "http://localhost:8000"
-    vllm_model_name: str = "Amphion/Amphion-3B"
+    vllm_model_name: str = "Amphion/AmphionASR-4.3B"
     secondary_vllm_base_url: str = "http://localhost:8001"
     secondary_vllm_model_name: str = "Qwen/Qwen3-ASR-1.7B"
     enable_secondary_asr: bool = True
@@ -58,65 +58,13 @@ class Config:
     vad_keep_tail_ms: int = 40
     min_segment_duration_ms: int = 350
 
-    # ---- Target-Speaker ASR (TS-ASR) -------------------------------------
-    # TS-ASR runs on the same Amphion vLLM endpoint as the primary ASR by
-    # default. When ``tsasr_base_url`` / ``tsasr_model_name`` are non-empty
-    # they override that default, which lets us swap in a dedicated TS-ASR
-    # checkpoint later without touching the standard ASR configuration.
-    tsasr_base_url: str = ""
-    tsasr_model_name: str = ""
-    tsasr_request_timeout: float = 30.0
-    tsasr_enrollment_min_sec: float = 1.0
-    # Long uploads are trimmed via VAD to the leading ``max_sec`` of voiced
-    # audio rather than being rejected — see ``decode_enrollment``. Eight
-    # seconds gives the speaker enough room to read a short prompt while
-    # still keeping the dual-audio prompt short.
-    tsasr_enrollment_max_sec: float = 8.0
-    tsasr_max_audio_seconds: float = 30.0
-    # Pseudo-streaming partials. Off by default: the dedicated TS-ASR
-    # endpoint is fast enough that the user only needs to see "识别中…"
-    # while a segment is in flight; piling partial results on top adds
-    # visual noise (text rewriting itself mid-utterance) without much
-    # latency benefit on top of a 1-2s end-to-end inference.
-    tsasr_enable_partial: bool = False
-    # Inject ``ctx.hotwords`` into the TS-ASR prompt as a comma-joined
-    # ``Hotwords:`` line after the transcribe instruction. Aligned with
-    # template B in the v3 SFT recipe (see backend/tsasr/prompt.py), so
-    # safe to enable by default; flip off only if the deployed model
-    # checkpoint pre-dates v3 hotword training.
-    tsasr_enable_hotwords: bool = True
-    # Optional Qwen3-ASR-1.7B presence/silence gate. When True the
-    # backend runs the general-purpose secondary ASR in parallel with
-    # AmphionTSASR and suppresses the segment if either path comes back
-    # empty (cheap protection against TS-ASR hallucinating on pure
-    # noise). Off by default: the dedicated TS-ASR checkpoint and the
-    # speech-presence gate below already handle silence well, and
-    # running two models doubles the per-segment latency.
-    tsasr_enable_secondary_gate: bool = False
-    # When True, run Qwen3-ASR in parallel with AmphionTSASR on every
-    # segment / partial and surface BOTH transcripts to the client (rendered
-    # as two labeled rows on the frontend: "安菲翁:" / "千问:"). This is the
-    # comparison/demo mode and is independent from the silence gate above:
-    # the gate suppresses output when either path is empty, while this flag
-    # only controls whether the secondary text is forwarded for display.
-    tsasr_show_secondary_text: bool = True
-    # First-stage speech-presence gate. The Amphion TS-ASR engine has no
-    # silence/noise filter beyond the upstream VAD, so transient noise
-    # like keyboard taps that VAD misclassifies as speech would
-    # otherwise be sent straight to the model. We re-analyze each
-    # segmented clip with a stricter per-frame probability threshold and
-    # require a minimum cumulative voiced duration before invoking vLLM.
-    tsasr_speech_gate_enabled: bool = True
-    tsasr_speech_gate_prob_threshold: float = 0.6
-    tsasr_speech_gate_min_voiced_ms: int = 200
-
     # ---- Emotion recognition: vLLM endpoint ------------------------------
-    # The Amphion multi-task model (Amphion/Amphion-3B) is trained to handle
-    # SER/SEC alongside ASR via different text prompts, so by default we point
-    # the emotion endpoint at the same backend as the primary ASR. Override
+    # The Amphion multi-task model is trained to handle SER/SEC alongside ASR
+    # via different text prompts, so by default we point the emotion endpoint
+    # at the same backend as the primary ASR. Override
     # ``emotion_vllm_base_url`` if you serve a dedicated emotion model.
     emotion_vllm_base_url: str = "http://localhost:8000"
-    emotion_vllm_model_name: str = "Amphion/Amphion-3B"
+    emotion_vllm_model_name: str = "Amphion/AmphionASR-4.3B"
     emotion_request_timeout: float = 30.0
     # Amphion SER/SEC training uses 1-20s utterances, so we cap longer audio
     # to the trailing 20 seconds (where the most recent speech lives).
@@ -124,6 +72,32 @@ class Config:
     # Default task variant when the client doesn't specify one in start.mode.
     # "ser" -> single label classification; "sec" -> free-form caption.
     emotion_task_mode: str = "ser"
+    # Whole-utterance HTTP job API backpressure (in-process store).
+    emotion_max_concurrent_jobs: int = 8
+    emotion_job_queue_max: int = 64
+    emotion_job_ttl_sec: float = 3600.0
+
+    # ---- Paralinguistic emotion model (AmphionSPEC) ----------------------
+    # Independent vLLM endpoint that serves the AmphionSPEC checkpoint. It
+    # is trained with two prompts: ``ser`` (same 8-way label set as the
+    # baseline emotion model) and ``sepc`` (free-form description of
+    # paralinguistic emotion cues — prosody, tempo, voice quality, etc.).
+    # Configuration mirrors the emotion knobs so it can scale and back-off
+    # independently from the baseline emotion store.
+    emotion_spec_vllm_base_url: str = "http://localhost:9001"
+    emotion_spec_vllm_model_name: str = "AmphionSPEC"
+    emotion_spec_request_timeout: float = 30.0
+    emotion_spec_max_audio_seconds: float = 20.0
+    # Default mode when the client omits ``mode``; the prompt label
+    # ``sepc`` is the literal training token (do not rename to ``spec``).
+    emotion_spec_task_mode: str = "sepc"
+    emotion_spec_max_concurrent_jobs: int = 8
+    emotion_spec_job_queue_max: int = 64
+    emotion_spec_job_ttl_sec: float = 3600.0
+
+    # Shared httpx pool ceiling for all vLLM / upstream HTTP calls.
+    http_max_connections: int = 32
+    http_max_keepalive_connections: int = 16
 
     # ---- Text cleanup LLM (DashScope OpenAI-compatible) -------------------
     text_cleanup_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -205,21 +179,24 @@ EMOTION_VLLM_MODEL_NAME = _default.emotion_vllm_model_name
 EMOTION_REQUEST_TIMEOUT = _default.emotion_request_timeout
 EMOTION_MAX_AUDIO_SECONDS = _default.emotion_max_audio_seconds
 EMOTION_TASK_MODE = _default.emotion_task_mode
+EMOTION_MAX_CONCURRENT_JOBS = _default.emotion_max_concurrent_jobs
+EMOTION_JOB_QUEUE_MAX = _default.emotion_job_queue_max
+EMOTION_JOB_TTL_SEC = _default.emotion_job_ttl_sec
+
+EMOTION_SPEC_VLLM_BASE_URL = _default.emotion_spec_vllm_base_url
+EMOTION_SPEC_VLLM_MODEL_NAME = _default.emotion_spec_vllm_model_name
+EMOTION_SPEC_REQUEST_TIMEOUT = _default.emotion_spec_request_timeout
+EMOTION_SPEC_MAX_AUDIO_SECONDS = _default.emotion_spec_max_audio_seconds
+EMOTION_SPEC_TASK_MODE = _default.emotion_spec_task_mode
+EMOTION_SPEC_MAX_CONCURRENT_JOBS = _default.emotion_spec_max_concurrent_jobs
+EMOTION_SPEC_JOB_QUEUE_MAX = _default.emotion_spec_job_queue_max
+EMOTION_SPEC_JOB_TTL_SEC = _default.emotion_spec_job_ttl_sec
+
+HTTP_MAX_CONNECTIONS = _default.http_max_connections
+HTTP_MAX_KEEPALIVE_CONNECTIONS = _default.http_max_keepalive_connections
 
 TEXT_CLEANUP_BASE_URL = _default.text_cleanup_base_url
 TEXT_CLEANUP_MODEL_NAME = _default.text_cleanup_model_name
 TEXT_CLEANUP_API_KEY_ENV = _default.text_cleanup_api_key_env
 TEXT_CLEANUP_TIMEOUT = _default.text_cleanup_timeout
 TEXT_CLEANUP_MAX_TOKENS = _default.text_cleanup_max_tokens
-
-TSASR_BASE_URL = _default.tsasr_base_url
-TSASR_MODEL_NAME = _default.tsasr_model_name
-TSASR_REQUEST_TIMEOUT = _default.tsasr_request_timeout
-TSASR_ENROLLMENT_MIN_SEC = _default.tsasr_enrollment_min_sec
-TSASR_ENROLLMENT_MAX_SEC = _default.tsasr_enrollment_max_sec
-TSASR_MAX_AUDIO_SECONDS = _default.tsasr_max_audio_seconds
-TSASR_ENABLE_PARTIAL = _default.tsasr_enable_partial
-TSASR_ENABLE_HOTWORDS = _default.tsasr_enable_hotwords
-TSASR_SPEECH_GATE_ENABLED = _default.tsasr_speech_gate_enabled
-TSASR_SPEECH_GATE_PROB_THRESHOLD = _default.tsasr_speech_gate_prob_threshold
-TSASR_SPEECH_GATE_MIN_VOICED_MS = _default.tsasr_speech_gate_min_voiced_ms

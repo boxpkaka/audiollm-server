@@ -713,8 +713,8 @@
   function renderEmotionMeta(emotion) {
     if (!emotion) return '';
     const ser = String(emotion.ser_label || '').trim();
-    const secText = String(emotion.sec_text || '').trim();
-    if (!ser && !secText) return '';
+    const sepcText = String(emotion.sepc_text || '').trim();
+    if (!ser && !sepcText) return '';
 
     const parts = [];
     if (ser) {
@@ -722,9 +722,9 @@
         `<span class="text-faint">${escapeHtml(t('asr.emotion.result.ser'))}:</span> ${escapeHtml(ser)}`
       );
     }
-    if (secText) {
+    if (sepcText) {
       parts.push(
-        `<span class="text-faint">${escapeHtml(t('asr.emotion.result.sec'))}:</span> ${escapeHtml(secText)}`
+        `<span class="text-faint">${escapeHtml(t('asr.emotion.result.sepc'))}:</span> ${escapeHtml(sepcText)}`
       );
     }
     return `

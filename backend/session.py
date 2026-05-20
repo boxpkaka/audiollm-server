@@ -13,10 +13,10 @@ from .audio.utils import Resampler48to16, pcm_to_wav_base64
 from .audio.vad import VADProcessor
 from .config import (
     DEBUG_SHOW_DUAL_ASR,
-    EMOTION_MAX_AUDIO_SECONDS,
-    EMOTION_REQUEST_TIMEOUT,
-    EMOTION_VLLM_BASE_URL,
-    EMOTION_VLLM_MODEL_NAME,
+    EMOTION_SPEC_MAX_AUDIO_SECONDS,
+    EMOTION_SPEC_REQUEST_TIMEOUT,
+    EMOTION_SPEC_VLLM_BASE_URL,
+    EMOTION_SPEC_VLLM_MODEL_NAME,
     ENABLE_PRIMARY_ASR,
     ENABLE_PSEUDO_STREAM,
     ENABLE_SECONDARY_ASR,
@@ -25,7 +25,7 @@ from .config import (
     PSEUDO_STREAM_INTERVAL_MS,
     SAMPLE_RATE,
 )
-from .emotion.client import query_emotion_model
+from .emotion_spec.client import query_emotion_spec_model
 
 logger = logging.getLogger(__name__)
 
@@ -459,14 +459,18 @@ class AudioSession:
         await self._send_json(payload)
 
     async def _run_emotion(self, segment: np.ndarray) -> dict | None:
-        """Run SER + SEC in parallel on the final segment. Best-effort."""
+        """Run SER + SEPC in parallel on the final segment via AmphionSPEC.
+
+        Best-effort: any single inference failure degrades to omitting that
+        field rather than failing the whole ASR response.
+        """
         audio_duration = len(segment) / SAMPLE_RATE
         clip = segment
         if (
-            EMOTION_MAX_AUDIO_SECONDS > 0
-            and audio_duration > EMOTION_MAX_AUDIO_SECONDS
+            EMOTION_SPEC_MAX_AUDIO_SECONDS > 0
+            and audio_duration > EMOTION_SPEC_MAX_AUDIO_SECONDS
         ):
-            max_samples = int(SAMPLE_RATE * EMOTION_MAX_AUDIO_SECONDS)
+            max_samples = int(SAMPLE_RATE * EMOTION_SPEC_MAX_AUDIO_SECONDS)
             clip = segment[-max_samples:]
 
         try:
@@ -476,36 +480,36 @@ class AudioSession:
             return None
 
         async def _call(mode: str):
-            return await query_emotion_model(
+            return await query_emotion_spec_model(
                 wav_b64,
                 mode=mode,
-                base_url=EMOTION_VLLM_BASE_URL,
-                model_name=EMOTION_VLLM_MODEL_NAME,
-                timeout=EMOTION_REQUEST_TIMEOUT,
+                base_url=EMOTION_SPEC_VLLM_BASE_URL,
+                model_name=EMOTION_SPEC_VLLM_MODEL_NAME,
+                timeout=EMOTION_SPEC_REQUEST_TIMEOUT,
             )
 
-        ser_res, sec_res = await asyncio.gather(
-            _call("ser"), _call("sec"), return_exceptions=True
+        ser_res, sepc_res = await asyncio.gather(
+            _call("ser"), _call("sepc"), return_exceptions=True
         )
 
         if isinstance(ser_res, Exception):
             logger.warning("SER inference failed: %s", ser_res)
             ser_res = None
-        if isinstance(sec_res, Exception):
-            logger.warning("SEC inference failed: %s", sec_res)
-            sec_res = None
+        if isinstance(sepc_res, Exception):
+            logger.warning("SEPC inference failed: %s", sepc_res)
+            sepc_res = None
 
         ser_label = str((ser_res or {}).get("label", "") or "").strip()
-        sec_text = str((sec_res or {}).get("text", "") or "").strip()
-        sec_label = str((sec_res or {}).get("label", "") or "").strip()
+        sepc_text = str((sepc_res or {}).get("text", "") or "").strip()
+        sepc_label = str((sepc_res or {}).get("label", "") or "").strip()
 
-        if not ser_label and not sec_text and not sec_label:
+        if not ser_label and not sepc_text and not sepc_label:
             return None
 
         return {
             "ser_label": ser_label,
-            "sec_text": sec_text,
-            "sec_label": sec_label,
+            "sepc_text": sepc_text,
+            "sepc_label": sepc_label,
         }
 
     async def _send_vad_event(

@@ -23,7 +23,6 @@
 |---|---|---|---|
 | `/transcribe-streaming` | 通用流式 ASR | 实时语音转写、带热词的对话转写 | `partial` / `partial_asr`、`final` / `final_asr` |
 | `/transcribe-target-streaming` | 目标说话人 ASR | 给定注册音频，只转写目标说话人 | `enrollment_ok`、`partial`、`final` |
-| `/emotion-streaming` | 整段情感识别 | 一段录音结束后给出一次情感判断 | `final_emotion` |
 | `/emotion-segmented-streaming` | 分段情感识别 | 长连接中按 VAD 语音段持续返回情感 | 多条 `final_emotion` |
 
 `/ws/audio` 是浏览器 Demo 使用的调试接口，包含前端专用消息和双模型调试视图。第三方系统集成建议优先使用上表中的任务接口。
@@ -33,7 +32,8 @@
 | 方法 | 路径 | 任务 | 表单字段 |
 |---|---|---|---|
 | POST | `/api/asr/upload` | 上传整段音频做 ASR | `audio`、`language`、`hotwords` |
-| POST | `/api/emotion/upload` | 上传整段音频做情感识别 | `audio`、`mode`、`language` |
+| POST | `/api/emotion/jobs` | 异步整段情感识别（202 + 轮询） | `audio`、`mode`、`language` |
+| GET | `/api/emotion/jobs/{job_id}` | 查询情感任务状态与结果 | — |
 | POST | `/api/tsasr/upload` | 上传注册音频和混合音频做目标说话人 ASR | `audio`、`enrollment_wav_base64`、`language`、`hotwords`、`voice_traits` |
 | POST | `/api/audio/analyze` | 非实时聚合分析：ASR 原始结果、文本清洗、情感标签和情感描述 | `audio`、`language`、`hotwords` |
 
@@ -230,18 +230,26 @@ python docs/examples/ws_transcribe.py sample.wav \
   --language zh
 ```
 
-运行整段情感识别：
+运行整段情感识别（异步 HTTP）：
 
 ```bash
-python docs/examples/ws_emotion.py sample.wav \
-  --url ws://172.16.0.3:8080/emotion-streaming \
+python docs/examples/http_emotion_job.py sample.wav \
+  --base-url http://172.16.0.3:8080 \
   --mode ser
 ```
 
-运行分段情感识别：
+或：
 
 ```bash
-python docs/examples/ws_emotion.py sample.wav \
+python docs/examples/rest_upload.py emotion sample.wav \
+  --base-url http://172.16.0.3:8080 \
+  --mode ser
+```
+
+运行分段情感识别（WebSocket）：
+
+```bash
+python tests/test_emotion_ws_client.py sample.wav \
   --url ws://172.16.0.3:8080/emotion-segmented-streaming \
   --segmented \
   --language zh
@@ -285,6 +293,9 @@ REST 接口使用标准 HTTP 状态码：
 | 422 | multipart 字段类型或必填字段不符合 FastAPI 校验 |
 | 502 | 后端模型服务推理失败 |
 | 502 | `/api/audio/analyze` 的 ASR、情感或文本清洗模型调用失败 |
+| 202 | `POST /api/emotion/jobs` 已受理（需轮询 GET） |
+| 503 | 情感任务队列已满（`Retry-After`） |
+| 404 | `GET /api/emotion/jobs/{id}` 任务不存在或已过期 |
 
 错误体示例：
 
@@ -311,5 +322,5 @@ TS-ASR 注册音频错误会返回结构化 detail：
 - [非实时音频分析 API](audio-analyze-api.md)
 - [通用流式 ASR WebSocket](transcribe-streaming-protocol.md)
 - [目标说话人 ASR WebSocket](tsasr.md)
-- [整段情感识别 WebSocket](emotion-streaming-protocol.md)
+- [整段情感识别 HTTP（异步）](emotion-streaming-protocol.md)
 - [分段情感识别 WebSocket](emotion-segmented-streaming-protocol.md)

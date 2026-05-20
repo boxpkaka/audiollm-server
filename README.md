@@ -87,23 +87,33 @@ graph LR
 
 ---
 
+## HTTP 接口（整段情感）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/emotion/jobs` | 提交 WAV，返回 `202` + `job_id` |
+| GET | `/api/emotion/jobs/{job_id}` | 轮询任务状态与 `final_emotion` 结果 |
+
+协议见 [docs/emotion-streaming-protocol.md](docs/emotion-streaming-protocol.md)（异步 HTTP，非 WebSocket）。
+
 ## WebSocket 接口
 
-服务暴露五个 WebSocket 端点，按任务一类一个：
+服务暴露四个 WebSocket 端点（流式 / 分段任务）：
 
 | 端点 | 任务 | VAD | 输出 | 协议文档 |
 |---|---|---|---|---|
 | `/ws/audio` | 浏览器 Demo（ASR + 双模型调试视图 + 可选情感） | 是 | response / partial_transcript，可选 response.emotion（SER 标签 + SEC 描述） | 见前端代码 |
 | `/transcribe-streaming` | 个性化语音识别 | 是 | partial / final（每段语音一条） | [docs/transcribe-streaming-protocol.md](docs/transcribe-streaming-protocol.md) |
 | `/transcribe-target-streaming` | 目标说话人识别（TS-ASR，注册音频 + 混合音频） | 是 | enrollment_ok / final（每段语音一条） | [docs/tsasr.md](docs/tsasr.md) |
-| `/emotion-streaming` | 整段情感识别（SER 8 分类 / SEC 自由描述） | 否 | final_emotion（每个 start/stop 周期一条） | [docs/emotion-streaming-protocol.md](docs/emotion-streaming-protocol.md) |
 | `/emotion-segmented-streaming` | 按段流式情感识别（同模型，逐段返回） | 是 | final_emotion（每个 VAD 段一条） | [docs/emotion-segmented-streaming-protocol.md](docs/emotion-segmented-streaming-protocol.md) |
 
 新增任务的命名约定：每个任务一个独立 WebSocket 端点（`/<task>-streaming`），共享同一套 `start` / `stop` / `update_hotwords` 控制消息与 `config` 覆写机制；任务专属字段（如 ASR 的 `language`/`hotwords`、情感的输出标签集）只出现在对应端点的协议文档中。
 
 ### `/ws/audio` 的情感开关
 
-浏览器 Demo 右侧面板有一个"情感识别"开关，开启后后端会为每个 final 片段并行跑一次 SER 与一次 SEC，并把结果挂到既有的 `response` 消息上：
+浏览器 Demo 右侧面板有一个"情感识别"开关，开启后后端会通过 AmphionSPEC
+（`emotion_spec_vllm_base_url`，默认 `http://localhost:9001`）为每个 final
+片段并行跑一次 SER 与一次 SEPC，并把结果挂到既有的 `response` 消息上：
 
 ```json
 {
@@ -112,8 +122,8 @@ graph LR
   "text": "转写文本",
   "emotion": {
     "ser_label": "Happy",
-    "sec_text":  "轻快、略带笑意的语气",
-    "sec_label": "Happy"
+    "sepc_text":  "轻快、略带笑意的语气",
+    "sepc_label": "Happy"
   }
 }
 ```
@@ -345,7 +355,7 @@ SERVICE=my-demo scripts/restart_service.sh   # 指定其他 systemd 服务名
 | `tsasr_speech_gate_prob_threshold` | float | `0.6` | 门控逐帧判帧的概率阈值，比上层 `vad_threshold` 更严格 |
 | `tsasr_speech_gate_min_voiced_ms` | int | `200` | 累计有声时长低于此值的片段会被丢弃，不再下发到 vLLM |
 
-#### 情感识别（仅 `/emotion-streaming` 使用）
+#### 情感识别（HTTP jobs + `/emotion-segmented-streaming`）
 
 | 参数 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
@@ -353,7 +363,10 @@ SERVICE=my-demo scripts/restart_service.sh   # 指定其他 systemd 服务名
 | `emotion_vllm_model_name` | string | `Amphion/Amphion-3B` | 情感识别模型名称；与 AmphionASR 项目的 SER/SEC 训练模型一致 |
 | `emotion_request_timeout` | float | `30.0` | 情感推理 HTTP 请求总超时（秒） |
 | `emotion_max_audio_seconds` | float | `20.0` | 单次推理处理的最长音频秒数；超过则保留尾部，贴合 Amphion SER/SEC 训练时 1-20s 的 utterance 上限 |
-| `emotion_task_mode` | string | `ser` | 缺省任务变体：`ser` 输出 8 分类标签，`sec` 输出自由文本描述；可被 `start.mode` 覆盖 |
+| `emotion_task_mode` | string | `ser` | 缺省任务变体：`ser` 输出 8 分类标签，`sec` 输出自由文本描述 |
+| `emotion_max_concurrent_jobs` | int | `8` | 异步 HTTP 任务同时调 vLLM 的上限 |
+| `emotion_job_queue_max` | int | `64` | 异步任务排队上限，超出返回 503 |
+| `emotion_job_ttl_sec` | float | `3600` | 已完成任务元数据保留秒数 |
 
 #### 调试
 

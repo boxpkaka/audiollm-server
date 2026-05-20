@@ -1,23 +1,20 @@
-# 整段情感识别 API
+# 整段情感识别 API（异步 HTTP）
 
-`/emotion-streaming` 用于对一段完整语音进行一次情感识别。客户端通过 WebSocket 发送 PCM 音频流，发送 `stop` 后服务端对整段音频做推理并返回一条 `final_emotion`。
+整段情感识别已改为 **异步 HTTP 任务 API**，不再提供 WebSocket `/emotion-streaming`。
 
-如果需要长连接中按句或按语音段持续返回情感结果，请使用 [分段情感识别 API](emotion-segmented-streaming-protocol.md)。
-
-REST 上传版本见本文末尾的 `/api/emotion/upload`。
+如果需要长连接中按 VAD 语音段持续返回情感结果，请使用 [分段情感识别 WebSocket](emotion-segmented-streaming-protocol.md)。
 
 ## 接口信息
 
 | 项目 | 说明 |
 |---|---|
-| 协议 | WebSocket |
-| 路径 | `/emotion-streaming` |
-| 完整 URL | `ws://172.16.0.3:8080/emotion-streaming` |
-| 鉴权 | 无内置鉴权，无需自定义请求头 |
-| 音频输入 | 二进制 PCM 帧，16 kHz、mono、signed 16-bit little-endian |
-| 分段策略 | 不启用 VAD 切段，整段缓存到 `stop` |
+| 创建任务 | `POST /api/emotion/jobs` |
+| 查询任务 | `GET /api/emotion/jobs/{job_id}` |
+| Base URL | `http://172.16.0.3:8080` |
+| 鉴权 | 无内置鉴权 |
+| 音频输入 | `multipart/form-data` 字段 `audio`（WAV 文件） |
 | 中间结果 | 不支持 |
-| 最终结果 | 每个 start/stop 周期返回一条 `final_emotion` |
+| 最终结果 | 任务 `status=succeeded` 时返回 `result`（`final_emotion`） |
 
 ## 模式
 
@@ -45,136 +42,21 @@ REST 上传版本见本文末尾的 `/api/emotion/upload`。
 
 ```text
 Client                                      Server
-  | ---- WebSocket connect --------------> |
-  | <---------------- ready -------------- |
-  | ---- start --------------------------> |
-  | ---- binary PCM chunk ---------------> |
-  | ---- binary PCM chunk ---------------> |
-  | ---- stop ---------------------------> |
-  | <---------------- final_emotion ------ |
-  | ---- close --------------------------> |
+  | ---- POST /api/emotion/jobs (WAV) ----> |
+  | <---------------- 202 + job_id ------- |
+  | ---- GET /api/emotion/jobs/{id} -----> |
+  | <---------------- status=queued ------- |
+  | ---- GET (poll) ----------------------> |
+  | <---------------- status=running ------ |
+  | ---- GET (poll) ----------------------> |
+  | <---------------- status=succeeded ---- |
 ```
 
-## 客户端消息
+推荐轮询间隔 300–500 ms，总等待时间不超过 `emotion_request_timeout + 10s`。
 
-### start
+## 创建任务
 
-```json
-{
-  "type": "start",
-  "format": "pcm_s16le",
-  "sample_rate_hz": 16000,
-  "channels": 1,
-  "mode": "ser",
-  "language": "zh",
-  "config": {
-    "emotion_request_timeout": 30
-  }
-}
-```
-
-| 字段 | 类型 | 必填 | 说明 |
-|---|---|---|---|
-| `type` | string | 是 | 固定为 `start` |
-| `format` | string | 是 | 固定为 `pcm_s16le` |
-| `sample_rate_hz` | integer | 是 | 固定为 `16000` |
-| `channels` | integer | 是 | 固定为 `1` |
-| `mode` | string | 否 | `ser` 或 `sec` |
-| `language` | string | 否 | 透传字段；如提供，响应会回填 |
-| `config` | object | 否 | 当前连接的服务端配置覆写 |
-
-### 二进制音频帧
-
-`start` 后持续发送 PCM bytes。建议每帧 80 ms，即 2560 bytes。
-
-### stop
-
-```json
-{"type":"stop"}
-```
-
-服务端收到后对累计音频做一次推理，并返回一条 `final_emotion`。如果没有有效音频，也会返回一条空结果。
-
-## 服务端消息
-
-### ready
-
-```json
-{"type":"ready"}
-```
-
-### final_emotion
-
-SER 响应：
-
-```json
-{
-  "type": "final_emotion",
-  "mode": "ser",
-  "label": "Happy",
-  "text": "Happy",
-  "duration_sec": 3.21,
-  "language": "zh"
-}
-```
-
-SEC 响应：
-
-```json
-{
-  "type": "final_emotion",
-  "mode": "sec",
-  "label": "Happy",
-  "text": "The speaker sounds excited and cheerful.",
-  "duration_sec": 3.21,
-  "language": "zh"
-}
-```
-
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `type` | string | 固定为 `final_emotion` |
-| `mode` | string | 本次推理模式：`ser` 或 `sec` |
-| `label` | string | SER 主标签；SEC 下为文本中匹配到的参考标签，可能为空 |
-| `text` | string | SER 下通常与 `label` 一致；SEC 下为自由文本描述 |
-| `raw_text` | string | 可选，模型原始输出与 `text` 不一致时返回 |
-| `duration_sec` | number | 实际推理使用的音频时长 |
-| `language` | string | 可选，客户端传入 language 时回填 |
-
-### error
-
-```json
-{
-  "type": "error",
-  "message": "emotion inference failed"
-}
-```
-
-## 可覆写配置
-
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `emotion_task_mode` | string | 默认情感任务模式：`ser` 或 `sec` |
-| `emotion_request_timeout` | number | 单次情感模型请求超时秒数 |
-| `emotion_max_audio_seconds` | number | 单次推理最大音频秒数；超出保留尾部 |
-
-## Python WebSocket 示例
-
-完整可运行脚本见 [examples/ws_emotion.py](examples/ws_emotion.py)。
-
-```bash
-pip install websockets numpy
-
-python docs/examples/ws_emotion.py sample.wav \
-  --url ws://172.16.0.3:8080/emotion-streaming \
-  --mode ser \
-```
-
-## REST 上传接口
-
-`POST /api/emotion/upload` 适合上传完整音频并获得一次情感识别结果。
-
-### 请求
+`POST /api/emotion/jobs`
 
 | 表单字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
@@ -182,35 +64,99 @@ python docs/examples/ws_emotion.py sample.wav \
 | `mode` | string | 否 | `ser` 或 `sec` |
 | `language` | string | 否 | 透传语言字段 |
 
-### 响应
+### 成功响应（202）
 
 ```json
 {
-  "type": "final_emotion",
-  "mode": "ser",
-  "label": "Happy",
-  "text": "Happy",
-  "duration_sec": 3.21,
-  "language": "zh"
+  "job_id": "em_8f3c2a1b4e5d6789",
+  "status": "queued",
+  "poll_url": "/api/emotion/jobs/em_8f3c2a1b4e5d6789"
 }
 ```
 
-### Python REST 示例
+### 背压（503）
 
-完整可运行脚本见 [examples/rest_upload.py](examples/rest_upload.py)。
+等待队列满时返回 `503`，响应头含 `Retry-After: 5`。队列与并发上限见配置项 `emotion_job_queue_max`、`emotion_max_concurrent_jobs`。
+
+## 查询任务
+
+`GET /api/emotion/jobs/{job_id}`
+
+### 进行中
+
+```json
+{
+  "job_id": "em_8f3c2a1b4e5d6789",
+  "status": "running",
+  "created_at": 1710000000.12,
+  "updated_at": 1710000001.05
+}
+```
+
+### 成功
+
+```json
+{
+  "job_id": "em_8f3c2a1b4e5d6789",
+  "status": "succeeded",
+  "created_at": 1710000000.12,
+  "updated_at": 1710000002.31,
+  "result": {
+    "type": "final_emotion",
+    "mode": "ser",
+    "label": "Happy",
+    "text": "Happy",
+    "duration_sec": 3.21,
+    "language": "zh"
+  }
+}
+```
+
+### 失败
+
+```json
+{
+  "job_id": "em_8f3c2a1b4e5d6789",
+  "status": "failed",
+  "error": {
+    "message": "emotion model request timed out",
+    "code": "inference_timeout"
+  }
+}
+```
+
+无有效音频时仍返回 `succeeded`，`result` 中 `label`/`text` 为空、`duration_sec` 为 `0`。
+
+## 可配置参数（服务端 config.json）
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `emotion_max_concurrent_jobs` | 8 | 同时调用 vLLM 的上限 |
+| `emotion_job_queue_max` | 64 | 排队任务上限 |
+| `emotion_job_ttl_sec` | 3600 | 已完成任务元数据保留秒数 |
+| `emotion_request_timeout` | 30 | 单次 vLLM 请求超时 |
+| `emotion_max_audio_seconds` | 20 | 超长音频保留尾部秒数 |
+
+## Python 示例
+
+完整可运行脚本见 [examples/http_emotion_job.py](examples/http_emotion_job.py)。
 
 ```bash
 pip install requests
 
-python docs/examples/rest_upload.py emotion sample.wav \
+python docs/examples/http_emotion_job.py sample.wav \
   --base-url http://172.16.0.3:8080 \
   --mode ser \
-  --language zh \
+  --language zh
 ```
+
+## 部署说明
+
+- Job 状态保存在 **进程内存** 中；`uvicorn --workers N` 且 N>1 时，创建与轮询必须命中同一 worker，或后续引入 Redis 等共享存储。
+- 单 worker systemd 部署（`172.16.0.3:8080`）下可直接使用本 API。
 
 ## 相关文档
 
 - [API 总览](api-reference.md)
-- [通用流式 ASR](transcribe-streaming-protocol.md)
-- [分段情感识别](emotion-segmented-streaming-protocol.md)
+- [分段情感识别 WebSocket](emotion-segmented-streaming-protocol.md)
 - [目标说话人 ASR](tsasr.md)
