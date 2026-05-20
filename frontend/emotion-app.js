@@ -17,9 +17,19 @@
 (() => {
   'use strict';
 
-  const i18n = window.Amphion && window.Amphion.i18n;
-  const t = (key, vars) => (i18n ? i18n.t(key, vars) : (vars && vars.defaultValue) || key);
-  const onLangChange = (fn) => (i18n ? i18n.onChange(fn) : () => {});
+  // Emotion demo page module.
+  //
+  // Wrapped in an ``init`` factory so the SPA router can mount and tear
+  // down this page repeatedly within a single document. ``init``
+  // returns a ``dispose`` callback the router calls before swapping the
+  // page out — that aborts uploads, closes the WS, releases the
+  // microphone + AudioContext, cancels the idle-release timer, and
+  // unsubscribes from i18n change events.
+  function initEmotion() {
+    const i18n = window.Amphion && window.Amphion.i18n;
+    const t = (key, vars) => (i18n ? i18n.t(key, vars) : (vars && vars.defaultValue) || key);
+    const onLangChange = (fn) => (i18n ? i18n.onChange(fn) : () => {});
+    let i18nUnsub = null;
 
   const MODE_LABEL_KEYS = { ser: 'emotion.mode.tag.ser', sec: 'emotion.mode.tag.sec' };
   const modeTag = (mode) => t(MODE_LABEL_KEYS[mode] || 'emotion.mode.tag.ser', {
@@ -671,13 +681,17 @@
     });
   }
 
-  window.addEventListener('beforeunload', () => {
+  // ``beforeunload`` still fires on a real tab close. Wrap so dispose
+  // can ``removeEventListener`` it during SPA navigation — otherwise
+  // every emotion mount would stack a duplicate listener.
+  function onBeforeUnload() {
     try { releaseCapture(); } catch (_) { /* ignore */ }
     try { closeWsSilently(); } catch (_) { /* ignore */ }
-  });
+  }
+  window.addEventListener('beforeunload', onBeforeUnload);
 
   // --- Refresh on language change ---
-  onLangChange(() => {
+  i18nUnsub = onLangChange(() => {
     if (currentStatus.labelKey) {
       setStatus(currentStatus.state, currentStatus.labelKey, currentStatus.labelVars);
     }
@@ -702,4 +716,36 @@
   setButton('idle');
   setIdleStatus();
   renderHistory();
+
+    // --- Dispose ---
+    // Called by the SPA router before the emotion <main> is swapped
+    // out. Release every external resource:
+    //   * In-flight upload AbortController
+    //   * Live WebSocket
+    //   * Microphone + AudioContext + worklet (warm-capture state)
+    //   * Idle-release timer that would otherwise fire after we're
+    //     gone and try to call setIdleStatus on detached DOM nodes
+    //   * i18n change subscription
+    return function disposeEmotion() {
+      try {
+        window.removeEventListener('beforeunload', onBeforeUnload);
+      } catch (_) { /* ignore */ }
+      if (uploadController) {
+        try { uploadController.abort(); } catch (_) { /* ignore */ }
+        uploadController = null;
+      }
+      try { closeWsSilently(); } catch (_) { /* ignore */ }
+      try { releaseCapture(); } catch (_) { /* ignore */ }
+      try { cancelIdleRelease(); } catch (_) { /* ignore */ }
+      isRecording = false;
+      awaitingFinal = false;
+      if (typeof i18nUnsub === 'function') {
+        try { i18nUnsub(); } catch (_) { /* ignore */ }
+        i18nUnsub = null;
+      }
+    };
+  }
+
+  window.AmphionPages = window.AmphionPages || {};
+  window.AmphionPages.emotion = { init: initEmotion };
 })();

@@ -43,6 +43,24 @@ class TaskEngine(Protocol):
     async def handle_partial(self, snap: PartialSnapshot, ctx: SessionContext) -> None:
         """Optional: emit incremental ("partial") result mid-utterance."""
 
+    async def handle_speech_start(self, ctx: SessionContext) -> None:
+        """Optional: react to VAD's silent->speaking transition.
+
+        Fires once per utterance, ahead of ``handle_partial`` /
+        ``handle_segment``. Useful for engines that want to paint a
+        placeholder UI ("识别中…") the moment the user opens their
+        mouth instead of waiting for the segment to finalize.
+        """
+
+    async def handle_speech_dropped(self, ctx: SessionContext) -> None:
+        """Optional: react when an announced utterance is abandoned.
+
+        Pairs with ``handle_speech_start``: fires when the in-flight
+        utterance never produces a usable segment (too short, force
+        flush mid-speech, etc.). Engines that announced a placeholder
+        on speech-start should retract it here.
+        """
+
     async def on_stop(
         self,
         ctx: SessionContext,
@@ -70,6 +88,12 @@ class BaseTaskEngine:
         return None
 
     async def handle_partial(self, snap: PartialSnapshot, ctx: SessionContext) -> None:
+        return None
+
+    async def handle_speech_start(self, ctx: SessionContext) -> None:
+        return None
+
+    async def handle_speech_dropped(self, ctx: SessionContext) -> None:
         return None
 
     async def on_stop(

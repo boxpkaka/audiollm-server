@@ -127,7 +127,6 @@ button {
   padding: 22px 14px 18px;
   background: var(--paper-sunk);
   border-right: 1px solid var(--line);
-  view-transition-name: sidebar;
   z-index: 10;
 }
 
@@ -526,39 +525,6 @@ button {
   }
 }
 
-/* -------------------- Streaming text reveal -------------------- */
-.stream-char {
-  opacity: 0;
-  display: inline;
-  animation: stream-char-in 0.18s ease-out forwards;
-}
-
-@keyframes stream-char-in {
-  from {
-    opacity: 0;
-    filter: blur(3px);
-  }
-  to {
-    opacity: 1;
-    filter: blur(0);
-  }
-}
-
-.stream-meta {
-  animation: stream-meta-in 0.3s ease-out 0.4s both;
-}
-
-@keyframes stream-meta-in {
-  from {
-    opacity: 0;
-    transform: translateY(3px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
 .hotword-hit {
   display: inline;
   padding: 0 4px;
@@ -567,6 +533,85 @@ button {
   color: var(--accent-deep);
   background: var(--accent-soft);
   border: 1px solid rgba(204, 120, 92, 0.24);
+}
+
+/* -------------------- Streaming text crossfade --------------------
+   Each update of a streaming bubble inserts a new ``.text-frame`` layer
+   that fades in while the previous layer fades out on top of it. Both
+   layers live in the same CSS Grid cell so the paragraph's height /
+   width is determined by the union of the two during the swap, then
+   relaxes to the new layer once the leaving frame is removed.
+
+   This is intentionally simpler than per-character diffing — see the
+   companion comment in frontend/streaming-text.js for the rationale.
+   The trade-off is that unchanged glyphs also briefly re-fade on every
+   partial, but the visual result is a calm crossfade rather than a
+   busy left-to-right wave that draws the eye away from the content. */
+.bubble-text {
+  display: inline-grid;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.bubble-text > .text-frame {
+  /* Stack every layer in the same cell so they overlap pixel-perfectly
+     during the crossfade window. */
+  grid-column: 1;
+  grid-row: 1;
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: inherit;
+}
+
+.bubble-text > .text-frame.is-current {
+  animation: text-frame-in 0.32s ease-out;
+}
+
+.bubble-text > .text-frame.is-leaving {
+  /* ``forwards`` keeps opacity at 0 between the animation finishing and
+     the JS cleanup yanking the node, so we never see a single-frame
+     flash of the leaving text after its fade completes. */
+  pointer-events: none;
+  animation: text-frame-out 0.28s ease-in forwards;
+}
+
+/* Hotword highlight applied to runs inside the final ``is-current``
+   layer. ``applyHotwordHighlights`` rewrites the layer's innerHTML to
+   wrap matching substrings in ``<mark class="is-hotword">``; we strip
+   the browser's default yellow ``mark`` styling and reapply the brand
+   accent palette. Each match is one continuous element so we don't
+   need the per-char ``:has``-based boundary rules the diff version
+   relied on. */
+.bubble-text .is-hotword,
+.bubble-text mark.is-hotword {
+  color: var(--accent-deep);
+  background: var(--accent-soft);
+  font-weight: 500;
+  /* tiny vertical breathing room via box-shadow inset rather than
+     padding so the glyph baseline doesn't shift */
+  box-shadow: inset 0 -1px 0 rgba(181, 96, 74, 0.35);
+  border-radius: 4px;
+  padding: 0 2px;
+}
+
+@keyframes text-frame-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes text-frame-out {
+  from { opacity: 1; }
+  to   { opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* Honour the OS-level "reduce motion" preference: snap text in / out
+     instantly so users sensitive to motion still see updated bubbles
+     without any visible transition. */
+  .bubble-text > .text-frame.is-current,
+  .bubble-text > .text-frame.is-leaving {
+    animation-duration: 0.001s;
+  }
 }
 
 /* -------------------- Shimmer -------------------- */
@@ -651,10 +696,6 @@ button {
     color 0.22s ease;
   position: relative;
   z-index: 1;
-  /* Keep the mic pinned across page transitions. Because the button sits at
-     the same spot on every page and shares this name, the VT engine treats
-     it as a single element that simply stays put instead of fading out. */
-  view-transition-name: mic-btn;
 }
 
 .mic-btn:hover:not([disabled]) {
@@ -682,12 +723,6 @@ button {
   animation: mic-breathe 1.8s ease-in-out infinite;
 }
 
-::view-transition-old(mic-btn),
-::view-transition-new(mic-btn) {
-  /* Static mic = same snapshot both sides; no animation needed. */
-  animation: none;
-}
-
 @keyframes mic-breathe {
   0%, 100% {
     box-shadow:
@@ -708,7 +743,25 @@ button {
   margin-top: 12px;
 }
 
-/* -------------------- Replay button -------------------- */
+/* -------------------- Replay button --------------------
+   ``.bubble-replay-slot`` is the placeholder rendered into the bubble
+   skeleton from page load. It MUST occupy the exact box the eventual
+   ``.replay-btn`` will take so the moment the final response arrives
+   and ``applyReplayButton`` swaps the placeholder for a real button,
+   no width is added to the flex row and the wrapped text doesn't
+   reflow. The button itself layers ``.replay-btn`` on top of the same
+   ``.bubble-replay-slot`` class, so its own width/margin rule wins for
+   the visual chrome (border, background, hover) while the slot rule
+   keeps the reserved geometry consistent across both states. */
+.bubble-replay-slot {
+  display: inline-flex;
+  width: 22px;
+  height: 22px;
+  margin-left: 4px;
+  flex-shrink: 0;
+  vertical-align: middle;
+}
+
 .replay-btn {
   display: inline-flex;
   align-items: center;
@@ -1096,14 +1149,22 @@ button {
   }
 }
 
-/* -------------------- View transitions -------------------- */
-@view-transition {
-  navigation: auto;
-}
+/* -------------------- View transitions --------------------
+   The SPA router (frontend/router.js) replaces ``<main class="app-main">``
+   in place inside ``document.startViewTransition``. The sidebar lives
+   outside that subtree and is therefore not part of the cross-fade —
+   it just stays put. Only the contents that actually changed (the
+   page header text and ``.page-content``) participate in the root
+   cross-fade.
+
+   We deliberately do NOT register a ``@view-transition`` rule here;
+   that rule only matters for cross-document navigations, which the
+   SPA short-circuits.
+*/
 
 ::view-transition-old(root),
 ::view-transition-new(root) {
-  animation-duration: 260ms;
+  animation-duration: 140ms;
   animation-timing-function: cubic-bezier(0.2, 0.72, 0.2, 1);
 }
 
@@ -1124,27 +1185,12 @@ button {
 @keyframes page-fade-in {
   from {
     opacity: 0;
-    transform: translateY(6px);
+    transform: translateY(2px);
   }
   to {
     opacity: 1;
     transform: translateY(0);
   }
-}
-
-::view-transition-old(sidebar),
-::view-transition-new(sidebar) {
-  animation: none;
-  mix-blend-mode: normal;
-}
-
-/* Fallback when VT is unsupported */
-.app-main.is-page-leaving {
-  opacity: 0;
-  transform: translateY(-4px);
-  transition:
-    opacity 0.22s ease,
-    transform 0.22s ease;
 }
 
 /* -------------------- Responsive -------------------- */

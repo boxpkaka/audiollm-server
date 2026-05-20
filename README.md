@@ -37,7 +37,7 @@ cp backend/api.json.example backend/api.json && vim backend/api.json
 bash start.sh
 ```
 
-浏览器打开 `https://<服务器IP>:8443` 进入实时 ASR Demo，另两个 Demo 入口：
+浏览器打开 `http://172.16.0.3:8080`（systemd 部署）或 `https://172.16.0.3:8443`（`bash start.sh` 自签 HTTPS）进入实时 ASR Demo，另两个 Demo 入口：
 
 | 页面 | 路径 | 说明 |
 |---|---|---|
@@ -48,6 +48,23 @@ bash start.sh
 页面右上角的 EN / 中 切换会持久化到浏览器 localStorage，下次访问保持上次的选择。
 
 > 首次访问时浏览器会提示自签名证书不安全，点击 **高级** → **继续访问** 即可。
+
+---
+
+## 前端样式重建（Tailwind）
+
+前端三个 Demo 页面共用一份 **预编译** 的 Tailwind 工具类样式 `frontend/tailwind.css`（已入仓），运行时不再依赖 `cdn.tailwindcss.com` 的 JIT 脚本，跨页切换不会再有"重新跑一遍 Tailwind 编译"的卡顿。
+
+仅当你修改了 `frontend/*.html` 或 `frontend/*.js` 中使用的 Tailwind 类名（包括 JS 字符串里拼接出来的 `lg:w-[380px]` 等动态类）后，需要重新生成一次：
+
+```bash
+bash scripts/build_tailwind.sh           # 一次性构建
+bash scripts/build_tailwind.sh --watch   # 监听文件改动持续构建
+```
+
+脚本通过 `npx tailwindcss@3` 调用 Tailwind v3 CLI，按 `frontend/tailwind.config.js` 中声明的 content 范围扫描，并写出压缩后的 `frontend/tailwind.css`。需要本机已安装 Node.js (>= 18) 和 npm。
+
+如果你新增了 Tailwind 类却忘了重建，浏览器只会回退到没有该类的默认样式（不会报错），需要重新运行脚本。
 
 ---
 
@@ -114,7 +131,7 @@ graph LR
 通过 WebSocket 连接：
 
 ```
-wss://<host>:<port>/transcribe-streaming
+ws://172.16.0.3:8080/transcribe-streaming
 ```
 
 **消息流程：**
@@ -175,15 +192,11 @@ wss://<host>:<port>/transcribe-streaming
 **Python 调用示例：**
 
 ```python
-import asyncio, json, ssl, websockets
+import asyncio, json, websockets
 
 async def transcribe(pcm_bytes: bytes):
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-
     async with websockets.connect(
-        "wss://localhost:8443/transcribe-streaming", ssl=ctx
+        "ws://172.16.0.3:8080/transcribe-streaming"
     ) as ws:
         ready = json.loads(await ws.recv())
         assert ready["type"] == "ready"
@@ -241,7 +254,9 @@ MODEL_PATH=/path/to/Qwen3-ASR-1.7B bash scripts/start_vllm_qwen.sh
 
 ## 运维脚本
 
-如果你通过 systemd（服务名默认 `audiollm-demo`）部署本服务，可以用 `scripts/restart_service.sh` 一键重启并查看日志，改完后端代码后无需手动敲 `systemctl`：
+systemd 服务（默认单元名 `audiollm-demo`）监听 `172.16.0.3:8080`（HTTP，无 TLS）。对外 REST / WebSocket / 静态页 Base URL 为 `http://172.16.0.3:8080`；WebSocket 使用 `ws://172.16.0.3:8080/<endpoint>`。
+
+如果你通过 systemd 部署本服务，可以用 `scripts/restart_service.sh` 一键重启并查看日志，改完后端代码后无需手动敲 `systemctl`：
 
 ```bash
 scripts/restart_service.sh            # 重启并打印最近 30 行日志
@@ -265,9 +280,9 @@ SERVICE=my-demo scripts/restart_service.sh   # 指定其他 systemd 服务名
 
 | 参数 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `vllm_base_url` | string | `http://localhost:8000` | 主 ASR 模型的服务地址 |
+| `vllm_base_url` | string | `http://172.16.0.3:8000` | 主 ASR 模型的服务地址 |
 | `vllm_model_name` | string | `Amphion/Amphion-3B` | 主 ASR 模型名称 |
-| `secondary_vllm_base_url` | string | `http://localhost:8001` | 副 ASR 模型的服务地址 |
+| `secondary_vllm_base_url` | string | `http://172.16.0.3:8001` | 副 ASR 模型的服务地址 |
 | `secondary_vllm_model_name` | string | `Qwen/Qwen3-ASR-1.7B` | 副 ASR 模型名称 |
 | `enable_primary_asr` | bool | `true` | 是否启用主模型。关闭后只用副模型 |
 | `enable_secondary_asr` | bool | `true` | 是否启用副模型。关闭后只用主模型 |
@@ -325,7 +340,7 @@ SERVICE=my-demo scripts/restart_service.sh   # 指定其他 systemd 服务名
 | `tsasr_enrollment_max_sec` | float | `5.0` | 注册音频最长时长（秒），超过此值服务端用 VAD 抽取有声帧后截断到该上限，而不是拒绝 |
 | `tsasr_max_audio_seconds` | float | `30.0` | 单段混合音频时长上限；超过则保留尾部 |
 | `tsasr_enable_partial` | bool | `false` | 是否开启伪流式 partial；双音频推理 RTF 较高，默认关闭 |
-| `tsasr_enable_hotwords` | bool | `false` | 是否把会话热词注入 Prompt；短期方案未验证，默认关闭 |
+| `tsasr_enable_hotwords` | bool | `true` | 是否把会话热词注入 Prompt（在 Transcribe 行后追加 `Hotwords:` 行）；已与 v3 训练 prompt 对齐，默认开启 |
 | `tsasr_speech_gate_enabled` | bool | `true` | 二级语音存在性门控开关。TS-ASR 模式下副模型被关闭，对 VAD 漏判的键盘敲击等瞬时噪音再做一次过滤 |
 | `tsasr_speech_gate_prob_threshold` | float | `0.6` | 门控逐帧判帧的概率阈值，比上层 `vad_threshold` 更严格 |
 | `tsasr_speech_gate_min_voiced_ms` | int | `200` | 累计有声时长低于此值的片段会被丢弃，不再下发到 vLLM |
@@ -334,7 +349,7 @@ SERVICE=my-demo scripts/restart_service.sh   # 指定其他 systemd 服务名
 
 | 参数 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `emotion_vllm_base_url` | string | `http://localhost:8000` | 情感识别模型的 vLLM 服务地址；默认与主 ASR 共用同一 Amphion 多任务服务 |
+| `emotion_vllm_base_url` | string | `http://172.16.0.3:8000` | 情感识别模型的 vLLM 服务地址；默认与主 ASR 共用同一 Amphion 多任务服务 |
 | `emotion_vllm_model_name` | string | `Amphion/Amphion-3B` | 情感识别模型名称；与 AmphionASR 项目的 SER/SEC 训练模型一致 |
 | `emotion_request_timeout` | float | `30.0` | 情感推理 HTTP 请求总超时（秒） |
 | `emotion_max_audio_seconds` | float | `20.0` | 单次推理处理的最长音频秒数；超过则保留尾部，贴合 Amphion SER/SEC 训练时 1-20s 的 utterance 上限 |
@@ -350,7 +365,7 @@ SERVICE=my-demo scripts/restart_service.sh   # 指定其他 systemd 服务名
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `PORT` | `8443` | HTTPS 服务端口（启动脚本参数） |
+| `PORT` | `8443` | `start.sh` 自签 HTTPS 端口；systemd 固定为 `8080`（HTTP） |
 
 ---
 

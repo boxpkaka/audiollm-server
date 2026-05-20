@@ -1,63 +1,59 @@
-# /emotion-segmented-streaming WebSocket 协议文档
+# 分段情感识别 API
 
-> 端点命名约定：本服务按任务一类一个 WebSocket 端点（`/<task>-streaming`）。本文档描述 VAD 切段的流式情感识别任务，与整段非流式版本 `/emotion-streaming`（详见 [docs/emotion-streaming-protocol.md](emotion-streaming-protocol.md)）并列存在；二者共享同一套控制消息基础结构（`ready` / `start` / `stop` / `error` / `start.config` 覆写机制）以及同一个底层情感模型，仅切段策略与最终消息节奏不同。
+`/emotion-segmented-streaming` 用于长连接场景下的分段情感识别。客户端持续发送 PCM 音频流，服务端按 VAD 切段，并在每个语音段结束后返回一条 `final_emotion`。
 
-## 概述
+如果只需要对一段录音做一次情感判断，请使用 [整段情感识别 API](emotion-streaming-protocol.md) 或 `POST /api/emotion/upload`。
 
-`/emotion-segmented-streaming` 在客户端持续推送 PCM 流的过程中按 VAD 切段，每段语音结束即触发一次情感推理，按段返回 `final_emotion`。底层模型与 prompt 与 [docs/emotion-streaming-protocol.md](emotion-streaming-protocol.md) 完全一致，支持 `ser` / `sec` 两种任务变体（见原文档的标签集说明）。
+## 接口信息
 
-适用场景：长时间持续录音、需要按句更新情感判断的对话/直播链路。若上游已自行做了句级切段、只需「整段一次性给出情感」，请使用 `/emotion-streaming`。
-
-与 `/emotion-streaming` 的关键差异：
-
-| 维度 | /emotion-streaming | /emotion-segmented-streaming |
-|---|---|---|
-| 是否启用 VAD | 否（整段缓存到 stop） | 是（同 /transcribe-streaming） |
-| final_emotion 数量 | 每个 start/stop 周期 1 条；空会话兜底返回一条 label="" 的 final_emotion | 每个 VAD 段 1 条；空会话不返回 final_emotion |
-| stop 后行为 | 触发整段推理 | flush 残余尾段；若无残余则不再产出 |
-| partial 输出 | 否 | 否（情感任务一律不出 partial） |
-| 模型 / prompt / mode 字段 | 完全一致 | 完全一致 |
-| max_audio_seconds 作用域 | 整段 | 每个 VAD 段独立生效 |
-
-## 连接
-
-```
-ws://<host>:<port>/emotion-segmented-streaming?language=<lang>
-wss://<host>:<port>/emotion-segmented-streaming?language=<lang>
-```
+| 项目 | 说明 |
+|---|---|
+| 协议 | WebSocket |
+| 路径 | `/emotion-segmented-streaming` |
+| 完整 URL | `ws://172.16.0.3:8080/emotion-segmented-streaming?language=<lang>` |
+| 鉴权 | 无内置鉴权，无需自定义请求头 |
+| 音频输入 | 二进制 PCM 帧，16 kHz、mono、signed 16-bit little-endian |
+| 分段策略 | 服务端 VAD 自动切段 |
+| 中间结果 | 不支持 |
+| 最终结果 | 每个有效 VAD 语音段一条 `final_emotion` |
 
 ### Query 参数
 
-| 参数     | 必填 | 说明                                          |
-|----------|------|-----------------------------------------------|
-| language | 否   | 语言代码，如 zh/en/id/th。仅作信息透传（情感模型本身与语言解耦），若提供，服务端会在每条 final_emotion 中回填 language 字段以便上游路由 |
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `language` | string | 否 | 透传语言字段，如 `zh`、`en`、`id`、`th`；服务端会在结果中回填 |
 
-## 消息时序
+## 与整段情感接口的区别
 
+| 维度 | `/emotion-streaming` | `/emotion-segmented-streaming` |
+|---|---|---|
+| VAD | 不启用 | 启用 |
+| 结果数量 | 每次 start/stop 一条 | 每个有效语音段一条 |
+| stop 后行为 | 即使空会话也返回一条结果 | 仅 flush 有效尾段；空会话可能无结果 |
+| 适用场景 | 单条录音、离线文件 | 实时对话、直播、长录音 |
+
+## 调用流程
+
+```text
+Client                                      Server
+  | ---- WebSocket connect --------------> |
+  | <---------------- ready -------------- |
+  | ---- start --------------------------> |
+  | ---- binary PCM chunk ---------------> |
+  | ---- binary PCM chunk ---------------> |
+  | <---------------- final_emotion ------ |  segment 1
+  | ---- binary PCM chunk ---------------> |
+  | <---------------- final_emotion ------ |  segment 2
+  | ---- stop ---------------------------> |
+  | <---------------- final_emotion ------ |  trailing segment, if any
+  | ---- close --------------------------> |
 ```
-Client                                Server
-  |                                      |
-  |  ---- WebSocket 连接 -------------->  |
-  |  <--------  ready  ---------------   |
-  |  ----  start (含 mode) ----------->   |
-  |  ----  binary PCM chunk  -------->    |
-  |  ----  binary PCM chunk  -------->    |
-  |  <--------  final_emotion  -------    |  每个 VAD 段一条
-  |  ----  binary PCM chunk  -------->    |
-  |  ----  ...                            |
-  |  <--------  final_emotion  -------    |
-  |  ----  stop  -------------------->    |
-  |  <--------  final_emotion  -------    |  仅当存在尾部残余段时
-  |  ---- 连接关闭 ---                     |
-```
 
-注意：与 `/emotion-streaming` 不同，stop 之后不会强行返回一条空 `final_emotion`。如果整个会话没有任何被 VAD 判定为语音的片段，客户端将收不到任何 `final_emotion`，请按 `stop` + WebSocket close 作为会话结束信号。
+客户端不应假设 `stop` 后一定有结果。如果整段音频没有被 VAD 判定为有效语音，服务端可能不返回 `final_emotion`。
 
-## 客户端 -> 服务端消息
+## 客户端消息
 
-### 1. start
-
-建连收到 `ready` 后发送，声明音频参数与任务模式。必须在发送 PCM 之前发送，一次会话只能发一条。
+### start
 
 ```json
 {
@@ -68,100 +64,97 @@ Client                                Server
   "mode": "ser",
   "language": "zh",
   "config": {
-    "emotion_request_timeout": 20.0,
     "min_segment_duration_ms": 500
   }
 }
 ```
 
-| 字段           | 类型   | 必填 | 说明                                                     |
-|----------------|--------|------|----------------------------------------------------------|
-| type           | string | 是   | 固定 "start"                                             |
-| format         | string | 否   | 固定 "pcm_s16le"                                         |
-| sample_rate_hz | int    | 否   | 16000                                                    |
-| channels       | int    | 否   | 1                                                        |
-| mode           | string | 否   | 任务变体 "ser" 或 "sec"，缺省读 Config.emotion_task_mode |
-| language       | string | 否   | 与 query 参数二选一，仅作元信息透传                      |
-| config         | object | 否   | 服务端 Config 字段平铺覆写（同 /emotion-streaming 机制） |
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `type` | string | 是 | 固定为 `start` |
+| `format` | string | 否 | 固定为 `pcm_s16le` |
+| `sample_rate_hz` | integer | 否 | 固定为 `16000` |
+| `channels` | integer | 否 | 固定为 `1` |
+| `mode` | string | 否 | `ser` 或 `sec`，不传使用服务端默认 |
+| `language` | string | 否 | 透传语言字段；也可通过 query 参数传入 |
+| `config` | object | 否 | 当前连接的服务端配置覆写 |
 
-### 2. 二进制 PCM 音频帧
+### 二进制音频帧
 
-格式与 `/transcribe-streaming` 完全一致：16 kHz、单声道、s16le。建议每帧 30-80 ms。服务端边收边走 VAD，触发段尾时立即排队推理。
+`start` 后持续发送 PCM bytes。建议每帧 30-80 ms。
 
-### 3. stop
+### stop
 
 ```json
-{ "type": "stop" }
+{"type":"stop"}
 ```
 
-收到后服务端立即 flush VAD 残余 PCM；若残余构成有效段则再回一条 `final_emotion`，否则直接进入关闭流程。
+服务端收到后 flush VAD 尾段。如果尾段满足最小时长要求，会返回最后一条 `final_emotion`。
 
-## 服务端 -> 客户端消息
+## 服务端消息
 
-| 消息                                              | 说明                                                                |
-|---------------------------------------------------|---------------------------------------------------------------------|
-| `{"type":"ready"}`                                | WebSocket 就绪，可发送 start                                        |
-| `{"type":"final_emotion", ...}`                   | 单段语音情感推理结果（payload 结构与 /emotion-streaming 完全一致） |
-| `{"type":"error","message":"..."}`                | 推理或控制消息处理中的异常通知；不会主动断开                        |
+### ready
 
-### final_emotion payload
-
-字段含义、SER / SEC 输出形态、固定 8 分类标签集等均与 [docs/emotion-streaming-protocol.md](emotion-streaming-protocol.md) 一致，此处不再重复。需要注意的点：
-
-- duration_sec 是当前 VAD 段（可能再被 emotion_max_audio_seconds 截尾）的实际推理时长，不是会话累计时长。
-- mode 字段在整个会话内固定为 start 时选定的值。
-- 如客户端 start 中传入了 language，每条 final_emotion 都会带回 language 字段。
-
-## 限制 / 默认值
-
-| 项                          | 默认值 | 说明                                                                                       |
-|-----------------------------|--------|--------------------------------------------------------------------------------------------|
-| emotion_vllm_base_url       | http://localhost:8000 | 同 /emotion-streaming                                                       |
-| emotion_vllm_model_name     | Amphion/Amphion-3B    | 同 /emotion-streaming                                                       |
-| emotion_request_timeout     | 30s                   | 单次推理超时                                                                |
-| emotion_max_audio_seconds   | 20s                   | 每个 VAD 段单独生效；超出则保留尾部 20s。长句被切段后通常远低于此上限       |
-| emotion_task_mode           | ser                   | 缺省任务变体；可被 start.mode 覆盖                                          |
-| min_segment_duration_ms     | 与 ASR 共用           | 短于此阈值的 VAD 段会被丢弃（避免对噪声/咳嗽起推理）                        |
-| vad_threshold / silence_duration_ms / vad_*  | 与 ASR 共用 | VAD 灵敏度参数；与 /transcribe-streaming 完全相同                       |
-| enable_pseudo_stream        | -                     | 不影响本端点。情感任务始终不输出 partial，VAD 的 partial 快照路径已被显式关闭 |
-
-服务端 `Config` 中所有 `emotion_*` 字段以及 VAD / 切段相关字段均可由 `start.config` 临时覆写。
-
-## 调用示例
-
-```python
-import asyncio, json, ssl, websockets
-
-async def stream_emotion(pcm_bytes: bytes, mode: str = "ser"):
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-
-    async with websockets.connect(
-        "wss://localhost:8443/emotion-segmented-streaming?language=zh", ssl=ctx
-    ) as ws:
-        ready = json.loads(await ws.recv())
-        assert ready["type"] == "ready"
-
-        await ws.send(json.dumps({
-            "type": "start",
-            "format": "pcm_s16le",
-            "sample_rate_hz": 16000,
-            "channels": 1,
-            "mode": mode,
-        }))
-
-        async def feed():
-            for i in range(0, len(pcm_bytes), 2560):
-                await ws.send(pcm_bytes[i:i + 2560])
-                await asyncio.sleep(0.08)
-            await ws.send(json.dumps({"type": "stop"}))
-
-        asyncio.create_task(feed())
-
-        async for msg in ws:
-            data = json.loads(msg)
-            print(data)
-            if data.get("type") == "error":
-                break
+```json
+{"type":"ready"}
 ```
+
+### final_emotion
+
+payload 与整段情感接口一致：
+
+```json
+{
+  "type": "final_emotion",
+  "mode": "ser",
+  "label": "Neutral",
+  "text": "Neutral",
+  "duration_sec": 2.68,
+  "language": "zh"
+}
+```
+
+字段说明见 [整段情感识别 API](emotion-streaming-protocol.md#服务端消息)。其中 `duration_sec` 表示当前 VAD 语音段的推理时长，不是整个连接的累计时长。
+
+### error
+
+```json
+{
+  "type": "error",
+  "message": "emotion inference failed"
+}
+```
+
+## 可覆写配置
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `vad_threshold` | number | VAD 判定阈值 |
+| `silence_duration_ms` | integer | 静音持续多久后切段 |
+| `min_segment_duration_ms` | integer | 短于该值的语音段会被丢弃 |
+| `emotion_task_mode` | string | 默认情感任务模式：`ser` 或 `sec` |
+| `emotion_request_timeout` | number | 单次情感模型请求超时秒数 |
+| `emotion_max_audio_seconds` | number | 每个语音段最大推理秒数；超出保留尾部 |
+
+`enable_pseudo_stream` 不影响本接口，情感任务不会返回 partial。
+
+## Python WebSocket 示例
+
+完整可运行脚本见 [examples/ws_emotion.py](examples/ws_emotion.py)。
+
+```bash
+pip install websockets numpy
+
+python docs/examples/ws_emotion.py sample.wav \
+  --url ws://172.16.0.3:8080/emotion-segmented-streaming \
+  --segmented \
+  --language zh \
+  --mode ser \
+```
+
+## 相关文档
+
+- [API 总览](api-reference.md)
+- [整段情感识别](emotion-streaming-protocol.md)
+- [通用流式 ASR](transcribe-streaming-protocol.md)
+- [目标说话人 ASR](tsasr.md)

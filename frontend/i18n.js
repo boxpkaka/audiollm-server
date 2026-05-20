@@ -89,7 +89,6 @@
     'asr.hotword.extracting': 'Extracting...',
     'asr.hotword.removeAria': 'Remove hotword',
     'asr.hotword.count': '{n} hotwords',
-    'asr.hotword.sessionHits': 'Session hits:',
 
     'asr.sync.active': 'Active',
     'asr.sync.paused': 'Paused',
@@ -121,7 +120,6 @@
     'asr.debug.reason': 'Reason:',
     'asr.debug.sim': 'Sim:',
     'asr.debug.langDetected': 'Detected language: {lang}',
-    'asr.debug.hotwordHits': 'Hotword hits: {n}',
 
     // ---- ASR upload (one-shot REST) ----
     'asr.upload.label': 'Upload audio',
@@ -212,15 +210,14 @@
     'tsasr.title': 'Target-Speaker ASR',
     'tsasr.subtitle': 'Enroll a voice once, then transcribe only that speaker amid overlapping audio.',
     'tsasr.greeting':
-      'Record a 1-5s clean sample of the target speaker first. Once enrollment is accepted, you can'
+      'Record a 1-8s clean sample of the target speaker first. Once enrollment is accepted, you can'
       + ' start speaking with any interfering audio in the background and the model will transcribe only'
       + ' the enrolled voice.',
     'tsasr.enroll.title': 'Speaker Enrollment',
-    'tsasr.enroll.tip': 'Record 1-5 seconds of the target speaker in a quiet environment.',
+    'tsasr.enroll.tip': 'Record 1-8 seconds of the target speaker in a quiet environment.',
     'tsasr.enroll.start': 'Start recording',
     'tsasr.enroll.stop': 'Stop',
-    'tsasr.enroll.reset': 'Reset',
-    'tsasr.enroll.minMax': 'min 1.0s \u00b7 max 5.0s',
+    'tsasr.enroll.minMax': 'min 1.0s \u00b7 max 8.0s',
     'tsasr.enroll.notRecorded': 'Not recorded',
     'tsasr.enroll.recording': 'Recording...',
     'tsasr.enroll.ready': 'Ready ({dur}s)',
@@ -233,13 +230,12 @@
     'tsasr.mic.start': 'Click to start',
     'tsasr.mic.listening': 'Listening...',
     'tsasr.mic.aria': 'Toggle microphone',
-    'tsasr.footer.note':
-      'Short-term demo: model = primary ASR endpoint.'
-      + ' Prompt and optional switches (hotwords, voice traits) are expected'
-      + ' to evolve before a dedicated TS-ASR checkpoint ships.',
+    'tsasr.recognizing': 'Recognizing\u2026',
     'tsasr.error.serverPrefix': 'Server error [{code}]: {msg}',
     'tsasr.meta.lang': 'language: {lang}',
     'tsasr.replayTitle': 'Replay audio',
+    'tsasr.label.primary': 'Amphion:',
+    'tsasr.label.secondary': 'Qwen:',
 
     // ---- TS-ASR upload (transcription stage only) ----
     'tsasr.upload.label': 'Upload audio',
@@ -269,6 +265,36 @@
     'tsasr.enrollUpload.error.unsupported': 'Audio upload is not supported in this browser.',
     'tsasr.enrollUpload.error.busy': 'A session is already in progress.',
     'tsasr.enrollUpload.error.tooShort': 'File is {dur}s, need at least {min}s.',
+
+    // ---- TS-ASR hotwords (mirrors the realtime-ASR hotword UI) ----
+    'tsasr.hotword.title': 'Hotwords',
+    'tsasr.hotword.tip': 'Boost recognition for domain-specific terms in target-speaker transcripts.',
+    'tsasr.hotword.toggle.title': 'Toggle hotword influence',
+    'tsasr.hotword.toggle.on': 'ON',
+    'tsasr.hotword.placeholder': 'Add hotword (comma-separated for batch)',
+    'tsasr.hotword.add': 'Add',
+    'tsasr.hotword.clear': 'Clear',
+    'tsasr.hotword.textarea.placeholder': 'Paste long text here to extract hotwords with LLM',
+    'tsasr.hotword.extract': 'Extract and Add',
+    'tsasr.hotword.extracting': 'Extracting...',
+    'tsasr.hotword.removeAria': 'Remove hotword',
+    'tsasr.hotword.count': '{n} hotwords',
+
+    'tsasr.sync.active': 'Active',
+    'tsasr.sync.paused': 'Paused',
+    'tsasr.sync.waiting': 'Waiting',
+    'tsasr.sync.offline': 'Offline',
+
+    'tsasr.extract.idle': 'Idle',
+    'tsasr.extract.loading': 'Extracting...',
+    'tsasr.extract.added': 'Added {added}/{total}',
+    'tsasr.extract.wsOffline': 'WebSocket offline',
+    'tsasr.extract.pasteFirst': 'Please paste text first',
+    'tsasr.extract.alreadyRunning': 'Extraction already running',
+    'tsasr.extract.connClosed': 'Connection closed',
+    'tsasr.extract.connError': 'Connection error',
+    'tsasr.extract.failed': 'Extract failed',
+    'tsasr.extract.raw': '{msg}',
 
     // ---- Fusion enums (frontend lookups; no backend coupling) ----
     'fusion.selected.primary_hotword_hit': 'primary_hotword_hit',
@@ -349,7 +375,6 @@
     'asr.hotword.extracting': '抽取中…',
     'asr.hotword.removeAria': '删除热词',
     'asr.hotword.count': '共 {n} 个热词',
-    'asr.hotword.sessionHits': '本次命中：',
 
     'asr.sync.active': '生效中',
     'asr.sync.paused': '已暂停',
@@ -381,7 +406,6 @@
     'asr.debug.reason': '原因：',
     'asr.debug.sim': '相似度：',
     'asr.debug.langDetected': '检测语种：{lang}',
-    'asr.debug.hotwordHits': '热词命中：{n}',
 
     'asr.upload.label': '上传音频',
     'asr.upload.uploading': '上传中…',
@@ -467,14 +491,13 @@
     'tsasr.title': '目标说话人 ASR',
     'tsasr.subtitle': '注册一次目标说话人，即可在重叠音频中只转写该说话人。',
     'tsasr.greeting':
-      '请先录制 1-5 秒目标说话人的纯净样本。注册被接受后，即使背景中有其他人声，'
+      '请先录制 1-8 秒目标说话人的纯净样本。注册被接受后，即使背景中有其他人声，'
       + '模型也只会转写该说话人。',
     'tsasr.enroll.title': '说话人注册',
-    'tsasr.enroll.tip': '在安静环境下录制 1-5 秒目标说话人的语音。',
+    'tsasr.enroll.tip': '在安静环境下录制 1-8 秒目标说话人的语音。',
     'tsasr.enroll.start': '开始录音',
     'tsasr.enroll.stop': '停止',
-    'tsasr.enroll.reset': '重置',
-    'tsasr.enroll.minMax': '最少 1.0 秒 \u00b7 最多 5.0 秒',
+    'tsasr.enroll.minMax': '最少 1.0 秒 \u00b7 最多 8.0 秒',
     'tsasr.enroll.notRecorded': '未录制',
     'tsasr.enroll.recording': '录音中…',
     'tsasr.enroll.ready': '就绪（{dur}s）',
@@ -487,12 +510,12 @@
     'tsasr.mic.start': '点击开始',
     'tsasr.mic.listening': '聆听中…',
     'tsasr.mic.aria': '切换麦克风',
-    'tsasr.footer.note':
-      '短期演示：模型 = 主路 ASR 端点。'
-      + '后续将引入专用 TS-ASR 模型；提示与可选参数（热词、声音特征）也将随之演进。',
+    'tsasr.recognizing': '识别中…',
     'tsasr.error.serverPrefix': '服务端错误 [{code}]：{msg}',
     'tsasr.meta.lang': '语种：{lang}',
     'tsasr.replayTitle': '重新播放',
+    'tsasr.label.primary': '安菲翁：',
+    'tsasr.label.secondary': '千问：',
 
     'tsasr.upload.label': '上传音频',
     'tsasr.upload.uploading': '上传中…',
@@ -520,6 +543,36 @@
     'tsasr.enrollUpload.error.unsupported': '当前浏览器不支持音频上传。',
     'tsasr.enrollUpload.error.busy': '已有任务进行中。',
     'tsasr.enrollUpload.error.tooShort': '文件时长 {dur} 秒，至少需要 {min} 秒。',
+
+    // ---- 目标说话人热词（与实时语音识别页面的热词 UI 对齐） ----
+    'tsasr.hotword.title': '热词',
+    'tsasr.hotword.tip': '在目标说话人识别中提升专有名词与领域词的识别准确率。',
+    'tsasr.hotword.toggle.title': '热词开关',
+    'tsasr.hotword.toggle.on': '开',
+    'tsasr.hotword.placeholder': '添加热词（多个用逗号分隔）',
+    'tsasr.hotword.add': '添加',
+    'tsasr.hotword.clear': '清空',
+    'tsasr.hotword.textarea.placeholder': '在此粘贴长文，使用大模型抽取热词',
+    'tsasr.hotword.extract': '抽取并添加',
+    'tsasr.hotword.extracting': '抽取中…',
+    'tsasr.hotword.removeAria': '删除热词',
+    'tsasr.hotword.count': '共 {n} 个热词',
+
+    'tsasr.sync.active': '生效中',
+    'tsasr.sync.paused': '已暂停',
+    'tsasr.sync.waiting': '等待中',
+    'tsasr.sync.offline': '离线',
+
+    'tsasr.extract.idle': '空闲',
+    'tsasr.extract.loading': '抽取中…',
+    'tsasr.extract.added': '已添加 {added}/{total}',
+    'tsasr.extract.wsOffline': 'WebSocket 离线',
+    'tsasr.extract.pasteFirst': '请先粘贴文本',
+    'tsasr.extract.alreadyRunning': '抽取任务进行中',
+    'tsasr.extract.connClosed': '连接已关闭',
+    'tsasr.extract.connError': '连接错误',
+    'tsasr.extract.failed': '抽取失败',
+    'tsasr.extract.raw': '{msg}',
 
     'fusion.selected.primary_hotword_hit': '主路命中热词',
     'fusion.selected.primary_agreement': '主副路一致',

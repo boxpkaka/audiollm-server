@@ -3,7 +3,8 @@
 The session owns:
 
 - WebSocket lifecycle (ready, receive loop, error/close)
-- Parsing of common control messages (start/stop/update_hotwords)
+- Parsing of common control messages
+  (start/stop/update_hotwords/extract_hotwords)
 - Per-session config override (Config.override)
 - Dispatching ``SegmentReady`` events serially through a work queue
 - Throttled, non-overlapping dispatch of ``PartialSnapshot`` events
@@ -21,10 +22,10 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-from ..asr.hotword import sanitize_hotwords
+from ..asr.hotword import query_text_hotwords, sanitize_hotwords
 from ..config import Config, load_config
 from .audio_stream import AudioStream
-from .events import PartialSnapshot, SegmentReady
+from .events import PartialSnapshot, SegmentReady, SpeechDropped, SpeechStarted
 
 if TYPE_CHECKING:
     from ..tasks.base import TaskEngine
@@ -103,6 +104,10 @@ class StreamingSession:
 
         self._work_queue: asyncio.Queue = asyncio.Queue(maxsize=40)
         self._partial_task: asyncio.Task | None = None
+        # Long-text hotword extraction runs out-of-band so the receive
+        # loop never blocks on an LLM round-trip; outstanding tasks
+        # are tracked here and cancelled in cleanup.
+        self._extract_tasks: set[asyncio.Task] = set()
 
         self._started = False
         self._stopped = False
@@ -129,6 +134,10 @@ class StreamingSession:
     async def cleanup(self) -> None:
         if self._partial_task and not self._partial_task.done():
             self._partial_task.cancel()
+        if self._extract_tasks:
+            for task in self._extract_tasks:
+                task.cancel()
+            await asyncio.gather(*self._extract_tasks, return_exceptions=True)
         logger.info("StreamingSession[%s] ended", self.engine.name)
 
     # ------------------------------------------------------------------
@@ -169,7 +178,7 @@ class StreamingSession:
         finally:
             # Always flush remaining audio so engine sees the tail.
             for ev in self.stream.flush(force=True):
-                self._enqueue_segment(ev)
+                await self._dispatch_stream_event(ev)
             await self._work_queue.put(_SENTINEL)
 
     async def _handle_text(self, text: str) -> bool:
@@ -185,6 +194,9 @@ class StreamingSession:
             return True
         if msg_type == "update_hotwords":
             self._handle_update_hotwords(ctrl)
+            return False
+        if msg_type == "extract_hotwords":
+            self._handle_extract_hotwords(ctrl)
             return False
         # Delegate unknown control messages to engine (returns truthy if handled).
         try:
@@ -248,13 +260,57 @@ class StreamingSession:
             self.ctx.hotwords, self.ctx.src_lang,
         )
 
+    def _handle_extract_hotwords(self, ctrl: dict) -> None:
+        """Schedule a long-text hotword extraction in the background.
+
+        The receive loop returns immediately so further audio frames /
+        control messages are not blocked by the LLM round-trip; the
+        eventual ``extract_hotwords_result`` (or ``..._error``) is
+        sent through the same WebSocket from the spawned task.
+        """
+        request_id = str(ctrl.get("request_id", "")).strip()
+        source_text = str(ctrl.get("text", ""))
+        task = asyncio.create_task(
+            self._run_extract_hotwords(request_id, source_text)
+        )
+        self._extract_tasks.add(task)
+        task.add_done_callback(self._extract_tasks.discard)
+
+    async def _run_extract_hotwords(
+        self, request_id: str, source_text: str
+    ) -> None:
+        try:
+            extracted = await query_text_hotwords(source_text)
+            await self._send_json(
+                {
+                    "type": "extract_hotwords_result",
+                    "request_id": request_id,
+                    "hotwords": extracted,
+                }
+            )
+        except WebSocketDisconnect:
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception(
+                "extract_hotwords failed (request_id=%s)", request_id or "n/a"
+            )
+            await self._send_json(
+                {
+                    "type": "extract_hotwords_error",
+                    "request_id": request_id,
+                    "message": str(exc),
+                }
+            )
+
     async def _handle_stop(self) -> None:
         if self._stopped:
             return
         self._stopped = True
         logger.info("Stop received (%s), flushing", self.engine.name)
         for ev in self.stream.flush(force=True):
-            self._enqueue_segment(ev)
+            await self._dispatch_stream_event(ev)
 
     # ------------------------------------------------------------------
     # PCM dispatch
@@ -262,10 +318,21 @@ class StreamingSession:
 
     async def _handle_pcm(self, pcm_bytes: bytes) -> None:
         for ev in self.stream.feed(pcm_bytes):
-            if isinstance(ev, SegmentReady):
-                self._enqueue_segment(ev)
-            elif isinstance(ev, PartialSnapshot):
-                self._maybe_launch_partial(ev)
+            await self._dispatch_stream_event(ev)
+
+    async def _dispatch_stream_event(self, ev) -> None:
+        # Heavy work (full-segment inference) goes through the queue so
+        # it stays serialized; lightweight notifications (speech start /
+        # dropped, partial snapshot) fan out directly without queuing
+        # so the placeholder UI shows up before the segment finishes.
+        if isinstance(ev, SegmentReady):
+            self._enqueue_segment(ev)
+        elif isinstance(ev, PartialSnapshot):
+            self._maybe_launch_partial(ev)
+        elif isinstance(ev, SpeechStarted):
+            await self._safe_speech_start()
+        elif isinstance(ev, SpeechDropped):
+            await self._safe_speech_dropped()
 
     def _enqueue_segment(self, ev: SegmentReady) -> None:
         snapshot = self.ctx.snapshot()
@@ -287,6 +354,22 @@ class StreamingSession:
             self._ws_closed = True
         except Exception:
             logger.debug("engine.handle_partial failed", exc_info=True)
+
+    async def _safe_speech_start(self) -> None:
+        try:
+            await self.engine.handle_speech_start(self.ctx.snapshot())
+        except WebSocketDisconnect:
+            self._ws_closed = True
+        except Exception:
+            logger.debug("engine.handle_speech_start failed", exc_info=True)
+
+    async def _safe_speech_dropped(self) -> None:
+        try:
+            await self.engine.handle_speech_dropped(self.ctx.snapshot())
+        except WebSocketDisconnect:
+            self._ws_closed = True
+        except Exception:
+            logger.debug("engine.handle_speech_dropped failed", exc_info=True)
 
     # ------------------------------------------------------------------
     # Work loop: drain final segments serially

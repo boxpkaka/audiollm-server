@@ -229,6 +229,58 @@ class AudioSession:
             self.extract_tasks.add(task)
             task.add_done_callback(self.extract_tasks.discard)
 
+        elif ctrl.get("type") == "flush":
+            # Client manually stopped the mic. Drain VAD's pending audio
+            # so the trailing in-progress utterance gets transcribed
+            # promptly instead of waiting for the WebSocket to actually
+            # disconnect (the long-lived WS in the realtime ASR page
+            # stays open across recording sessions, so without an
+            # explicit flush the tail just sits in VAD's buffer until
+            # the next disconnect or the next utterance overwrites it).
+            self._flush_pending_audio()
+
+    def _flush_pending_audio(self) -> None:
+        """Drain VAD's pending speech and enqueue it as a final segment.
+
+        Mirrors the ``finally`` branch of ``_vad_loop`` so a manual stop
+        from the client (``{"type": "flush"}``) produces the same
+        ``vad_event`` + ``response`` pair as a natural VAD-detected end.
+        Returning quietly when there's nothing buffered (or the residual
+        is shorter than the minimum segment length) is by design — silent
+        no-ops keep the protocol idempotent for spurious flush messages.
+        """
+        was_speaking = self.vad.is_speaking
+        remaining = self.vad.flush()
+        if remaining is None:
+            logger.info(
+                "Flush: nothing to drain (was_speaking=%s, utterance=%s)",
+                was_speaking,
+                self._utterance_id,
+            )
+            self._utterance_id = None
+            return
+        if len(remaining) < MIN_SEGMENT_SAMPLES:
+            logger.info(
+                "Flush: segment too short (%.2fs < %.2fs)",
+                len(remaining) / SAMPLE_RATE,
+                MIN_SEGMENT_DURATION_MS / 1000.0,
+            )
+            self._utterance_id = None
+            return
+        seg_id = self._utterance_id or _generate_segment_id()
+        self._utterance_id = None
+        logger.info(
+            "Flush: enqueueing segment %s (%.2fs)",
+            seg_id,
+            len(remaining) / SAMPLE_RATE,
+        )
+        try:
+            self.segment_queue.put_nowait(
+                (seg_id, remaining, list(self.hotwords), self.src_lang)
+            )
+        except asyncio.QueueFull:
+            logger.warning("Segment queue full, dropping flush %s", seg_id)
+
     async def _extract_hotwords(self, request_id: str, source_text: str) -> None:
         try:
             extracted = await query_text_hotwords(source_text)

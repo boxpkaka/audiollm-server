@@ -31,3 +31,27 @@ class PartialSnapshot:
     """
 
     pcm: np.ndarray
+
+
+@dataclass
+class SpeechStarted:
+    """VAD just transitioned silent -> speaking.
+
+    Emitted exactly once per utterance, before any ``PartialSnapshot`` or
+    ``SegmentReady``. Lets engines paint a placeholder UI (e.g. "识别中…")
+    the moment the user opens their mouth instead of waiting for the
+    segment to finalize. Engines that don't override the corresponding
+    hook simply ignore the event.
+    """
+
+
+@dataclass
+class SpeechDropped:
+    """The current utterance was abandoned without producing a segment.
+
+    Emitted by the stream when speech ends but the resulting clip is
+    rejected upstream (too short, sub-min duration, etc.) or when the
+    session is force-flushed mid-speech with nothing useful to recover.
+    Engines that announced a placeholder on ``SpeechStarted`` must
+    retract it (e.g. send an empty ``final``) when they see this.
+    """

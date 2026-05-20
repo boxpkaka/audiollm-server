@@ -4,13 +4,15 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title data-i18n-doc-title="tsasr.titleTag" data-i18n="tsasr.titleTag">Amphion TS-ASR Demo</title>
-  <script src="https://cdn.tailwindcss.com"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link
     href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Source+Serif+4:wght@400;500;600&display=swap"
     rel="stylesheet"
   />
+  <!-- Pre-compiled Tailwind utilities (see scripts/build_tailwind.sh).
+       Loaded before style.css so our custom rules win on equal specificity. -->
+  <link rel="stylesheet" href="tailwind.css" />
   <link rel="stylesheet" href="style.css" />
   <link rel="stylesheet" href="tsasr.css" />
 </head>
@@ -79,8 +81,9 @@
             </div>
           </section>
 
-          <aside class="lg:w-[380px] xl:w-[420px] flex-shrink-0 min-h-0">
-            <div id="enroll-panel" class="paper-card p-4 h-full flex flex-col">
+          <aside class="lg:w-[380px] xl:w-[420px] flex-shrink-0 min-h-0
+                        flex flex-col gap-4 overflow-y-auto pr-1">
+            <div id="enroll-panel" class="paper-card p-4 flex-shrink-0 flex flex-col">
               <div class="flex items-start justify-between gap-3 mb-3">
                 <div>
                   <div class="flex items-center gap-2">
@@ -99,15 +102,13 @@
                   <button id="enroll-rec-btn" class="btn-primary flex-1">
                     <span id="enroll-rec-label" data-i18n="tsasr.enroll.start">Start recording</span>
                   </button>
-                  <button id="enroll-reset-btn" disabled class="btn-ghost"
-                          data-i18n="tsasr.enroll.reset">Reset</button>
                 </div>
                 <div id="enroll-progress" class="enroll-progress mt-3">
                   <div id="enroll-progress-bar" class="enroll-progress-bar"></div>
                 </div>
                 <div class="flex items-center justify-between text-[11px] text-muted mt-1">
                   <span id="enroll-timer">0.0s</span>
-                  <span data-i18n="tsasr.enroll.minMax">min 1.0s &middot; max 5.0s</span>
+                  <span data-i18n="tsasr.enroll.minMax">min 1.0s &middot; max 8.0s</span>
                 </div>
                 <div class="upload-row enroll-upload-row">
                   <input id="enroll-upload-input" type="file" accept="audio/*" hidden />
@@ -127,12 +128,50 @@
               </div>
 
               <audio id="enroll-preview" controls class="enroll-preview hidden" preload="metadata"></audio>
+            </div>
 
-              <div class="mt-auto text-[11px] text-faint pt-4" data-i18n="tsasr.footer.note">
-                Short-term demo: model = primary ASR endpoint.
-                Prompt and optional switches (hotwords, voice traits) are expected
-                to evolve before a dedicated TS-ASR checkpoint ships.
+            <div id="tsasr-hotword-panel" class="paper-card p-4 flex-shrink-0 flex flex-col">
+              <div class="flex items-start justify-between gap-3 mb-3">
+                <div>
+                  <div class="flex items-center gap-2">
+                    <span class="text-[13px] font-semibold" style="letter-spacing:0.02em"
+                          data-i18n="tsasr.hotword.title">Hotwords</span>
+                    <span id="tsasr-hotword-sync-status" class="status-pill" data-state="waiting">Waiting</span>
+                  </div>
+                  <p class="text-xs text-muted mt-1" data-i18n="tsasr.hotword.tip">Boost recognition for domain-specific terms.</p>
+                </div>
+
+                <label for="tsasr-hotword-enabled" class="hotword-switch"
+                       data-i18n-attr-title="tsasr.hotword.toggle.title" title="Toggle hotword influence">
+                  <input id="tsasr-hotword-enabled" type="checkbox" checked />
+                  <span class="hotword-switch-track"></span>
+                  <span class="hotword-switch-label" data-i18n="tsasr.hotword.toggle.on">ON</span>
+                </label>
               </div>
+
+              <div class="flex gap-2 mb-3">
+                <input id="tsasr-hotword-input" type="text" class="hotword-input flex-1"
+                       data-i18n-attr-placeholder="tsasr.hotword.placeholder"
+                       placeholder="Add hotword (comma-separated for batch)" />
+                <button id="tsasr-hotword-add-btn" class="btn-secondary" data-i18n="tsasr.hotword.add">Add</button>
+                <button id="tsasr-hotword-clear-btn" class="btn-ghost" data-i18n="tsasr.hotword.clear">Clear</button>
+              </div>
+
+              <div class="mb-3">
+                <textarea id="tsasr-hotword-textarea" class="hotword-textarea w-full" rows="4"
+                          data-i18n-attr-placeholder="tsasr.hotword.textarea.placeholder"
+                          placeholder="Paste long text here to extract hotwords with LLM"></textarea>
+                <div class="mt-2 flex items-center justify-between gap-2">
+                  <button id="tsasr-hotword-extract-btn" class="btn-primary" data-i18n="tsasr.hotword.extract">Extract and Add</button>
+                  <span id="tsasr-hotword-extract-status" class="hotword-extract-status">Idle</span>
+                </div>
+              </div>
+
+              <div class="flex items-center text-xs text-muted mb-2">
+                <span id="tsasr-hotword-count">0 hotwords</span>
+              </div>
+
+              <div id="tsasr-hotword-list" class="flex flex-wrap gap-2 min-h-[32px] overflow-y-auto pr-1"></div>
             </div>
           </aside>
         </div>
@@ -141,8 +180,15 @@
   </div>
 
   <script src="i18n.js"></script>
-  <script src="sidebar.js"></script>
+  <!-- All three demo pages share the same SPA shell, so every entry
+       HTML loads every page module. The router (router.js) decides
+       which one to mount based on body[data-page]. -->
   <script src="audio-upload.js"></script>
+  <script src="streaming-text.js"></script>
+  <script src="app.js"></script>
+  <script src="emotion-app.js"></script>
   <script src="tsasr-app.js"></script>
+  <script src="sidebar.js"></script>
+  <script src="router.js"></script>
 </body>
 </html>

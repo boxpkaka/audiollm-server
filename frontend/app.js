@@ -1,13 +1,34 @@
 (() => {
   'use strict';
 
-  // --- i18n ---
-  const i18n = window.Amphion && window.Amphion.i18n;
-  const t = (key, vars) => (i18n ? i18n.t(key, vars) : (vars && vars.defaultValue) || key);
-  const onLangChange = (fn) => (i18n ? i18n.onChange(fn) : () => {});
+  // ASR demo page module.
+  //
+  // Wrapped in an ``init`` factory so the SPA router (frontend/router.js)
+  // can mount and tear down this page repeatedly within a single
+  // document. ``init`` returns a ``dispose`` callback that the router
+  // invokes before swapping the page out — that closes the WebSocket,
+  // releases the AudioContext + microphone, revokes all the segment
+  // blob URLs, aborts in-flight uploads, and unsubscribes from i18n
+  // change events. None of this code runs on script load anymore;
+  // everything is gated on the router calling ``init``.
+  function initAsr() {
+    // --- i18n ---
+    const i18n = window.Amphion && window.Amphion.i18n;
+    const t = (key, vars) => (i18n ? i18n.t(key, vars) : (vars && vars.defaultValue) || key);
+    const onLangChange = (fn) => (i18n ? i18n.onChange(fn) : () => {});
 
-  // --- State ---
-  let ws = null;
+    // --- Dispose state ---
+    // ``connectWS``'s onclose schedules a reconnect setTimeout; if the
+    // user navigates away mid-reconnect we'd otherwise leak the timer
+    // and a fresh WebSocket. ``isDisposed`` short-circuits the
+    // reconnect path; ``reconnectTimer`` is the handle we cancel from
+    // dispose().
+    let isDisposed = false;
+    let reconnectTimer = null;
+    let i18nUnsub = null;
+
+    // --- State ---
+    let ws = null;
   let audioCtx = null;
   let workletNode = null;
   let mediaStream = null;
@@ -15,7 +36,6 @@
   let hotwords = [];
   let hotwordEnabled = localStorage.getItem('hotword_enabled') !== '0';
   let emotionEnabled = localStorage.getItem('asr_emotion_enabled') === '1';
-  let sessionHitCount = 0;
   let extractRequestId = null;
   let activeReplayAudio = null;
   const segmentAudio = new Map();
@@ -101,7 +121,6 @@
   const hotwordEnabledInput = document.getElementById('hotword-enabled');
   const hotwordSyncStatus = document.getElementById('hotword-sync-status');
   const hotwordCount = document.getElementById('hotword-count');
-  const hotwordHitCount = document.getElementById('hotword-hit-count');
   const hotwordTextarea = document.getElementById('hotword-textarea');
   const hotwordExtractBtn = document.getElementById('hotword-extract-btn');
   const hotwordExtractStatus = document.getElementById('hotword-extract-status');
@@ -242,10 +261,6 @@
     localStorage.setItem('hotwords', JSON.stringify(hotwords));
     renderHotwords();
     syncHotwords();
-  }
-
-  function updateHitCounter() {
-    hotwordHitCount.textContent = String(sessionHitCount);
   }
 
   function setExtractStatus(state, key, vars) {
@@ -406,7 +421,6 @@
   hotwords = sanitizeHotwords(readHotwordBucket(srcLangUi));
   localStorage.setItem('hotwords', JSON.stringify(hotwords));
   renderHotwords();
-  updateHitCounter();
   setHotwordSyncStatus('waiting');
   setExtractStatus('idle', 'asr.extract.idle');
   updateExtractButtonAttention();
@@ -444,7 +458,9 @@
       // The upload path is REST and not bound to the WS lifecycle, so
       // there is nothing to clean up here for it.
       stopRecording();
-      setTimeout(connectWS, 2000);
+      if (!isDisposed) {
+        reconnectTimer = setTimeout(connectWS, 2000);
+      }
     };
 
     ws.onerror = () => {
@@ -470,15 +486,16 @@
   function handleServerMessage(data) {
     switch (data.type) {
       case 'partial_transcript': {
+        // Pseudo-streaming partial. We only need a single AI bubble per
+        // utterance — the right-side user bubble was removed so the
+        // realtime page mirrors the target-speaker page (one column of
+        // assistant bubbles, replay control lives inside).
         const uid = data.utterance_id;
         if (!uid) break;
         const prevSeq = partialSeqMap.get(uid) || 0;
         if (typeof data.seq === 'number' && data.seq <= prevSeq) break;
         partialSeqMap.set(uid, data.seq || 0);
 
-        if (!document.getElementById(`user-${uid}`)) {
-          addUserBubble(uid, '', true);
-        }
         if (!document.getElementById(`ai-${uid}`)) {
           addAIBubble(uid);
         }
@@ -487,14 +504,13 @@
       }
       case 'vad_event':
         if (data.event === 'segment_detected') {
+          // Stash the segment audio for later replay — the actual replay
+          // button is mounted in the bubble when the final response
+          // arrives (see updateAIBubble 'done' branch). Mounting it
+          // earlier would clutter the bubble while it's still visibly
+          // streaming.
           if (data.audio_b64) {
             segmentAudio.set(data.id, b64ToWavBlobUrl(data.audio_b64));
-          }
-          const existingUser = document.getElementById(`user-${data.id}`);
-          if (existingUser) {
-            refreshUserBubbleAudio(data.id, data.duration || '');
-          } else {
-            addUserBubble(data.id, data.duration || '');
           }
           if (!document.getElementById(`ai-${data.id}`)) {
             addAIBubble(data.id);
@@ -580,91 +596,19 @@
     activeReplayAudio = audio;
   }
 
-  function addUserBubble(segId, duration, isPartial) {
-    const wrapper = document.createElement('div');
-    wrapper.className = 'chat-row chat-row-user chat-bubble-float';
-    wrapper.id = `user-${segId}`;
-
-    const hasAudio = segmentAudio.has(segId);
-    const labelKey = isPartial ? 'asr.user.speaking' : 'asr.user.voice';
-    const labelVars = isPartial ? null : { dur: duration };
-    const labelText = t(labelKey, labelVars || undefined);
-    const labelVarsAttr = labelVars
-      ? ` data-dyn-vars='${escapeHtml(JSON.stringify(labelVars))}'`
-      : '';
-    const replayTitle = escapeHtml(t('asr.user.replayTitle'));
-    wrapper.innerHTML = `
-      <div class="chat-bubble chat-bubble-user">
-        <div class="flex items-center gap-2">
-          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                  d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"/>
-          </svg>
-          <span class="text-sm font-medium tracking-wide user-voice-label"
-                data-dyn-key="${labelKey}"${labelVarsAttr}>${escapeHtml(labelText)}</span>
-          ${hasAudio ? `<button class="replay-btn" data-seg="${segId}" title="${replayTitle}">
-            <svg class="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 20 20">
-              <path d="M6.3 2.841A1.5 1.5 0 004 4.11V15.89a1.5 1.5 0 002.3 1.269l9.344-5.89a1.5 1.5 0 000-2.538L6.3 2.84z"/>
-            </svg>
-          </button>` : ''}
-        </div>
-        <div class="mt-2 flex gap-0.5 items-end h-4">
-          ${generateWaveformBars()}
-        </div>
-      </div>
-    `;
-
-    if (hasAudio) {
-      wrapper.querySelector('.replay-btn').addEventListener('click', (e) => {
-        e.stopPropagation();
-        replaySegment(segId, e.currentTarget);
-      });
-    }
-
-    chatArea.appendChild(wrapper);
-    scrollChatToBottom();
-  }
-
-  function refreshUserBubbleAudio(segId, duration) {
-    const wrapper = document.getElementById(`user-${segId}`);
-    if (!wrapper) return;
-    const label = wrapper.querySelector('.user-voice-label');
-    if (label) {
-      const vars = { dur: duration };
-      label.setAttribute('data-dyn-key', 'asr.user.voice');
-      label.setAttribute('data-dyn-vars', JSON.stringify(vars));
-      label.textContent = t('asr.user.voice', vars);
-    }
-    if (segmentAudio.has(segId) && !wrapper.querySelector('.replay-btn')) {
-      const replayTitle = escapeHtml(t('asr.user.replayTitle'));
-      const btnHtml = `<button class="replay-btn" data-seg="${segId}" title="${replayTitle}">
-        <svg class="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 20 20">
-          <path d="M6.3 2.841A1.5 1.5 0 004 4.11V15.89a1.5 1.5 0 002.3 1.269l9.344-5.89a1.5 1.5 0 000-2.538L6.3 2.84z"/>
-        </svg>
-      </button>`;
-      const container = wrapper.querySelector('.flex.items-center');
-      if (container) {
-        container.insertAdjacentHTML('beforeend', btnHtml);
-        const btn = container.querySelector('.replay-btn');
-        if (btn) {
-          btn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            replaySegment(segId, e.currentTarget);
-          });
-        }
-      }
-    }
-  }
-
-  function generateWaveformBars() {
-    let bars = '';
-    for (let i = 0; i < 20; i++) {
-      const h = 4 + Math.random() * 12;
-      bars += `<div class="waveform-bar" style="height:${h}px"></div>`;
-    }
-    return bars;
-  }
-
+  // Single-sided bubble skeleton, intentionally identical in shape to
+  // the TS-ASR page (frontend/tsasr-app.js#buildBubbleSkeleton):
+  //
+  //   .ai-content
+  //     .bubble-shimmer    <- visible while we're waiting on the model
+  //     .bubble-content    <- visible once partial/final text exists
+  //       .bubble-text     <- streaming-text helper writes <span class="ch"> here
+  //       .bubble-replay-slot
+  //     .bubble-meta-slot
+  //
+  // The shimmer + content split lets us swap states without rebuilding
+  // the whole bubble (no chat-bubble-float animation re-runs) while
+  // keeping the upload path's "model is thinking" placeholder.
   function addAIBubble(segId) {
     const wrapper = document.createElement('div');
     wrapper.className = 'chat-row chat-row-ai chat-bubble-float';
@@ -678,11 +622,20 @@
                   d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/>
           </svg>
         </div>
-        <div class="chat-bubble chat-bubble-ai ai-processing ai-content">
-          <div class="shimmer-lines">
-            <div class="shimmer-line w-48 h-3 mb-2"></div>
-            <div class="shimmer-line w-36 h-3 mb-2"></div>
-            <div class="shimmer-line w-24 h-3"></div>
+        <div class="chat-bubble chat-bubble-ai ai-content">
+          <div class="bubble-shimmer">
+            <div class="shimmer-lines">
+              <div class="shimmer-line w-48 h-3 mb-2"></div>
+              <div class="shimmer-line w-36 h-3 mb-2"></div>
+              <div class="shimmer-line w-24 h-3"></div>
+            </div>
+          </div>
+          <div class="bubble-content" hidden>
+            <div class="flex items-start gap-2">
+              <p class="text-sm leading-relaxed flex-1 bubble-text"></p>
+              <span class="bubble-replay-slot"></span>
+            </div>
+            <div class="bubble-meta-slot"></div>
           </div>
         </div>
       </div>
@@ -693,28 +646,24 @@
   }
 
   function removeSegmentBubbles(segId) {
-    const user = document.getElementById(`user-${segId}`);
     const ai = document.getElementById(`ai-${segId}`);
-    const targets = [user, ai].filter((el) => el && el.parentNode);
-    if (targets.length === 0) {
+    if (!ai || !ai.parentNode) {
       const url = segmentAudio.get(segId);
       if (url) URL.revokeObjectURL(url);
       segmentAudio.delete(segId);
       return;
     }
-    let removed = 0;
-    targets.forEach((el) => {
-      el.classList.add('chat-bubble-discard');
-      el.addEventListener('animationend', () => {
-        if (el.parentNode) el.parentNode.removeChild(el);
-        removed++;
-        if (removed >= targets.length) {
-          const url = segmentAudio.get(segId);
-          if (url) URL.revokeObjectURL(url);
-          segmentAudio.delete(segId);
-        }
-      }, { once: true });
-    });
+    ai.classList.add('chat-bubble-discard');
+    ai.addEventListener(
+      'animationend',
+      () => {
+        if (ai.parentNode) ai.parentNode.removeChild(ai);
+        const url = segmentAudio.get(segId);
+        if (url) URL.revokeObjectURL(url);
+        segmentAudio.delete(segId);
+      },
+      { once: true },
+    );
   }
 
   function fusionLabel(scope, value) {
@@ -779,38 +728,89 @@
       );
     }
     return `
-      <div class="text-[11px] mt-2 stream-meta" style="color:var(--accent-deep)">
+      <div class="text-[11px] mt-2" style="color:var(--accent-deep)">
         ${parts.join(' &middot; ')}
       </div>
     `;
   }
 
-  function streamRevealContent(container, htmlString, charDelayMs = 12) {
-    const temp = document.createElement('div');
-    temp.innerHTML = htmlString;
-    let idx = 0;
-
-    function wrapTextNodes(node) {
-      if (node.nodeType === Node.TEXT_NODE) {
-        const text = node.textContent;
-        if (!text) return;
-        const frag = document.createDocumentFragment();
-        for (const ch of text) {
-          const span = document.createElement('span');
-          span.className = 'stream-char';
-          span.style.animationDelay = `${idx * charDelayMs}ms`;
-          span.textContent = ch;
-          frag.appendChild(span);
-          if (ch.trim()) idx++;
-        }
-        node.parentNode.replaceChild(frag, node);
-      } else if (node.nodeType === Node.ELEMENT_NODE) {
-        [...node.childNodes].forEach(wrapTextNodes);
-      }
+  // Route every text mutation through the diff helper. Fallback to plain
+  // textContent guards against the script tag failing to load.
+  function setBubbleText(textEl, text) {
+    if (!textEl) return;
+    const next = text == null ? '' : String(text);
+    if (window.AmphionStreamingText && window.AmphionStreamingText.apply) {
+      window.AmphionStreamingText.apply(textEl, next);
+    } else {
+      textEl.textContent = next;
     }
+  }
 
-    wrapTextNodes(temp);
-    container.innerHTML = temp.innerHTML;
+  function showShimmer(content, show) {
+    if (!content) return;
+    const shimmer = content.querySelector('.bubble-shimmer');
+    const body = content.querySelector('.bubble-content');
+    if (shimmer) shimmer.hidden = !show;
+    if (body) body.hidden = show;
+  }
+
+  function applyMeta(content, metaHtml) {
+    const slot = content.querySelector('.bubble-meta-slot');
+    if (!slot) return;
+    if (!metaHtml) {
+      slot.outerHTML = '<div class="bubble-meta-slot"></div>';
+      return;
+    }
+    slot.outerHTML = `<div class="bubble-meta-slot mt-1 space-y-1">${metaHtml}</div>`;
+  }
+
+  function applyReplayButton(content, segId) {
+    const slot = content.querySelector('.bubble-replay-slot');
+    if (!slot) return;
+    if (!segId || !segmentAudio.has(segId)) {
+      slot.outerHTML = '<span class="bubble-replay-slot"></span>';
+      return;
+    }
+    const replayTitle = escapeHtml(t('asr.user.replayTitle'));
+    const btnHtml = `<button class="replay-btn bubble-replay-slot" type="button" title="${replayTitle}">
+        <svg class="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 20 20">
+          <path d="M6.3 2.841A1.5 1.5 0 004 4.11V15.89a1.5 1.5 0 002.3 1.269l9.344-5.89a1.5 1.5 0 000-2.538L6.3 2.84z"/>
+        </svg>
+      </button>`;
+    slot.outerHTML = btnHtml;
+    const btn = content.querySelector('button.bubble-replay-slot');
+    if (btn) {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        replaySegment(segId, e.currentTarget);
+      });
+    }
+  }
+
+  // Hotword highlighting for the crossfade representation.
+  // ``setBubbleText`` swaps in a <span class="text-frame is-current"> with
+  // plain text for every partial; on the final ``done`` event we reach
+  // back into the now-stable current layer and rewrite its innerHTML so
+  // matching substrings are wrapped in <mark class="is-hotword">. The
+  // mark element naturally forms one continuous capsule per run, so no
+  // boundary-detection passes are needed.
+  function applyHotwordHighlights(textEl, text, words) {
+    if (!textEl || !words || !words.length) return 0;
+    const ranges = collectHotwordRanges(text, words);
+    if (!ranges.length) return 0;
+    const current = textEl.querySelector(':scope > .text-frame.is-current');
+    if (!current) return 0;
+    const source = String(text || '');
+    let html = '';
+    let prev = 0;
+    for (const r of ranges) {
+      if (r.start > prev) html += escapeHtml(source.substring(prev, r.start));
+      html += `<mark class="is-hotword">${escapeHtml(source.substring(r.start, r.end))}</mark>`;
+      prev = r.end;
+    }
+    if (prev < source.length) html += escapeHtml(source.substring(prev));
+    current.innerHTML = html;
+    return ranges.length;
   }
 
   function updateAIBubble(segId, text, status, modelHotwords = null, debugInfo = null) {
@@ -820,40 +820,51 @@
     if (!content) return;
 
     if (status === 'streaming') {
-      content.classList.remove('ai-processing');
-      content.innerHTML = `<p class="text-sm leading-relaxed">${escapeHtml(text || '')}</p>
-        <div class="text-[11px] text-faint" data-dyn-key="asr.streamingHint">${escapeHtml(t('asr.streamingHint'))}</div>`;
+      // Hide shimmer the moment the first partial arrives; from here on
+      // the bubble grows char-by-char via the diff helper. We deliberately
+      // do NOT highlight hotwords on partials — the wording shifts a lot
+      // while the model decodes and a flickering highlight is jarring.
+      showShimmer(content, false);
+      const textEl = content.querySelector('.bubble-text');
+      setBubbleText(textEl, text || '');
       scrollChatToBottom();
       return;
     } else if (status === 'processing') {
-      content.classList.add('ai-processing');
-      content.innerHTML = `
-        <div class="shimmer-lines">
-          <div class="shimmer-line w-48 h-3 mb-2"></div>
-          <div class="shimmer-line w-36 h-3 mb-2"></div>
-          <div class="shimmer-line w-24 h-3"></div>
-        </div>
-        <div class="text-xs text-faint mt-2" data-dyn-key="asr.processing">${escapeHtml(t('asr.processing'))}</div>
-      `;
+      // Server says "transcribing now". If we already have streaming
+      // text, leave it in place — overwriting it with shimmer would
+      // discard everything the user just watched type out. Only fall
+      // back to shimmer when we have nothing to show (e.g. uploads,
+      // or a segment that ended before any partial reached us).
+      const textEl = content.querySelector('.bubble-text');
+      const hasText = textEl && textEl.querySelector('.text-frame');
+      if (!hasText) {
+        showShimmer(content, true);
+      }
+      scrollChatToBottom();
+      return;
     } else if (status === 'done') {
-      content.classList.remove('ai-processing');
+      showShimmer(content, false);
+      const textEl = content.querySelector('.bubble-text');
+      const finalText = text || '';
+      setBubbleText(textEl, finalText);
+
+      // Hotword feedback is now exclusively the inline <mark> highlight
+      // applied by applyHotwordHighlights (which rewrites the current
+      // text-frame's innerHTML once the final text has settled). The
+      // previous "Hotword hits: N" line and the session-wide running
+      // counter were redundant once the glyphs themselves are tinted,
+      // and the bubble's meta block now matches the TS-ASR layout
+      // (lang/duration only).
       const wordsForHighlight = Array.from(
         new Set([
-          ...((Array.isArray(modelHotwords) ? modelHotwords : []).map((w) => String(w || '').trim()).filter(Boolean)),
+          ...((Array.isArray(modelHotwords) ? modelHotwords : [])
+            .map((w) => String(w || '').trim())
+            .filter(Boolean)),
           ...getEffectiveHotwords(),
         ])
       );
-      const highlighted = highlightHotwords(text || '', wordsForHighlight);
-      if (highlighted.count > 0) {
-        sessionHitCount += highlighted.count;
-        updateHitCounter();
-      }
-      const hitMeta =
-        highlighted.count > 0
-          ? `<div class="text-[11px] mt-2 stream-meta" style="color:var(--accent-deep)"
-                  data-dyn-key="asr.debug.hotwordHits"
-                  data-dyn-vars='${escapeHtml(JSON.stringify({ n: highlighted.count }))}'>${escapeHtml(t('asr.debug.hotwordHits', { n: highlighted.count }))}</div>`
-          : '';
+      applyHotwordHighlights(textEl, finalText, wordsForHighlight);
+
       const detectedRaw =
         debugInfo && debugInfo.srcLangDetected
           ? String(debugInfo.srcLangDetected).trim()
@@ -862,30 +873,30 @@
         detectedRaw && srcLangUi === 'auto'
           ? (() => {
               const vars = { lang: langDisplayName(detectedRaw) };
-              return `<div class="text-[11px] mt-2 stream-meta" style="color:var(--info)"
+              return `<div class="text-[11px]" style="color:var(--info)"
                           data-dyn-key="asr.debug.langDetected"
                           data-dyn-vars='${escapeHtml(JSON.stringify({ lang: detectedRaw }))}'>${escapeHtml(t('asr.debug.langDetected', vars))}</div>`;
             })()
           : '';
       const debugBlock = renderDualAsrDebug(debugInfo);
       const emotionBlock = renderEmotionMeta(debugInfo && debugInfo.emotion);
-
-      const textP = document.createElement('p');
-      textP.className = 'text-sm leading-relaxed';
-      streamRevealContent(textP, highlighted.html);
-      content.innerHTML = '';
-      content.appendChild(textP);
-      if (hitMeta || langDetectedMeta || debugBlock || emotionBlock) {
-        const extra = document.createElement('div');
-        extra.innerHTML = langDetectedMeta + hitMeta + emotionBlock + debugBlock;
-        content.appendChild(extra);
-      }
+      applyMeta(
+        content,
+        langDetectedMeta + emotionBlock + debugBlock,
+      );
+      applyReplayButton(content, segId);
     } else if (status === 'error') {
-      content.classList.remove('ai-processing');
-      const msg = text || '';
-      content.innerHTML = `<p class="text-sm" style="color:var(--danger)"
-                              data-dyn-key="asr.errorPrefix"
-                              data-dyn-vars='${escapeHtml(JSON.stringify({ msg }))}'>${escapeHtml(t('asr.errorPrefix', { msg }))}</p>`;
+      // Wholesale replace the bubble body — the error is terminal for
+      // this segment, no partial / replay context to preserve.
+      showShimmer(content, false);
+      const body = content.querySelector('.bubble-content');
+      if (body) {
+        body.hidden = false;
+        const msg = text || '';
+        body.innerHTML = `<p class="text-sm" style="color:var(--danger)"
+                                  data-dyn-key="asr.errorPrefix"
+                                  data-dyn-vars='${escapeHtml(JSON.stringify({ msg }))}'>${escapeHtml(t('asr.errorPrefix', { msg }))}</p>`;
+      }
     }
 
     scrollChatToBottom();
@@ -946,9 +957,22 @@
   function stopRecording() {
     if (!isRecording) return;
 
+    // Detach the worklet's message port BEFORE we send the flush control
+    // message so any audio frames the worklet had buffered can't sneak in
+    // after our flush and end up split across two segments.
     if (workletNode) {
+      workletNode.port.onmessage = null;
       workletNode.disconnect();
       workletNode = null;
+    }
+    // Tell the backend "no more audio coming, drain whatever you're
+    // holding". Without this the trailing in-progress utterance sits in
+    // VAD's buffer until the WebSocket actually closes, so the user
+    // never sees a final bubble (and replay button) for the last thing
+    // they said before clicking stop. Mirrors the TS-ASR ``stop``
+    // protocol, see backend/session.py _handle_control_message.
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try { ws.send(JSON.stringify({ type: 'flush' })); } catch { /* noop */ }
     }
     if (audioCtx) {
       audioCtx.close();
@@ -1059,14 +1083,14 @@
       trimmedNote = totalSec.toFixed(1);
     }
 
-    // Stage a chat row pair so the user sees their upload appear in the
-    // transcript stream while the server is thinking. The id namespace
-    // mirrors what `vad_event` would have produced.
+    // Stage a single AI bubble that immediately shows the shimmer while
+    // the server is thinking — no companion user bubble (the realtime
+    // page is now AI-only, replay button moves into the AI bubble once
+    // the final text arrives).
     uploadCounter += 1;
     const segId = `upload-${uploadCounter}`;
     const audioB64 = upload.bytesToBase64(wavBytes);
     segmentAudio.set(segId, b64ToWavBlobUrl(audioB64));
-    addUserBubble(segId, `${(pcm.length / ASR_UPLOAD_SAMPLE_RATE).toFixed(1)}s`);
     addAIBubble(segId);
     updateAIBubble(segId, null, 'processing');
 
@@ -1148,63 +1172,47 @@
     return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 
-  function highlightHotwords(text, candidateHotwords = null) {
+  // Returns merged, non-overlapping match ranges for ``text`` against
+  // the supplied hotword list. Each range is in UTF-16 string offsets so
+  // it can be compared against substring positions; ``applyHotwordHighlights``
+  // then slices the text on those offsets and wraps each match in a
+  // <mark class="is-hotword"> tag inside the current text-frame layer.
+  function collectHotwordRanges(text, candidateHotwords) {
     const source = String(text || '');
-    const activeSource = Array.isArray(candidateHotwords)
-      ? candidateHotwords
-      : getEffectiveHotwords();
-    const active = activeSource
-      .map((w) => w.trim())
+    const active = (Array.isArray(candidateHotwords) ? candidateHotwords : [])
+      .map((w) => String(w || '').trim())
       .filter(Boolean);
+    if (!source || active.length === 0) return [];
 
-    if (!source || active.length === 0) {
-      return { html: escapeHtml(source), count: 0 };
-    }
-
-    const ranges = [];
+    const raw = [];
     active.forEach((word) => {
       const re = new RegExp(escapeRegExp(word), 'gi');
       let match = re.exec(source);
       while (match) {
-        ranges.push({
-          start: match.index,
-          end: match.index + match[0].length,
-        });
+        raw.push({ start: match.index, end: match.index + match[0].length });
         match = re.exec(source);
       }
     });
+    if (!raw.length) return [];
 
-    if (ranges.length === 0) {
-      return { html: escapeHtml(source), count: 0 };
-    }
-
-    ranges.sort((a, b) => {
-      if (a.start !== b.start) return a.start - b.start;
-      return b.end - a.end;
-    });
+    // Sort by (start asc, length desc) so when two overlapping matches
+    // share a start, the longer one wins the merge step below.
+    raw.sort((a, b) => (a.start !== b.start ? a.start - b.start : b.end - a.end));
 
     const merged = [];
-    ranges.forEach((r) => {
+    raw.forEach((r) => {
       const last = merged[merged.length - 1];
       if (!last || r.start >= last.end) {
         merged.push(r);
+      } else if (r.end > last.end) {
+        last.end = r.end;
       }
     });
-
-    let html = '';
-    let cursor = 0;
-    merged.forEach((r) => {
-      html += escapeHtml(source.slice(cursor, r.start));
-      html += `<mark class="hotword-hit">${escapeHtml(source.slice(r.start, r.end))}</mark>`;
-      cursor = r.end;
-    });
-    html += escapeHtml(source.slice(cursor));
-
-    return { html, count: merged.length };
+    return merged;
   }
 
   // --- Language change refresh ---
-  onLangChange(() => {
+  i18nUnsub = onLangChange(() => {
     setHotwordSyncStatus(currentSyncState);
     if (!isRecording) {
       setDynText(micStatus, 'asr.mic.start');
@@ -1222,4 +1230,72 @@
 
   // --- Init ---
   connectWS();
+
+    // --- Dispose ---
+    // Called by the SPA router before this page's <main> is replaced.
+    // Must release every external resource the page has captured so we
+    // don't leak across navigations:
+    //   * WebSocket (and its scheduled reconnect timer)
+    //   * AudioContext + AudioWorkletNode + the source MediaStream
+    //   * The replay <audio> currently playing, if any
+    //   * Every blob URL we minted via URL.createObjectURL for replay
+    //   * Any in-flight upload fetch
+    //   * The i18n change subscription
+    return function disposeAsr() {
+      isDisposed = true;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      if (ws) {
+        try {
+          ws.onopen = null;
+          ws.onclose = null;
+          ws.onerror = null;
+          ws.onmessage = null;
+          if (ws.readyState === WebSocket.OPEN
+              || ws.readyState === WebSocket.CONNECTING) {
+            ws.close();
+          }
+        } catch (_) { /* ignore */ }
+        ws = null;
+      }
+      if (workletNode) {
+        try { workletNode.port.onmessage = null; } catch (_) { /* ignore */ }
+        try { workletNode.disconnect(); } catch (_) { /* ignore */ }
+        workletNode = null;
+      }
+      if (audioCtx) {
+        try { audioCtx.close(); } catch (_) { /* ignore */ }
+        audioCtx = null;
+      }
+      if (mediaStream) {
+        try {
+          mediaStream.getTracks().forEach((tr) => {
+            try { tr.stop(); } catch (_) { /* ignore */ }
+          });
+        } catch (_) { /* ignore */ }
+        mediaStream = null;
+      }
+      if (activeReplayAudio) {
+        try { activeReplayAudio.pause(); } catch (_) { /* ignore */ }
+        activeReplayAudio = null;
+      }
+      segmentAudio.forEach((url) => {
+        try { URL.revokeObjectURL(url); } catch (_) { /* ignore */ }
+      });
+      segmentAudio.clear();
+      if (uploadController) {
+        try { uploadController.abort(); } catch (_) { /* ignore */ }
+        uploadController = null;
+      }
+      if (typeof i18nUnsub === 'function') {
+        try { i18nUnsub(); } catch (_) { /* ignore */ }
+        i18nUnsub = null;
+      }
+    };
+  }
+
+  window.AmphionPages = window.AmphionPages || {};
+  window.AmphionPages.asr = { init: initAsr };
 })();

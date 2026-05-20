@@ -1,10 +1,11 @@
 """Offline tests for the Target-Speaker ASR (TS-ASR) pipeline.
 
 Covers:
-- Prompt builder (default / hotwords / voice_traits variants)
+- Prompt builder (default / hotwords / voice_traits compatibility)
 - Enrollment decoder (happy path, duration bounds, bad payloads)
 - Client request shape (dual-audio content, base_url override)
 - TsAsrTaskEngine lifecycle (enrollment error, segment flow, fallback config)
+- StreamingSession's generic extract_hotwords plumbing
 
 Run with:
     .venv/bin/python -m pytest tests/test_tsasr.py -v
@@ -12,6 +13,7 @@ Run with:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import sys
@@ -38,8 +40,7 @@ from backend.tsasr.prompt import (  # noqa: E402
     ENROLL_PREFIX,
     TRANSCRIBE_PREFIX,
     build_tsasr_content,
-    format_hotwords_segment,
-    format_voice_traits_segment,
+    format_hotwords_line,
 )
 
 
@@ -52,6 +53,23 @@ def _make_wav_b64(duration_sec: float, sample_rate: int = 16000) -> str:
     n = int(duration_sec * sample_rate)
     pcm = np.zeros(n, dtype=np.float32)
     return pcm_to_wav_base64(pcm, sample_rate=sample_rate)
+
+
+def _patch_secondary_nonempty(monkeypatch, text: str = "presence"):
+    """Stub the Qwen3-ASR presence gate with a non-empty transcription.
+
+    The dual-channel gate in ``TsAsrTaskEngine._dual_infer`` only emits text
+    when both TS-ASR *and* the secondary ASR have non-empty output. Tests
+    that focus on the TS-ASR side should call this so the gate doesn't
+    short-circuit and swallow the result they want to assert on.
+    """
+
+    async def _fake(*_args, **_kwargs):
+        return {"transcription": text, "raw_text": text}
+
+    monkeypatch.setattr(
+        "backend.tasks.ts_asr.query_audio_model_secondary", _fake
+    )
 
 
 def _make_wav_bytes_custom(
@@ -69,51 +87,65 @@ def _make_wav_bytes_custom(
 
 
 # ---------------------------------------------------------------------------
-# Prompt builder
+# Prompt builder (aligned with v3 SFT template; see backend/tsasr/prompt.py)
 # ---------------------------------------------------------------------------
 
 
-def test_prompt_builder_default_layout():
+def test_prompt_builder_default_layout_no_hotwords():
+    """Template A: enrollment + transcribe-with-period + mixed audio."""
     content = build_tsasr_content("ENROLL_B64", "MIXED_B64")
-    # Expected sequence: [text ENROLL, audio enroll, text TRANSCRIBE, audio mixed]
     assert len(content) == 4
     assert content[0] == {"type": "text", "text": ENROLL_PREFIX}
     assert content[1]["type"] == "input_audio"
     assert content[1]["input_audio"]["data"] == "ENROLL_B64"
     assert content[1]["input_audio"]["format"] == "wav"
+    # Transcribe text MUST end in a period (v3 standard) and MUST NOT
+    # carry a Hotwords line when none were supplied.
     assert content[2] == {"type": "text", "text": "\n" + TRANSCRIBE_PREFIX}
+    assert TRANSCRIBE_PREFIX.endswith(".")
     assert content[3]["type"] == "input_audio"
     assert content[3]["input_audio"]["data"] == "MIXED_B64"
 
 
-def test_prompt_builder_with_hotwords():
+def test_prompt_builder_with_hotwords_layout():
+    """Template B: Hotwords line is appended to the transcribe text block.
+
+    Critically the Hotwords line lives in the SAME ``text`` block as the
+    transcribe instruction so the mixed ``<audio>`` immediately follows
+    the last text line with no extra whitespace -- matching the
+    ``"\\n".join(lines) + _AUDIO_PLACEHOLDER`` byte sequence emitted at
+    training time.
+    """
     content = build_tsasr_content(
         "ENR", "MIX", hotwords=["Alpha", " Beta ", "", "Gamma"]
     )
-    texts = [c["text"] for c in content if c.get("type") == "text"]
-    joined = "\n".join(texts)
-    assert "Hotwords: Alpha,Beta,Gamma." in joined
-    # Hotwords segment must sit between enrollment audio and transcribe instr.
-    indices = [i for i, c in enumerate(content) if c.get("type") == "text"]
-    audio_indices = [i for i, c in enumerate(content) if c.get("type") == "input_audio"]
-    # audio[0] is enrollment, audio[1] is mixed
-    assert audio_indices == [1, len(content) - 1]
-    # hotwords segment index strictly between the enrollment and mixed audio
-    hotwords_idx = next(
-        i for i, c in enumerate(content)
-        if c.get("type") == "text" and "Hotwords" in c.get("text", "")
+    assert len(content) == 4
+    transcribe_text = content[2]["text"]
+    assert transcribe_text == (
+        "\n" + TRANSCRIBE_PREFIX + "\nHotwords: Alpha,Beta,Gamma"
     )
-    assert audio_indices[0] < hotwords_idx < audio_indices[1]
-    assert indices  # sanity
+    # No trailing period on the Hotwords line, no spaces in the comma join.
+    assert "Hotwords: Alpha,Beta,Gamma." not in transcribe_text
+    assert "Hotwords: Alpha, Beta, Gamma" not in transcribe_text
+    # The mixed audio is the very next chunk -- no spurious text in between.
+    assert content[3]["type"] == "input_audio"
 
 
-def test_prompt_builder_with_voice_traits():
+def test_prompt_builder_voice_traits_does_not_leak_into_prompt():
+    """Backward-compat: voice_traits is accepted but never written to prompt.
+
+    v3 training data has no ``Speaker traits:`` segment, so emitting one
+    would push the prompt off-distribution. The parameter still exists so
+    older clients keep working without errors.
+    """
     content = build_tsasr_content(
         "ENR", "MIX", voice_traits="female, warm, mid-range"
     )
     texts = [c["text"] for c in content if c.get("type") == "text"]
-    joined = "\n".join(texts)
-    assert "Speaker traits: female, warm, mid-range." in joined
+    assert all("Speaker traits" not in t for t in texts)
+    assert all("female" not in t for t in texts)
+    # Layout matches the no-hotwords case exactly.
+    assert content[2] == {"type": "text", "text": "\n" + TRANSCRIBE_PREFIX}
 
 
 def test_prompt_builder_empty_optionals_are_ignored():
@@ -126,14 +158,15 @@ def test_prompt_builder_empty_optionals_are_ignored():
     assert len(content) == 4
 
 
-def test_format_helpers_edge_cases():
-    assert format_hotwords_segment(None) == ""
-    assert format_hotwords_segment([]) == ""
-    assert format_hotwords_segment(["  "]) == ""
-    assert format_voice_traits_segment(None) == ""
-    assert format_voice_traits_segment("") == ""
-    # Trailing punctuation preserved (not double-dotted).
-    assert format_voice_traits_segment("old man.") == "\nSpeaker traits: old man."
+def test_format_hotwords_line_edge_cases():
+    assert format_hotwords_line(None) == ""
+    assert format_hotwords_line([]) == ""
+    assert format_hotwords_line(["  "]) == ""
+    # Trims surrounding whitespace, joins with comma, no trailing period.
+    assert (
+        format_hotwords_line(["foo", " bar ", "", "baz"])
+        == "\nHotwords: foo,bar,baz"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -253,8 +286,23 @@ async def _noop_send(payload: dict) -> bool:
     return True
 
 
+def _ungated_cfg(**overrides):
+    """Build a config that bypasses the TS-ASR speech-presence gate.
+
+    The gate runs Silero-VAD over the PCM segment and rejects clips with
+    fewer than ``tsasr_speech_gate_min_voiced_ms`` of voiced frames.
+    Synthetic test PCM (constant DC, white noise, ones) doesn't look like
+    speech to the VAD, so engine tests that want to drive the inference
+    path must disable the gate; otherwise ``handle_segment`` /
+    ``handle_partial`` short-circuit before reaching the model.
+    """
+    base = {"tsasr_speech_gate_enabled": False}
+    base.update(overrides)
+    return load_config().override(**base)
+
+
 def _make_ctx(cfg=None, send_json=None):
-    cfg = cfg or load_config()
+    cfg = cfg or _ungated_cfg()
     return SessionContext(
         cfg=cfg, language="zh", src_lang="Chinese",
         hotwords=[], send_json=send_json or _noop_send,
@@ -339,6 +387,7 @@ async def test_engine_handle_segment_calls_tsasr_with_dual_audio(monkeypatch):
     monkeypatch.setattr(
         "backend.tasks.ts_asr.query_tsasr_model", _fake_query
     )
+    _patch_secondary_nonempty(monkeypatch)
 
     seg = SegmentReady(
         pcm=np.ones(16000, dtype=np.float32) * 0.1,
@@ -350,11 +399,18 @@ async def test_engine_handle_segment_calls_tsasr_with_dual_audio(monkeypatch):
     assert captured["enrollment_b64"] == engine._enrollment.wav_base64
     assert captured["mixed_b64"]  # non-empty
     assert captured["enrollment_b64"] != captured["mixed_b64"]
-    # hotwords disabled by default
-    assert captured["hotwords"] is None
-    # fallback to vllm_* because tsasr_base_url/model are "" in defaults
-    assert captured["base_url"] == ctx.cfg.vllm_base_url
-    assert captured["model_name"] == ctx.cfg.vllm_model_name
+    # ``tsasr_enable_hotwords`` defaults to True in v3-aligned config; with
+    # an empty ctx.hotwords list the engine still passes ``[]`` through so
+    # the prompt builder consistently sees a list (and decides whether to
+    # emit a Hotwords line based on its contents).
+    assert captured["hotwords"] == []
+    # ``_resolve`` prefers ``tsasr_*`` when set (the deployed config wires
+    # the dedicated TS-ASR endpoint), and falls back to ``vllm_*`` only
+    # when ``tsasr_*`` is empty.
+    expected_base = ctx.cfg.tsasr_base_url or ctx.cfg.vllm_base_url
+    expected_model = ctx.cfg.tsasr_model_name or ctx.cfg.vllm_model_name
+    assert captured["base_url"] == expected_base
+    assert captured["model_name"] == expected_model
     assert abs(captured["enrollment_duration_sec"] - 2.0) < 1e-2
 
     final = next(m for m in sent if m["type"] == "final")
@@ -376,7 +432,7 @@ async def test_engine_handle_segment_respects_tsasr_endpoint_override(monkeypatc
     async def _send(payload):
         return True
 
-    cfg = load_config().override(
+    cfg = _ungated_cfg(
         tsasr_base_url="http://custom:9000",
         tsasr_model_name="Amphion/TS-Demo",
     )
@@ -400,6 +456,7 @@ async def test_engine_handle_segment_respects_tsasr_endpoint_override(monkeypatc
     monkeypatch.setattr(
         "backend.tasks.ts_asr.query_tsasr_model", _fake_query
     )
+    _patch_secondary_nonempty(monkeypatch)
     seg = SegmentReady(pcm=np.ones(16000, dtype=np.float32) * 0.05)
     await engine.handle_segment(seg, ctx)
     assert captured["base_url"] == "http://custom:9000"
@@ -407,8 +464,13 @@ async def test_engine_handle_segment_respects_tsasr_endpoint_override(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_engine_handle_partial_disabled_by_default(monkeypatch):
-    ctx = _make_ctx()
+async def test_engine_handle_partial_skipped_when_disabled(monkeypatch):
+    """``tsasr_enable_partial=False`` must short-circuit before any inference."""
+    async def _send(_payload):
+        return True
+
+    cfg = _ungated_cfg(tsasr_enable_partial=False)
+    ctx = SessionContext(cfg=cfg, language="zh", send_json=_send)
     engine = TsAsrTaskEngine()
     await engine.on_start(
         {"enrollment_audio": _make_wav_b64(2.0)}, ctx
@@ -425,6 +487,7 @@ async def test_engine_handle_partial_disabled_by_default(monkeypatch):
     monkeypatch.setattr(
         "backend.tasks.ts_asr.query_tsasr_model", _fake_query
     )
+    _patch_secondary_nonempty(monkeypatch)
     from backend.streaming.events import PartialSnapshot
 
     snap = PartialSnapshot(pcm=np.ones(8000, dtype=np.float32) * 0.05)
@@ -440,7 +503,7 @@ async def test_engine_handle_partial_enabled_via_config(monkeypatch):
         sent.append(payload)
         return True
 
-    cfg = load_config().override(tsasr_enable_partial=True)
+    cfg = _ungated_cfg(tsasr_enable_partial=True)
     ctx = SessionContext(cfg=cfg, language="zh", send_json=_send)
     engine = TsAsrTaskEngine()
     await engine.on_start(
@@ -458,6 +521,7 @@ async def test_engine_handle_partial_enabled_via_config(monkeypatch):
     monkeypatch.setattr(
         "backend.tasks.ts_asr.query_tsasr_model", _fake_query
     )
+    _patch_secondary_nonempty(monkeypatch)
     from backend.streaming.events import PartialSnapshot
 
     snap = PartialSnapshot(pcm=np.ones(8000, dtype=np.float32) * 0.05)
@@ -466,6 +530,8 @@ async def test_engine_handle_partial_enabled_via_config(monkeypatch):
     assert partials
     assert partials[0]["text"] == "hello"
     assert partials[0]["task"] == "tsasr"
+    # Same id is shared between partial and the eventual final emission.
+    assert partials[0]["id"]
 
 
 @pytest.mark.asyncio
@@ -503,7 +569,7 @@ async def test_engine_with_hotwords_enabled_forwards_hotwords(monkeypatch):
     async def _send(payload):
         return True
 
-    cfg = load_config().override(tsasr_enable_hotwords=True)
+    cfg = _ungated_cfg(tsasr_enable_hotwords=True)
     ctx = SessionContext(
         cfg=cfg, language="zh", hotwords=["Alpha", "Beta"], send_json=_send
     )
@@ -524,9 +590,141 @@ async def test_engine_with_hotwords_enabled_forwards_hotwords(monkeypatch):
     monkeypatch.setattr(
         "backend.tasks.ts_asr.query_tsasr_model", _fake_query
     )
+    _patch_secondary_nonempty(monkeypatch)
     seg = SegmentReady(pcm=np.ones(16000, dtype=np.float32) * 0.05)
     await engine.handle_segment(seg, ctx)
     assert captured["hotwords"] == ["Alpha", "Beta"]
+
+
+@pytest.mark.asyncio
+async def test_engine_with_hotwords_disabled_does_not_forward_hotwords(monkeypatch):
+    """``tsasr_enable_hotwords=False`` should pass ``None`` (not the list)."""
+    async def _send(_payload):
+        return True
+
+    cfg = _ungated_cfg(tsasr_enable_hotwords=False)
+    ctx = SessionContext(
+        cfg=cfg, language="zh", hotwords=["Alpha", "Beta"], send_json=_send
+    )
+    engine = TsAsrTaskEngine()
+    await engine.on_start(
+        {"enrollment_audio": _make_wav_b64(2.0)}, ctx
+    )
+
+    captured: dict = {}
+
+    async def _fake_query(*_args, **kwargs):
+        captured.update(kwargs)
+        return {
+            "transcription": "x", "raw_text": "x",
+            "detected_language": None, "enrollment_duration_sec": None,
+        }
+
+    monkeypatch.setattr(
+        "backend.tasks.ts_asr.query_tsasr_model", _fake_query
+    )
+    _patch_secondary_nonempty(monkeypatch)
+    seg = SegmentReady(pcm=np.ones(16000, dtype=np.float32) * 0.05)
+    await engine.handle_segment(seg, ctx)
+    assert captured["hotwords"] is None
+
+
+# ---------------------------------------------------------------------------
+# StreamingSession: generic extract_hotwords plumbing
+# ---------------------------------------------------------------------------
+#
+# The realtime ASR page already supports a ``{"type":"extract_hotwords"}``
+# control message that asks the backend to call an LLM and return
+# extracted hotwords. We lifted that handler into ``StreamingSession`` so
+# every task engine on the new session layer (TS-ASR, emotion) gets it for
+# free. The two tests below drive ``_handle_text`` directly with a
+# ``StreamingSession`` constructed against a fake WebSocket so we can
+# assert on both the success and failure response shapes.
+
+
+class _FakeWebSocket:
+    """Minimal in-memory WebSocket for unit tests.
+
+    Captures every ``send_json`` payload in ``self.sent``. ``accept`` /
+    ``receive`` are stubbed because the tests drive control message
+    handling directly via ``_handle_text``.
+    """
+
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+
+    async def send_json(self, payload: dict) -> None:
+        self.sent.append(payload)
+
+
+async def _drain_extract_tasks(session) -> None:
+    """Wait for any pending extract_hotwords background tasks to finish."""
+    while session._extract_tasks:
+        await asyncio.gather(*session._extract_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_streaming_session_extract_hotwords_success(monkeypatch):
+    from backend.streaming import StreamingSession, VadSegmentedStream
+
+    async def _fake_query(_text: str) -> list[str]:
+        return ["北京", "清华大学"]
+
+    monkeypatch.setattr(
+        "backend.streaming.session.query_text_hotwords", _fake_query
+    )
+
+    ws = _FakeWebSocket()
+    session = StreamingSession(
+        ws,  # type: ignore[arg-type]
+        stream=VadSegmentedStream(),
+        engine=TsAsrTaskEngine(),
+    )
+    # Suppress the implicit ``ready`` greeting we don't care about.
+    ws.sent.clear()
+
+    await session._handle_text(
+        '{"type":"extract_hotwords","request_id":"r-1","text":"北京 清华大学"}'
+    )
+    await _drain_extract_tasks(session)
+
+    assert any(
+        m.get("type") == "extract_hotwords_result"
+        and m.get("request_id") == "r-1"
+        and m.get("hotwords") == ["北京", "清华大学"]
+        for m in ws.sent
+    )
+
+
+@pytest.mark.asyncio
+async def test_streaming_session_extract_hotwords_error(monkeypatch):
+    from backend.streaming import StreamingSession, VadSegmentedStream
+
+    async def _broken_query(_text: str) -> list[str]:
+        raise RuntimeError("upstream LLM exploded")
+
+    monkeypatch.setattr(
+        "backend.streaming.session.query_text_hotwords", _broken_query
+    )
+
+    ws = _FakeWebSocket()
+    session = StreamingSession(
+        ws,  # type: ignore[arg-type]
+        stream=VadSegmentedStream(),
+        engine=TsAsrTaskEngine(),
+    )
+    ws.sent.clear()
+
+    await session._handle_text(
+        '{"type":"extract_hotwords","request_id":"r-2","text":"x"}'
+    )
+    await _drain_extract_tasks(session)
+
+    err = next(
+        m for m in ws.sent if m.get("type") == "extract_hotwords_error"
+    )
+    assert err["request_id"] == "r-2"
+    assert "upstream LLM exploded" in err["message"]
 
 
 # ---------------------------------------------------------------------------

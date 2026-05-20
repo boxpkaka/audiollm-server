@@ -18,8 +18,7 @@ from .prompt import (
     ENROLL_PREFIX,
     TRANSCRIBE_PREFIX,
     build_tsasr_content,
-    format_hotwords_segment,
-    format_voice_traits_segment,
+    format_hotwords_line,
 )
 
 __all__ = [
@@ -29,7 +28,6 @@ __all__ = [
     "TsAsrResult",
     "build_tsasr_content",
     "decode_enrollment",
-    "format_hotwords_segment",
-    "format_voice_traits_segment",
+    "format_hotwords_line",
     "query_tsasr_model",
 ]

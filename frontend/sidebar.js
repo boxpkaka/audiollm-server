@@ -1,18 +1,20 @@
 /**
- * Shared sidebar navigation for Amphion demos.
+ * Shared sidebar navigation for the Amphion demos.
  *
- * The host HTML only needs to set `<body data-page="asr|emotion|tsasr">`
- * and include this script; the sidebar DOM is injected at runtime so the
- * three pages don't need to keep duplicated markup in sync.
+ * The sidebar lives outside ``<main class="app-main">`` and is mounted
+ * exactly once per document load — the SPA router (frontend/router.js)
+ * never re-renders it, just calls ``setActive(key)`` after a successful
+ * navigation. Anchor clicks inside the sidebar are intercepted at the
+ * document level by the router, so the click handlers here only need
+ * to handle language switching; the active state is driven from the
+ * router so it stays consistent with whatever ``<main>`` is currently
+ * mounted (including the case where the user came in via a deep link
+ * to /emotion.html or via browser back/forward).
  *
- * Exposes on window.AmphionSidebar:
- *   setConnectionState(state, label?) - updates the bottom dot + label
- *     state in: idle | ready | listening | analyzing | busy | pending |
- *               connected | error | offline
- *
- * Labels are looked up via window.Amphion.i18n.t(); when the language
- * changes we re-render the navigation labels and re-derive the connection
- * label from its last known state.
+ * Public surface (``window.AmphionSidebar``):
+ *   mount()
+ *   setActive(key)
+ *   setConnectionState(state, label?)
  */
 (() => {
   'use strict';
@@ -158,41 +160,37 @@
     } else {
       document.body.insertBefore(aside, document.body.firstChild);
     }
-    attachBehaviors(aside);
+    attachLangBehaviour(aside);
     if (i18n && typeof i18n.applyTranslations === 'function') {
       i18n.applyTranslations(aside);
     }
     return aside;
   }
 
-  function attachBehaviors(aside) {
-    const mainEl = document.querySelector('.app-main');
-    const supportsVT =
-      typeof document !== 'undefined'
-      && typeof document.startViewTransition === 'function';
-
-    aside.querySelectorAll('.app-nav-item').forEach((a) => {
-      a.addEventListener('click', (ev) => {
-        const isActive = a.classList.contains('is-active');
-        if (isActive) {
-          ev.preventDefault();
-          return;
-        }
-        aside.querySelectorAll('.app-nav-item').forEach((el) => {
-          el.classList.toggle('is-active', el === a);
-        });
-        if (!supportsVT && mainEl) {
-          mainEl.classList.add('is-page-leaving');
-        }
-      });
-    });
-
+  // Only language buttons need a per-mount click handler. Nav anchors
+  // are intercepted globally by the router at document level, so we
+  // don't bind click listeners to each ``.app-nav-item`` here. The
+  // router calls ``setActive(key)`` after a successful navigation to
+  // sync the sidebar's visual state.
+  function attachLangBehaviour(aside) {
     aside.querySelectorAll('.app-lang-btn').forEach((btn) => {
       btn.addEventListener('click', () => {
         const lng = btn.getAttribute('data-lang');
         if (!lng || !i18n) return;
         i18n.setLang(lng);
       });
+    });
+  }
+
+  function setActive(key) {
+    const aside = document.querySelector('.app-sidebar');
+    if (!aside) return;
+    aside.setAttribute('data-active', key || '');
+    aside.querySelectorAll('.app-nav-item').forEach((el) => {
+      const isActive = el.getAttribute('data-nav-key') === key;
+      el.classList.toggle('is-active', isActive);
+      if (isActive) el.setAttribute('aria-current', 'page');
+      else el.removeAttribute('aria-current');
     });
   }
 
@@ -271,6 +269,7 @@
 
   window.AmphionSidebar = {
     mount,
+    setActive,
     setConnectionState,
   };
 })();

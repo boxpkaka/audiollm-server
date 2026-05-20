@@ -18,15 +18,27 @@
 (() => {
   'use strict';
 
-  const i18n = window.Amphion && window.Amphion.i18n;
-  const t = (key, vars) => (i18n ? i18n.t(key, vars) : (vars && vars.defaultValue) || key);
-  const onLangChange = (fn) => (i18n ? i18n.onChange(fn) : () => {});
+  // TS-ASR demo page module.
+  //
+  // Wrapped in an ``init`` factory so the SPA router can mount and tear
+  // down this page repeatedly within a single document. ``init``
+  // returns a ``dispose`` callback the router calls before swapping
+  // the page out — that closes the live WebSocket, releases both the
+  // enrollment and live AudioContext + microphone, abort in-flight
+  // uploads, revokes every cached blob URL (segment replay + enrollment
+  // preview), clears the timer driving the enrollment progress bar,
+  // and unsubscribes from i18n change events.
+  function initTsasr() {
+    const i18n = window.Amphion && window.Amphion.i18n;
+    const t = (key, vars) => (i18n ? i18n.t(key, vars) : (vars && vars.defaultValue) || key);
+    const onLangChange = (fn) => (i18n ? i18n.onChange(fn) : () => {});
+    let i18nUnsub = null;
 
-  const MIN_ENROLL_SEC = 1.0;
-  // Backend VAD-trims longer uploads to 5s (see tsasr_enrollment_max_sec).
+    const MIN_ENROLL_SEC = 1.0;
+  // Backend VAD-trims longer uploads to 8s (see tsasr_enrollment_max_sec).
   // Keeping the browser auto-stop in sync avoids uploading material we know
-  // will be discarded and lets the progress bar fill cleanly at 5s.
-  const MAX_ENROLL_SEC = 5.0;
+  // will be discarded and lets the progress bar fill cleanly at 8s.
+  const MAX_ENROLL_SEC = 8.0;
   const TARGET_SAMPLE_RATE = 16000;
 
   // -------------------- State --------------------
@@ -35,6 +47,11 @@
   let liveNode = null;
   let liveStream = null;
   let isRecordingLive = false;
+  // True between sending ``{type:"stop"}`` and the server closing the
+  // WebSocket. The mic button is gated off during this window so the
+  // user can't fire a second start before the previous take's final
+  // arrives — see ``updateMicGate`` and ``ws.onclose``.
+  let isAwaitingFinalize = false;
 
   let enrollCtx = null;
   let enrollNode = null;
@@ -59,6 +76,12 @@
   const segmentAudio = new Map();
   let activeReplayAudio = null;
 
+  // Partial bubbles still waiting for their `final` counterpart. Keyed by
+  // utterance id (same id the backend reuses for the eventual final), so
+  // that when the final arrives we can replace the partial's text in
+  // place — no second `chat-bubble-float` animation, no extra DOM row.
+  const partialBubbles = new Map();
+
   function b64ToWavBlobUrl(b64) {
     const bin = atob(b64);
     const bytes = new Uint8Array(bin.length);
@@ -75,12 +98,17 @@
       try { URL.revokeObjectURL(url); } catch { /* noop */ }
     });
     segmentAudio.clear();
+    partialBubbles.clear();
     document.querySelectorAll('.replay-btn.is-playing').forEach((b) => {
       b.classList.remove('is-playing');
     });
   }
 
-  window.addEventListener('beforeunload', clearSegmentAudio);
+  // beforeunload still fires on real tab close. We use ``onBeforeUnload``
+  // so dispose can detach the listener — otherwise multiple SPA mounts
+  // would stack up duplicate listeners on the window.
+  function onBeforeUnload() { clearSegmentAudio(); }
+  window.addEventListener('beforeunload', onBeforeUnload);
 
   // -------------------- DOM refs --------------------
   const micBtn = document.getElementById('mic-btn');
@@ -92,7 +120,6 @@
   const enrollStatusPill = document.getElementById('enroll-status');
   const enrollRecBtn = document.getElementById('enroll-rec-btn');
   const enrollRecLabel = document.getElementById('enroll-rec-label');
-  const enrollResetBtn = document.getElementById('enroll-reset-btn');
   const enrollTimer = document.getElementById('enroll-timer');
   const enrollProgressBar = document.getElementById('enroll-progress-bar');
   const enrollProgress = document.getElementById('enroll-progress');
@@ -120,6 +147,35 @@
   let currentUploadDyn = null;     // { key, vars }
   const TSASR_UPLOAD_MAX_SECONDS = 60;
 
+  // -------------------- Hotword state --------------------
+  // Mirrors the realtime-ASR page's hotword pipeline (manual entry +
+  // long-text LLM extraction) with TS-ASR-specific persistence keys
+  // and DOM IDs (``tsasr-hotword-*``) so the two pages can keep
+  // independent hotword lists. The hotword list is comma-joined and
+  // sent on every ``start`` (initial state) and ``update_hotwords``
+  // (mid-session edit) message — see the v3 SFT prompt template B in
+  // ``backend/tsasr/prompt.py`` for the receiving end.
+  const TSASR_HOTWORDS_KEY = 'tsasr_hotwords';
+  const TSASR_HOTWORD_ENABLED_KEY = 'tsasr_hotword_enabled';
+  const TSASR_HOTWORD_MAX = 100;
+  const TSASR_EXTRACTED_HOTWORD_MAX_LEN = 10;
+
+  let hotwords = [];
+  let hotwordEnabled = localStorage.getItem(TSASR_HOTWORD_ENABLED_KEY) !== '0';
+  let extractRequestId = null;
+  let currentExtractDyn = { key: 'tsasr.extract.idle', vars: null };
+
+  const hotwordInput = document.getElementById('tsasr-hotword-input');
+  const hotwordAddBtn = document.getElementById('tsasr-hotword-add-btn');
+  const hotwordList = document.getElementById('tsasr-hotword-list');
+  const hotwordClearBtn = document.getElementById('tsasr-hotword-clear-btn');
+  const hotwordEnabledInput = document.getElementById('tsasr-hotword-enabled');
+  const hotwordSyncStatus = document.getElementById('tsasr-hotword-sync-status');
+  const hotwordCount = document.getElementById('tsasr-hotword-count');
+  const hotwordTextarea = document.getElementById('tsasr-hotword-textarea');
+  const hotwordExtractBtn = document.getElementById('tsasr-hotword-extract-btn');
+  const hotwordExtractStatus = document.getElementById('tsasr-hotword-extract-status');
+
   function langDisplayName(value) {
     if (!value) return '';
     const v = String(value).trim();
@@ -139,6 +195,258 @@
     }
   }
   setConnStatus('disconnected');
+
+  // -------------------- Hotword management --------------------
+  function setDynText(el, key, vars) {
+    if (!el) return;
+    el.setAttribute('data-dyn-key', key);
+    if (vars) {
+      try {
+        el.setAttribute('data-dyn-vars', JSON.stringify(vars));
+      } catch (_) {
+        el.removeAttribute('data-dyn-vars');
+      }
+    } else {
+      el.removeAttribute('data-dyn-vars');
+    }
+    el.textContent = t(key, vars || undefined);
+  }
+
+  function sanitizeHotwords(sourceWords) {
+    const seen = new Set();
+    const cleaned = [];
+    (Array.isArray(sourceWords) ? sourceWords : []).forEach((w) => {
+      const s = String(w || '').trim();
+      if (!s || seen.has(s)) return;
+      seen.add(s);
+      cleaned.push(s);
+    });
+    return cleaned.slice(0, TSASR_HOTWORD_MAX);
+  }
+
+  function readHotwordsFromStorage() {
+    const raw = localStorage.getItem(TSASR_HOTWORDS_KEY);
+    if (!raw) return [];
+    try {
+      const arr = JSON.parse(raw);
+      return Array.isArray(arr) ? sanitizeHotwords(arr) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function persistHotwords() {
+    localStorage.setItem(TSASR_HOTWORDS_KEY, JSON.stringify(hotwords));
+  }
+
+  function getEffectiveHotwords() {
+    return hotwordEnabled ? hotwords.slice() : [];
+  }
+
+  function renderHotwords() {
+    if (!hotwordList) return;
+    hotwordList.innerHTML = '';
+    hotwords.forEach((word, idx) => {
+      const tag = document.createElement('span');
+      tag.className = 'hotword-pill';
+      tag.innerHTML =
+        `${escapeHtml(word)}` +
+        `<button data-idx="${idx}" aria-label="${escapeHtml(t('tsasr.hotword.removeAria'))}">&times;</button>`;
+      tag.querySelector('button').addEventListener('click', () => removeHotword(idx));
+      hotwordList.appendChild(tag);
+    });
+    if (hotwordCount) {
+      setDynText(hotwordCount, 'tsasr.hotword.count', { n: hotwords.length });
+    }
+  }
+
+  const SYNC_PILL_BASE = 'status-pill';
+  let currentSyncState = 'waiting';
+
+  function setHotwordSyncStatus(state) {
+    if (!hotwordSyncStatus) return;
+    currentSyncState = state;
+    hotwordSyncStatus.className = SYNC_PILL_BASE;
+    if (state === 'synced') {
+      const key = hotwordEnabled ? 'tsasr.sync.active' : 'tsasr.sync.paused';
+      setDynText(hotwordSyncStatus, key);
+      hotwordSyncStatus.dataset.state = hotwordEnabled ? 'ready' : 'waiting';
+      return;
+    }
+    if (state === 'offline') {
+      setDynText(hotwordSyncStatus, 'tsasr.sync.offline');
+      hotwordSyncStatus.dataset.state = 'offline';
+      return;
+    }
+    setDynText(hotwordSyncStatus, 'tsasr.sync.waiting');
+    hotwordSyncStatus.dataset.state = 'waiting';
+  }
+
+  function syncHotwords() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(
+          JSON.stringify({
+            type: 'update_hotwords',
+            hotwords: getEffectiveHotwords(),
+          })
+        );
+      } catch (_) {
+        setHotwordSyncStatus('offline');
+        return;
+      }
+      setHotwordSyncStatus('synced');
+    } else {
+      setHotwordSyncStatus('offline');
+    }
+  }
+
+  function saveAndSyncHotwords() {
+    hotwords = sanitizeHotwords(hotwords);
+    persistHotwords();
+    renderHotwords();
+    syncHotwords();
+  }
+
+  function setExtractStatus(state, key, vars) {
+    if (!hotwordExtractStatus) return;
+    currentExtractDyn = { key, vars: vars || null };
+    setDynText(hotwordExtractStatus, key, vars || undefined);
+    hotwordExtractStatus.className = 'hotword-extract-status';
+    if (state === 'loading') hotwordExtractStatus.classList.add('is-loading');
+    else if (state === 'success') hotwordExtractStatus.classList.add('is-success');
+    else if (state === 'error') hotwordExtractStatus.classList.add('is-error');
+  }
+
+  function setExtractBusy(busy) {
+    if (!hotwordExtractBtn || !hotwordTextarea) return;
+    hotwordExtractBtn.disabled = busy;
+    setDynText(
+      hotwordExtractBtn,
+      busy ? 'tsasr.hotword.extracting' : 'tsasr.hotword.extract'
+    );
+    hotwordTextarea.disabled = busy;
+    updateExtractButtonAttention();
+  }
+
+  function updateExtractButtonAttention() {
+    if (!hotwordExtractBtn || !hotwordTextarea) return;
+    const hasText = hotwordTextarea.value.trim().length > 0;
+    hotwordExtractBtn.classList.toggle(
+      'btn-primary-attention',
+      hasText && !hotwordExtractBtn.disabled
+    );
+  }
+
+  function mergeExtractedHotwords(words) {
+    const incoming = sanitizeHotwords(
+      (Array.isArray(words) ? words : [])
+        .filter((w) => w && w.length < TSASR_EXTRACTED_HOTWORD_MAX_LEN)
+    );
+    let added = 0;
+    incoming.forEach((word) => {
+      if (!hotwords.includes(word)) {
+        hotwords.push(word);
+        added += 1;
+      }
+    });
+    if (added > 0) {
+      saveAndSyncHotwords();
+    } else {
+      renderHotwords();
+    }
+    return added;
+  }
+
+  function requestHotwordExtraction(text) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      setExtractStatus('error', 'tsasr.extract.wsOffline');
+      return;
+    }
+    const trimmed = String(text || '').trim();
+    if (!trimmed) {
+      setExtractStatus('error', 'tsasr.extract.pasteFirst');
+      return;
+    }
+    if (extractRequestId) {
+      setExtractStatus('error', 'tsasr.extract.alreadyRunning');
+      return;
+    }
+    extractRequestId = `tsasr-extract-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+    setExtractBusy(true);
+    setExtractStatus('loading', 'tsasr.extract.loading');
+    try {
+      ws.send(
+        JSON.stringify({
+          type: 'extract_hotwords',
+          request_id: extractRequestId,
+          text: trimmed,
+        })
+      );
+    } catch (_) {
+      extractRequestId = null;
+      setExtractBusy(false);
+      setExtractStatus('error', 'tsasr.extract.wsOffline');
+    }
+  }
+
+  function addHotword(text) {
+    const words = String(text || '')
+      .split(/[,，\n;；]+/)
+      .map((s) => s.trim())
+      .filter((w) => w && !hotwords.includes(w));
+    if (words.length === 0) return;
+    hotwords.push(...words);
+    saveAndSyncHotwords();
+  }
+
+  function removeHotword(idx) {
+    if (idx < 0 || idx >= hotwords.length) return;
+    hotwords.splice(idx, 1);
+    saveAndSyncHotwords();
+  }
+
+  function clearHotwords() {
+    if (hotwords.length === 0) return;
+    hotwords = [];
+    saveAndSyncHotwords();
+  }
+
+  if (hotwordAddBtn && hotwordInput) {
+    hotwordAddBtn.addEventListener('click', () => {
+      addHotword(hotwordInput.value);
+      hotwordInput.value = '';
+    });
+    hotwordInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        addHotword(hotwordInput.value);
+        hotwordInput.value = '';
+      }
+    });
+  }
+  if (hotwordClearBtn) hotwordClearBtn.addEventListener('click', clearHotwords);
+  if (hotwordExtractBtn && hotwordTextarea) {
+    hotwordExtractBtn.addEventListener('click', () => {
+      requestHotwordExtraction(hotwordTextarea.value);
+    });
+    hotwordTextarea.addEventListener('input', updateExtractButtonAttention);
+  }
+
+  if (hotwordEnabledInput) {
+    hotwordEnabledInput.checked = hotwordEnabled;
+    hotwordEnabledInput.addEventListener('change', () => {
+      hotwordEnabled = hotwordEnabledInput.checked;
+      localStorage.setItem(TSASR_HOTWORD_ENABLED_KEY, hotwordEnabled ? '1' : '0');
+      syncHotwords();
+    });
+  }
+
+  hotwords = readHotwordsFromStorage();
+  renderHotwords();
+  setHotwordSyncStatus('waiting');
+  setExtractStatus('idle', 'tsasr.extract.idle');
+  updateExtractButtonAttention();
 
   // -------------------- Enrollment status pill --------------------
   function setEnrollStatus(state, key, vars) {
@@ -163,7 +471,12 @@
       enrollWavB64 !== null
       && !isEnrollRecording
       && !isUploading
-      && !isEnrollUploading;
+      && !isEnrollUploading
+      // Block the mic between sending ``stop`` and the WS actually
+      // closing — otherwise the user could click again, fall through
+      // ``stopLiveStreaming``'s early return, and end up wondering
+      // why nothing happened.
+      && !isAwaitingFinalize;
     micBtn.disabled = !enabled;
     if (uploadBtn) {
       uploadBtn.disabled =
@@ -171,7 +484,8 @@
         || isEnrollRecording
         || isRecordingLive
         || isUploading
-        || isEnrollUploading;
+        || isEnrollUploading
+        || isAwaitingFinalize;
     }
     if (enrollUploadBtn) {
       enrollUploadBtn.disabled =
@@ -180,6 +494,9 @@
     if (isRecordingLive) {
       micStatus.textContent = t('tsasr.mic.listening');
       micStatus.setAttribute('data-dyn-key', 'tsasr.mic.listening');
+    } else if (isAwaitingFinalize) {
+      micStatus.textContent = t('tsasr.recognizing');
+      micStatus.setAttribute('data-dyn-key', 'tsasr.recognizing');
     } else if (!enabled) {
       const k = messageKey || 'tsasr.mic.gateDisabled';
       micStatus.textContent = t(k);
@@ -268,6 +585,11 @@
 
   // -------------------- Enrollment recording --------------------
   async function startEnrollRecording() {
+    // Always start from a clean slate: clicking "Start recording" discards
+    // any previous enrollment (audio buffers, preview, in-flight uploads,
+    // status pill) so the user can re-record without a separate Reset btn.
+    discardPreviousEnrollment();
+
     try {
       const { ctx, node, mediaStream } = await openSixteenKContext();
       enrollCtx = ctx;
@@ -292,7 +614,6 @@
     enrollRecLabel.setAttribute('data-i18n', 'tsasr.enroll.stop');
     enrollRecBtn.classList.add('enroll-recording');
     setEnrollStatus('recording', 'tsasr.enroll.recording');
-    enrollResetBtn.disabled = true;
     enrollPreviewEl.classList.add('hidden');
 
     enrollTimerId = setInterval(tickEnrollTimer, 80);
@@ -342,7 +663,6 @@
       enrollChunks = [];
       enrollPcm = null;
       enrollWavB64 = null;
-      enrollResetBtn.disabled = true;
       updateMicGate();
       return;
     }
@@ -366,12 +686,13 @@
     enrollPreviewEl.classList.remove('hidden');
 
     setEnrollStatus('ready', 'tsasr.enroll.ready', { dur: duration.toFixed(1) });
-    enrollResetBtn.disabled = false;
     updateMicGate();
   }
 
-  function resetEnrollment() {
-    if (isEnrollRecording) stopEnrollRecording();
+  // Drop any previously captured enrollment without flipping button state
+  // for a separate Reset affordance — invoked at the start of each new
+  // recording so the user gets a clean buffer + UI.
+  function discardPreviousEnrollment() {
     enrollChunks = [];
     enrollPcm = null;
     enrollWavB64 = null;
@@ -383,7 +704,6 @@
       URL.revokeObjectURL(enrollPreviewUrl);
       enrollPreviewUrl = null;
     }
-    enrollResetBtn.disabled = true;
     setEnrollStatus('idle', 'tsasr.enroll.notRecorded');
     if (uploadController) {
       try { uploadController.abort(); } catch (_) { /* noop */ }
@@ -401,10 +721,6 @@
     } else {
       startEnrollRecording();
     }
-  });
-  enrollResetBtn.addEventListener('click', () => {
-    if (isRecordingLive) return;
-    resetEnrollment();
   });
 
   // -------------------- Enrollment via uploaded audio --------------------
@@ -440,7 +756,6 @@
     // While uploading enrollment, also gate the mic / file-upload for the
     // transcription stage so the user can't fire two flows at once.
     enrollRecBtn.disabled = busy;
-    enrollResetBtn.disabled = busy || enrollWavB64 === null;
     updateMicGate();
   }
 
@@ -514,7 +829,6 @@
     enrollPreviewEl.classList.remove('hidden');
 
     setEnrollStatus('ready', 'tsasr.enroll.ready', { dur: finalDuration.toFixed(1) });
-    enrollResetBtn.disabled = false;
     setEnrollUploadBusy(false);
     if (trimmedNote !== null) {
       setEnrollUploadStatus('warn', 'tsasr.enrollUpload.trimmed', {
@@ -569,37 +883,20 @@
     activeReplayAudio = audio;
   }
 
-  function addFinalBubble(text, langValue, durationSec, segId) {
+  function buildBubbleSkeleton(segId, isPartial) {
     const wrapper = document.createElement('div');
+    // Apply chat-bubble-float only on the very first DOM insertion so the
+    // fly-in animation runs once at the start of pseudo-streaming and the
+    // partial -> final transition stays smooth (no second animation).
     wrapper.className = 'chat-row chat-row-ai chat-bubble-float';
     if (segId) wrapper.id = `ai-${segId}`;
-
-    const metaParts = [];
-    if (langValue) {
-      metaParts.push(
-        `<span data-dyn-key="tsasr.meta.lang"
-               data-dyn-vars='${escapeHtml(JSON.stringify({ lang: langValue }))}'>${escapeHtml(t('tsasr.meta.lang', { lang: langDisplayName(langValue) }))}</span>`
-      );
-    }
-    if (typeof durationSec === 'number') {
-      metaParts.push(`<span>${durationSec.toFixed(1)}s</span>`);
-    }
-    const metaLine = metaParts.length
-      ? `<div class="text-[11px] text-faint mt-1">${metaParts.join(' \u00b7 ')}</div>`
-      : '';
-    const hasAudio = Boolean(segId) && segmentAudio.has(segId);
-    // Keep the replay button inline with the paragraph so users scan text
-    // first and see the play affordance as a subtle trailing glyph, not a
-    // separate control.
-    const replayTitle = escapeHtml(t('tsasr.replayTitle'));
-    const replayBtn = hasAudio
-      ? `<button class="replay-btn" type="button" title="${replayTitle}">
-           <svg class="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 20 20">
-             <path d="M6.3 2.841A1.5 1.5 0 004 4.11V15.89a1.5 1.5 0 002.3 1.269l9.344-5.89a1.5 1.5 0 000-2.538L6.3 2.84z"/>
-           </svg>
-         </button>`
-      : '';
-
+    if (isPartial) wrapper.dataset.partial = '1';
+    // Dual-ASR layout: two labeled rows ("安菲翁:" + "千问:") side-by-side
+    // with the same text-frame helper driving each one independently. The
+    // replay slot sits at the top-right so it stays put across partial /
+    // final / processing states.
+    const labelPrimary = escapeHtml(t('tsasr.label.primary'));
+    const labelSecondary = escapeHtml(t('tsasr.label.secondary'));
     wrapper.innerHTML = `
       <div class="flex gap-3 max-w-2xl items-start">
         <div class="chat-avatar flex-shrink-0">
@@ -610,25 +907,196 @@
         </div>
         <div class="chat-bubble chat-bubble-ai ai-content">
           <div class="flex items-start gap-2">
-            <p class="text-sm leading-relaxed flex-1">${escapeHtml(text)}</p>
-            ${replayBtn}
+            <div class="flex-1 dual-asr-lines">
+              <div class="bubble-line bubble-line-primary">
+                <span class="bubble-label" data-dyn-key="tsasr.label.primary">${labelPrimary}</span>
+                <p class="text-sm leading-relaxed bubble-text bubble-text-primary"></p>
+              </div>
+              <div class="bubble-line bubble-line-secondary">
+                <span class="bubble-label" data-dyn-key="tsasr.label.secondary">${labelSecondary}</span>
+                <p class="text-sm leading-relaxed bubble-text bubble-text-secondary"></p>
+              </div>
+            </div>
+            <span class="bubble-replay-slot"></span>
           </div>
-          ${metaLine}
+          <div class="bubble-meta-slot"></div>
         </div>
       </div>
     `;
+    return wrapper;
+  }
 
-    if (hasAudio) {
-      const btn = wrapper.querySelector('.replay-btn');
-      if (btn) {
-        btn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          replaySegment(segId, e.currentTarget);
-        });
-      }
+  function applyMeta(wrapper, langValue, durationSec) {
+    const slot = wrapper.querySelector('.bubble-meta-slot');
+    if (!slot) return;
+    const metaParts = [];
+    if (langValue) {
+      metaParts.push(
+        `<span data-dyn-key="tsasr.meta.lang"
+               data-dyn-vars='${escapeHtml(JSON.stringify({ lang: langValue }))}'>${escapeHtml(t('tsasr.meta.lang', { lang: langDisplayName(langValue) }))}</span>`
+      );
     }
+    if (typeof durationSec === 'number') {
+      metaParts.push(`<span>${durationSec.toFixed(1)}s</span>`);
+    }
+    if (metaParts.length === 0) {
+      slot.outerHTML = '<div class="bubble-meta-slot"></div>';
+      return;
+    }
+    slot.outerHTML = `<div class="bubble-meta-slot text-[11px] text-faint mt-1">${metaParts.join(' \u00b7 ')}</div>`;
+  }
 
+  function applyReplayButton(wrapper, segId) {
+    const slot = wrapper.querySelector('.bubble-replay-slot');
+    if (!slot) return;
+    if (!segId || !segmentAudio.has(segId)) {
+      slot.outerHTML = '<span class="bubble-replay-slot"></span>';
+      return;
+    }
+    const replayTitle = escapeHtml(t('tsasr.replayTitle'));
+    const btnHtml = `<button class="replay-btn bubble-replay-slot" type="button" title="${replayTitle}">
+        <svg class="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 20 20">
+          <path d="M6.3 2.841A1.5 1.5 0 004 4.11V15.89a1.5 1.5 0 002.3 1.269l9.344-5.89a1.5 1.5 0 000-2.538L6.3 2.84z"/>
+        </svg>
+      </button>`;
+    slot.outerHTML = btnHtml;
+    const btn = wrapper.querySelector('button.bubble-replay-slot');
+    if (btn) {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        replaySegment(segId, e.currentTarget);
+      });
+    }
+  }
+
+  // Route every text mutation through the streaming-text helper so the
+  // partial -> partial and partial -> final transitions only animate the
+  // characters that actually changed. Falls back to plain textContent if
+  // the helper script isn't loaded for some reason (defensive — both
+  // pages list it in the script tag chain).
+  function setBubbleText(textEl, text) {
+    if (!textEl) return;
+    const next = text == null ? '' : String(text);
+    if (window.AmphionStreamingText && window.AmphionStreamingText.apply) {
+      window.AmphionStreamingText.apply(textEl, next);
+    } else {
+      textEl.textContent = next;
+    }
+  }
+
+  // Apply text to the dual-ASR rows. Each row is updated independently
+  // through the streaming-text helper so the partial -> partial and
+  // partial -> final transitions only crossfade the row that actually
+  // changed (the other row stays put if its text was already current).
+  function setDualBubbleText(wrapper, textPrimary, textSecondary) {
+    if (!wrapper) return;
+    setBubbleText(
+      wrapper.querySelector('.bubble-text-primary'),
+      textPrimary == null ? '' : textPrimary,
+    );
+    setBubbleText(
+      wrapper.querySelector('.bubble-text-secondary'),
+      textSecondary == null ? '' : textSecondary,
+    );
+  }
+
+  function addPartialBubble(segId, text, textSecondary) {
+    const wrapper = buildBubbleSkeleton(segId, true);
+    setDualBubbleText(wrapper, text, textSecondary);
     chatArea.appendChild(wrapper);
+    chatArea.scrollTo({ top: chatArea.scrollHeight, behavior: 'smooth' });
+    if (segId) partialBubbles.set(segId, wrapper);
+  }
+
+  // Placeholder bubble shown while the model is running. Reuses the
+  // partial-bubble book-keeping (``partialBubbles`` map + the same
+  // skeleton DOM) so ``addFinalBubble`` can upgrade it in place once the
+  // final transcript arrives. The ``is-recognizing`` class drives a
+  // slow opacity / shimmer breath in CSS.
+  //
+  // For the dual-ASR layout we paint the breathing "识别中…" placeholder
+  // on the primary (Amphion) row only — having both rows pulse at the
+  // same time double-stacks the animation and reads as visual noise.
+  // The secondary row is left empty until its real Qwen3 text arrives.
+  function addProcessingBubble(segId) {
+    if (!segId) return;
+    if (partialBubbles.has(segId)) return;
+    const wrapper = buildBubbleSkeleton(segId, true);
+    wrapper.classList.add('is-recognizing');
+    const textEl = wrapper.querySelector('.bubble-text-primary');
+    if (textEl) {
+      textEl.classList.add('bubble-text-recognizing');
+      // ``data-dyn-key`` lets refreshDynamic re-translate the
+      // placeholder if the user switches language while the model is
+      // still working on this segment.
+      textEl.setAttribute('data-dyn-key', 'tsasr.recognizing');
+      textEl.textContent = t('tsasr.recognizing');
+    }
+    chatArea.appendChild(wrapper);
+    chatArea.scrollTo({ top: chatArea.scrollHeight, behavior: 'smooth' });
+    partialBubbles.set(segId, wrapper);
+  }
+
+  function clearRecognizingDecor(wrapper) {
+    if (!wrapper) return;
+    wrapper.classList.remove('is-recognizing');
+    // Walk both text rows: the placeholder is currently only painted on
+    // primary, but a defensive sweep here keeps us robust if future
+    // changes ever paint a secondary placeholder too.
+    wrapper
+      .querySelectorAll('.bubble-text-primary, .bubble-text-secondary')
+      .forEach((textEl) => {
+        textEl.classList.remove('bubble-text-recognizing');
+        if (textEl.getAttribute('data-dyn-key') === 'tsasr.recognizing') {
+          textEl.removeAttribute('data-dyn-key');
+          // The placeholder was written via ``textContent`` (a raw text
+          // node), but ``setBubbleText`` goes through the streaming-text
+          // helper which only manages ``.text-frame`` siblings. Without
+          // a wipe here the helper would *append* the final transcript
+          // beside the leftover "识别中…" text and the user would see
+          // them glued together. Clearing the element back to an empty
+          // state gives streaming-text a clean canvas.
+          textEl.textContent = '';
+        }
+      });
+  }
+
+  function updatePartialBubble(segId, text, textSecondary) {
+    const wrapper = partialBubbles.get(segId);
+    if (!wrapper) return false;
+    // Upgrading from a "识别中…" placeholder to a real partial drops
+    // the breathing indicator so the text doesn't keep pulsing while
+    // it streams.
+    clearRecognizingDecor(wrapper);
+    setDualBubbleText(wrapper, text, textSecondary);
+    chatArea.scrollTo({ top: chatArea.scrollHeight, behavior: 'smooth' });
+    return true;
+  }
+
+  function discardPartialBubble(segId) {
+    const wrapper = partialBubbles.get(segId);
+    if (!wrapper) return;
+    partialBubbles.delete(segId);
+    if (wrapper.parentNode) wrapper.parentNode.removeChild(wrapper);
+  }
+
+  function addFinalBubble(text, textSecondary, langValue, durationSec, segId) {
+    // If a partial / processing bubble for this id is already mounted,
+    // upgrade it in place: drop the recognizing breath, replace text,
+    // attach meta + replay button, and avoid triggering another fly-in.
+    let wrapper = segId ? partialBubbles.get(segId) : null;
+    if (wrapper) {
+      partialBubbles.delete(segId);
+      wrapper.removeAttribute('data-partial');
+      clearRecognizingDecor(wrapper);
+      setDualBubbleText(wrapper, text, textSecondary);
+    } else {
+      wrapper = buildBubbleSkeleton(segId, false);
+      setDualBubbleText(wrapper, text, textSecondary);
+      chatArea.appendChild(wrapper);
+    }
+    applyMeta(wrapper, langValue, durationSec);
+    applyReplayButton(wrapper, segId);
     chatArea.scrollTo({ top: chatArea.scrollHeight, behavior: 'smooth' });
   }
 
@@ -743,11 +1211,14 @@
         wavBytes,
         {
           enrollment_wav_base64: enrollWavB64,
-          // Pass through the same hot-word/voice-trait knobs the live mic
-          // session would, even though the server currently ignores them
-          // unless ``tsasr_enable_hotwords`` is on. Voice traits are not
-          // exposed in the demo UI yet, so they go in empty.
-          hotwords: '',
+          // Comma-joined hotword list (matches the v3 SFT prompt format
+          // used by ``backend.tsasr.prompt.build_tsasr_content``). The
+          // server only forwards the list when ``tsasr_enable_hotwords``
+          // is on; sending it always is harmless.
+          hotwords: getEffectiveHotwords().join(','),
+          // ``voice_traits`` is accepted by the server for backward
+          // compatibility but never written into the prompt (see
+          // ``backend/tsasr/prompt.py`` docstring).
           voice_traits: '',
         },
         { signal: uploadController.signal, fileName: file.name || 'upload.wav' }
@@ -776,8 +1247,9 @@
     }
     uploadController = null;
 
-    const text = (result && result.text) || '';
-    if (text.trim()) {
+    const text = ((result && result.text) || '').trim();
+    const textSecondary = ((result && result.text_secondary) || '').trim();
+    if (text || textSecondary) {
       // Mirror the WS ``final`` payload's replay-button wiring.
       if (result.audio_b64) {
         const synthId = `upload-${Date.now()}`;
@@ -790,9 +1262,9 @@
           result.language && result.language !== 'N/A' ? result.language : null;
         const durationSec =
           typeof result.duration_sec === 'number' ? result.duration_sec : null;
-        addFinalBubble(text.trim(), langValue, durationSec, synthId);
+        addFinalBubble(text, textSecondary, langValue, durationSec, synthId);
       } else {
-        addFinalBubble(text.trim(), result.language || null, null, null);
+        addFinalBubble(text, textSecondary, result.language || null, null, null);
       }
     }
 
@@ -836,8 +1308,17 @@
         channels: 1,
         enrollment_audio: enrollWavB64,
         enrollment_format: 'wav',
+        // Initial hotword snapshot. Mid-session edits are pushed via
+        // ``update_hotwords`` (see ``saveAndSyncHotwords`` ->
+        // ``syncHotwords``). When the toggle is off ``getEffectiveHotwords``
+        // returns ``[]`` so the server effectively sees no hotwords.
+        hotwords: getEffectiveHotwords(),
       };
       ws.send(JSON.stringify(payload));
+      // The WS just opened so a synced status is now accurate. Echo it
+      // to the pill (it won't reflect the open state until the first
+      // client-driven action otherwise).
+      setHotwordSyncStatus('synced');
     };
 
     ws.onmessage = (evt) => {
@@ -852,13 +1333,31 @@
 
     ws.onerror = () => {
       setConnStatus('disconnected');
+      setHotwordSyncStatus('offline');
+      if (extractRequestId) {
+        extractRequestId = null;
+        setExtractBusy(false);
+        setExtractStatus('error', 'tsasr.extract.connError');
+      }
     };
 
     ws.onclose = () => {
       setConnStatus('disconnected');
       ws = null;
+      setHotwordSyncStatus('offline');
+      if (extractRequestId) {
+        extractRequestId = null;
+        setExtractBusy(false);
+        setExtractStatus('error', 'tsasr.extract.connClosed');
+      }
+      // Server has finished its post-stop work and dropped the
+      // connection. Re-enable the mic so the user can start the next
+      // utterance.
+      isAwaitingFinalize = false;
       if (isRecordingLive) {
         stopLiveStreaming({ sendStop: false, reason: 'ws_closed' });
+      } else {
+        updateMicGate();
       }
     };
   }
@@ -876,8 +1375,17 @@
         );
         startLiveStreaming();
         break;
-      case 'final':
-        if (data.text && data.text.trim()) {
+      case 'processing':
+        // The backend has accepted a VAD segment and is about to invoke
+        // AmphionTSASR. Paint a placeholder bubble carrying the segment
+        // id so the eventual ``final`` (or empty-final discard) can
+        // upgrade / remove it in place.
+        if (data.id) addProcessingBubble(data.id);
+        break;
+      case 'final': {
+        const ptext = (data.text || '').trim();
+        const sectext = (data.text_secondary || '').trim();
+        if (ptext || sectext) {
           // Cache the mixed-audio blob *before* rendering so addFinalBubble
           // can mount the replay button in the initial DOM pass. Always
           // overwrite on collision (backend should mint unique ids, but if
@@ -900,16 +1408,44 @@
           const durationSec =
             typeof data.duration_sec === 'number' ? data.duration_sec : null;
           addFinalBubble(
-            data.text.trim(),
+            ptext,
+            sectext,
             langValue,
             durationSec,
             data.id || null,
           );
+        } else if (data.id) {
+          // Both rows empty + an id is the backend's "discard the
+          // partial bubble" signal — fired when the optional silence
+          // gate suppresses an utterance whose partial(s) we already
+          // painted (or both ASR paths returned empty text).
+          discardPartialBubble(data.id);
         }
         break;
-      case 'partial':
-        // Not rendered by default; TS-ASR partial is usually disabled server-side.
+      }
+      case 'partial': {
+        // Pseudo-streaming partial. Backend reuses the same id across all
+        // partials in an utterance and on the eventual final.
+        //
+        // Both rows empty (with a valid id) is the backend's "drop what
+        // we've painted for this utterance" signal — fired by the
+        // optional silence gate, or when both ASR paths returned empty.
+        // The next non-empty partial will arrive under a fresh id and
+        // mint a new bubble, so we simply drop the existing one and
+        // otherwise stay quiet.
+        const pid = data.id;
+        if (!pid) break;
+        const ptext = (data.text || '').trim();
+        const sectext = (data.text_secondary || '').trim();
+        if (!ptext && !sectext) {
+          discardPartialBubble(pid);
+          break;
+        }
+        if (!updatePartialBubble(pid, ptext, sectext)) {
+          addPartialBubble(pid, ptext, sectext);
+        }
         break;
+      }
       case 'error': {
         const code = data.code || 'error';
         // Pill stays short -- show the short code only; the full message
@@ -927,6 +1463,28 @@
           if (ws) {
             try { ws.close(); } catch { /* noop */ }
           }
+        }
+        break;
+      }
+      case 'extract_hotwords_result': {
+        if (!extractRequestId || data.request_id !== extractRequestId) break;
+        extractRequestId = null;
+        setExtractBusy(false);
+        const merged = mergeExtractedHotwords(data.hotwords || []);
+        setExtractStatus('success', 'tsasr.extract.added', {
+          added: merged,
+          total: (data.hotwords || []).length,
+        });
+        break;
+      }
+      case 'extract_hotwords_error': {
+        if (!extractRequestId || data.request_id !== extractRequestId) break;
+        extractRequestId = null;
+        setExtractBusy(false);
+        if (data.message) {
+          setExtractStatus('error', 'tsasr.extract.raw', { msg: data.message });
+        } else {
+          setExtractStatus('error', 'tsasr.extract.failed');
         }
         break;
       }
@@ -983,14 +1541,25 @@
     micBtn.classList.remove('recording');
     micIcon.setAttribute('fill', 'none');
     pulseRings.forEach((r) => r.classList.remove('active'));
-    updateMicGate();
 
     if (sendStop && ws && ws.readyState === WebSocket.OPEN) {
+      // The mic-stop click means "I'm done with this take, give me the
+      // result". Send stop and DON'T close the WS — the server still
+      // has to flush the buffered audio, run inference, and emit the
+      // final. It will close the socket from its end after on_stop
+      // returns. Closing here would truncate the in-flight inference
+      // response and orphan any "识别中…" placeholder already on
+      // screen. While we wait, ``isAwaitingFinalize`` keeps the mic
+      // button disabled so the user can't double-fire stop.
       try { ws.send(JSON.stringify({ type: 'stop' })); } catch { /* noop */ }
-    }
-    if (ws && ws.readyState === WebSocket.OPEN && reason !== 'keep_ws') {
+      isAwaitingFinalize = true;
+    } else if (ws && ws.readyState === WebSocket.OPEN && reason !== 'keep_ws') {
+      // Cancel-style paths (ws_closed echo, enrollment rejected, etc):
+      // no stop will be processed server-side, so close right away.
       try { ws.close(1000); } catch { /* noop */ }
     }
+
+    updateMicGate();
   }
 
   micBtn.addEventListener('click', async () => {
@@ -1031,6 +1600,26 @@
         currentEnrollUploadDyn.vars || undefined,
       );
     }
+    // Re-render hotword list (the trash button's aria-label uses an i18n
+    // key) and the dynamic translation pills (sync status, extract
+    // status, count). The pills already carry ``data-dyn-key`` attrs, so
+    // the chatArea walk below would normally cover them, but they live
+    // outside #chat-area — translate explicitly here.
+    renderHotwords();
+    setHotwordSyncStatus(currentSyncState);
+    if (currentExtractDyn && currentExtractDyn.key) {
+      setDynText(
+        hotwordExtractStatus,
+        currentExtractDyn.key,
+        currentExtractDyn.vars || undefined,
+      );
+    }
+    if (hotwordExtractBtn) {
+      setDynText(
+        hotwordExtractBtn,
+        extractRequestId ? 'tsasr.hotword.extracting' : 'tsasr.hotword.extract',
+      );
+    }
     updateMicGate();
     // Walk dyn nodes inside the chat area to refresh transcript meta + errors.
     chatArea.querySelectorAll('[data-dyn-key]').forEach((el) => {
@@ -1048,9 +1637,121 @@
     });
   }
 
-  onLangChange(refreshDynamic);
+  i18nUnsub = onLangChange(refreshDynamic);
 
   // -------------------- Init --------------------
   setEnrollStatus('idle', 'tsasr.enroll.notRecorded');
   updateMicGate();
+
+    // -------------------- Dispose --------------------
+    // Called by the SPA router before the tsasr <main> is swapped out.
+    // Aborts the in-flight upload (if any), shuts down the live WS,
+    // releases both AudioContext + microphone graphs (live + enroll),
+    // cancels the enrollment progress timer, revokes every replay /
+    // preview blob URL we've minted, and unsubscribes from i18n change
+    // events. Mirrors the ``beforeunload`` cleanup.
+    return function disposeTsasr() {
+      try {
+        window.removeEventListener('beforeunload', onBeforeUnload);
+      } catch (_) { /* ignore */ }
+      if (uploadController) {
+        try { uploadController.abort(); } catch (_) { /* ignore */ }
+        uploadController = null;
+      }
+      if (enrollTimerId !== null) {
+        try { clearInterval(enrollTimerId); } catch (_) { /* ignore */ }
+        enrollTimerId = null;
+      }
+
+      // Live (microphone -> WS) graph.
+      if (liveNode) {
+        try { liveNode.port.onmessage = null; } catch (_) { /* ignore */ }
+        try { liveNode.disconnect(); } catch (_) { /* ignore */ }
+        liveNode = null;
+      }
+      if (liveCtx) {
+        try { liveCtx.close(); } catch (_) { /* ignore */ }
+        liveCtx = null;
+      }
+      if (liveStream) {
+        try {
+          liveStream.getTracks().forEach((tr) => {
+            try { tr.stop(); } catch (_) { /* ignore */ }
+          });
+        } catch (_) { /* ignore */ }
+        liveStream = null;
+      }
+      isRecordingLive = false;
+
+      // Enrollment recording graph (only running when the user pressed
+      // Start enrollment and didn't release).
+      if (enrollNode) {
+        try { enrollNode.port.onmessage = null; } catch (_) { /* ignore */ }
+        try { enrollNode.disconnect(); } catch (_) { /* ignore */ }
+        enrollNode = null;
+      }
+      if (enrollCtx) {
+        try { enrollCtx.close(); } catch (_) { /* ignore */ }
+        enrollCtx = null;
+      }
+      if (enrollStream) {
+        try {
+          enrollStream.getTracks().forEach((tr) => {
+            try { tr.stop(); } catch (_) { /* ignore */ }
+          });
+        } catch (_) { /* ignore */ }
+        enrollStream = null;
+      }
+      isEnrollRecording = false;
+
+      // The TS-ASR WebSocket survives across utterances, so close it
+      // outside of stopLiveStreaming and only on dispose.
+      if (ws) {
+        try {
+          ws.onopen = null;
+          ws.onclose = null;
+          ws.onerror = null;
+          ws.onmessage = null;
+          if (ws.readyState === WebSocket.OPEN
+              || ws.readyState === WebSocket.CONNECTING) {
+            ws.close();
+          }
+        } catch (_) { /* ignore */ }
+        ws = null;
+      }
+
+      // Reset hotword sync pill + abort any in-flight extraction so a
+      // remount starts in a clean state. The hotword list itself stays
+      // in localStorage and will be re-read on the next mount.
+      try { setHotwordSyncStatus('waiting'); } catch (_) { /* ignore */ }
+      if (extractRequestId) {
+        extractRequestId = null;
+        try { setExtractBusy(false); } catch (_) { /* ignore */ }
+        try { setExtractStatus('idle', 'tsasr.extract.idle'); } catch (_) { /* ignore */ }
+      }
+
+      // Revoke replay blob cache (also clears active <audio> playback).
+      try { clearSegmentAudio(); } catch (_) { /* ignore */ }
+
+      // The enrollment preview audio holds another blob URL; let it go.
+      if (enrollPreviewUrl) {
+        try { URL.revokeObjectURL(enrollPreviewUrl); } catch (_) { /* ignore */ }
+        enrollPreviewUrl = null;
+      }
+      try {
+        if (enrollPreviewEl) {
+          enrollPreviewEl.pause();
+          enrollPreviewEl.removeAttribute('src');
+        }
+      } catch (_) { /* ignore */ }
+
+      if (typeof i18nUnsub === 'function') {
+        try { i18nUnsub(); } catch (_) { /* ignore */ }
+        i18nUnsub = null;
+      }
+    };
+  }
+
+  window.AmphionPages = window.AmphionPages || {};
+  window.AmphionPages.tsasr = { init: initTsasr };
 })();

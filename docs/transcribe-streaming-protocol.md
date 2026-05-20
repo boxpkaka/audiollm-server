@@ -1,351 +1,239 @@
-# /transcribe-streaming WebSocket 协议文档
+# 通用流式 ASR API
 
-> 端点命名约定：本服务按任务一类一个 WebSocket 端点（`/<task>-streaming`）。本文档主体描述的是「个性化语音识别」任务；目标说话人 ASR 使用 `/transcribe-target-streaming`（详见 [docs/tsasr.md](tsasr.md)），整段情感识别使用 `/emotion-streaming`（详见 [docs/emotion-streaming-protocol.md](emotion-streaming-protocol.md)），按段流式情感识别使用 `/emotion-segmented-streaming`（详见 [docs/emotion-segmented-streaming-protocol.md](emotion-segmented-streaming-protocol.md)）。所有端点共享相同的控制消息基础结构（`ready` / `start` / `stop` / `update_hotwords` / `error` / `start.config` 覆写机制），只是任务专属字段与输出语义不同。
+`/transcribe-streaming` 用于实时语音转写。客户端通过 WebSocket 发送 16 kHz mono s16le PCM 音频流，服务端按 VAD 语音段返回中间结果和最终结果。
 
-## 当前支持的 Demo WS 端点总览
+REST 上传版本见本文末尾的 `/api/asr/upload`。
 
-下表列出本服务当前对外提供的任务流式 WebSocket 接入方式，所有端点均共享 `ready / start / 二进制 PCM / stop / error` 的基础时序，差异集中在 `start` 必填字段与服务端推送的结果消息类型上。
+## 接口信息
 
-| 任务 | 端点路径 | Query 参数 | 是否走 VAD 分段 | partial 输出 | 最终消息类型 | start 关键字段 | 详细协议 |
-|---|---|---|---|---|---|---|---|
-| 通用流式 ASR | /transcribe-streaming | language（可选） | 是 | 是（伪流式） | final_asr | mode=asr_only, format=pcm_s16le, sample_rate_hz=16000, channels=1 | 见本文档下文 |
-| 目标说话人 ASR（TS-ASR） | /transcribe-target-streaming | language（可选） | 是 | 默认关闭，由 tsasr_enable_partial 控制 | final（task=tsasr） | format/sample_rate_hz/channels（可选）+ enrollment_audio（必填，base64 WAV） | docs/tsasr.md |
-| 整段情感识别（SER/SEC） | /emotion-streaming | 无 | 否（整段缓存到 stop） | 否 | final_emotion | format=pcm_s16le, sample_rate_hz=16000, channels=1, mode=ser 或 sec（可选） | docs/emotion-streaming-protocol.md |
-| 按段流式情感识别（SER/SEC） | /emotion-segmented-streaming | language（可选） | 是 | 否 | final_emotion（每段一条） | format=pcm_s16le, sample_rate_hz=16000, channels=1, mode=ser 或 sec（可选） | docs/emotion-segmented-streaming-protocol.md |
-
-三类端点统一的接入步骤：
-
-1. 建连：ws(s)://host:port/<endpoint>，按需附加 query 参数。
-2. 等待服务端首条 ready。
-3. 发送一条 start（JSON），声明音频参数与任务专属字段；TS-ASR 还会在校验通过后回一条 enrollment_ok。
-4. 持续以二进制帧推送 PCM（统一 16 kHz / mono / s16le，建议每帧 30–80 ms）。
-5. 期间按需收取 partial / partial_asr 等中间结果（仅 ASR 端点默认开启）。
-6. 发送 {"type":"stop"} 结束本次会话；服务端 flush 后保证回一条最终结果（final_asr / final / final_emotion）再允许 close。
-7. 发生错误时服务端推送 {"type":"error",...}，TS-ASR 的注册类错误 code 以 enrollment_ 为前缀，但不会主动断连。
-
-所有端点均允许在 start.config 内平铺覆写服务端 Config 的白名单字段（例如 ASR 的 vad_threshold、TS-ASR 的 tsasr_enable_partial、情感的 emotion_request_timeout 等），仅本次会话生效。
-
-## 概述
-
-`/transcribe-streaming` 是面向上游服务（如 tiro_api）的 ASR WebSocket 接口。客户端通过该接口发送实时音频流，服务端返回增量转写结果（partial）和最终转写结果（final）。
-
-## 连接
-
-### URL
-
-```
-ws://<host>:<port>/transcribe-streaming?language=<lang>
-wss://<host>:<port>/transcribe-streaming?language=<lang>
-```
+| 项目 | 说明 |
+|---|---|
+| 协议 | WebSocket |
+| 路径 | `/transcribe-streaming` |
+| 完整 URL | `ws://172.16.0.3:8080/transcribe-streaming?language=<lang>` |
+| 鉴权 | 无内置鉴权，无需自定义请求头 |
+| 音频输入 | 二进制 PCM 帧，16 kHz、mono、signed 16-bit little-endian |
+| 分段策略 | 服务端 VAD 自动切段 |
+| 中间结果 | 支持，受 `enable_pseudo_stream` 与 `pseudo_stream_interval_ms` 影响 |
+| 最终结果 | 每个语音段一条；`stop` 后会 flush 尾部残余音频 |
 
 ### Query 参数
 
-| 参数       | 必填 | 说明                                                |
-|------------|------|-----------------------------------------------------|
-| `language` | 否   | 语言代码，如 `zh`、`en`、`id`、`th`。默认空（自动检测） |
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `language` | string | 否 | 语言代码，如 `zh`、`en`、`id`、`th`。不传表示自动检测或使用服务端默认策略 |
 
-### 请求头
+## 调用流程
 
-无自定义请求头要求。仅使用 WebSocket 标准握手头。
-
----
-
-## 消息时序
-
-```
-Client                                Server
-  |                                      |
-  |  ---- WebSocket 连接 (?language=zh) -->
-  |                                      |
-  |  <--------  ready  ---------------   |
-  |                                      |
-  |  ----  update_hotwords (可选)  ---->  |
-  |  ----  start  -------------------->  |
-  |                                      |
-  |  ----  binary PCM chunk  --------->  |
-  |  ----  binary PCM chunk  --------->  |
-  |  <--------  partial_asr  ----------  |  (VAD 检测到语音期间，周期性输出)
-  |  ----  binary PCM chunk  --------->  |
-  |  <--------  partial_asr  ----------  |
-  |  ----  binary PCM chunk  --------->  |
-  |                                      |  (VAD 检测到语音结束)
-  |  <--------  final_asr  ------------  |
-  |                                      |
-  |  ----  update_hotwords (可选)  ---->  |  (中途可随时更新热词)
-  |                                      |
-  |  ----  binary PCM chunk  --------->  |  (下一段语音...)
-  |  ...                                 |
-  |                                      |
-  |  ----  stop  ----------------------> |
-  |  <--------  final_asr  ------------  |  (残余音频的最终结果)
-  |                                      |
-  |  ---- 连接关闭 ---                    |
+```text
+Client                                      Server
+  | ---- WebSocket connect --------------> |
+  | <---------------- ready -------------- |
+  | ---- start --------------------------> |
+  | ---- binary PCM chunk ---------------> |
+  | <---------------- partial ----------- |
+  | ---- binary PCM chunk ---------------> |
+  | <---------------- final ------------- |  one speech segment
+  | ---- binary PCM chunk ---------------> |
+  | ---- stop ---------------------------> |
+  | <---------------- final ------------- |  trailing audio, if any
+  | ---- close --------------------------> |
 ```
 
----
+服务端历史版本可能返回 `partial_asr` / `final_asr`，当前第三方客户端建议同时兼容 `partial` / `partial_asr` 与 `final` / `final_asr`。
 
-## 客户端 -> 服务端消息
+## 客户端消息
 
-### 1. start
+### start
 
-建连收到 `ready` 后发送，声明音频参数。必须在发送 PCM 之前发送。
+收到 `ready` 后、发送任何 PCM 前必须先发送 `start`。
 
 ```json
 {
   "type": "start",
-  "mode": "asr_only",
   "format": "pcm_s16le",
   "sample_rate_hz": 16000,
-  "channels": 1
+  "channels": 1,
+  "language": "zh",
+  "hotwords": ["挚音科技", "张硕"],
+  "config": {
+    "vad_threshold": 0.45
+  }
 }
 ```
 
-| 字段             | 类型   | 必填 | 说明                                  |
-|------------------|--------|------|---------------------------------------|
-| `type`           | string | 是   | 固定 `"start"`                        |
-| `mode`           | string | 是   | 固定 `"asr_only"`                     |
-| `format`         | string | 是   | 音频编码，固定 `"pcm_s16le"`          |
-| `sample_rate_hz` | int    | 是   | 采样率，固定 `16000`                  |
-| `channels`       | int    | 是   | 声道数，固定 `1`                      |
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `type` | string | 是 | 固定为 `start` |
+| `format` | string | 是 | 固定为 `pcm_s16le` |
+| `sample_rate_hz` | integer | 是 | 固定为 `16000` |
+| `channels` | integer | 是 | 固定为 `1` |
+| `language` | string | 否 | 语言代码；与 query 参数二选一即可 |
+| `hotwords` | string[] | 否 | 热词列表 |
+| `config` | object | 否 | 当前连接的服务端配置覆写 |
 
-### 2. update_hotwords
+### update_hotwords
 
-更新热词和语种。可在 start 之后、音频流期间随时发送。
+会话中可随时更新热词。
 
 ```json
 {
   "type": "update_hotwords",
-  "hotwords": ["武新华", "挚音科技", "张硕"],
+  "hotwords": ["产品名", "人名"],
   "src_lang": "zh"
 }
 ```
 
-| 字段       | 类型     | 必填 | 说明                                                                 |
-|------------|----------|------|----------------------------------------------------------------------|
-| `type`     | string   | 是   | 固定 `"update_hotwords"`                                             |
-| `hotwords` | string[] | 是   | 热词列表，空数组 `[]` 表示清除                                       |
-| `src_lang` | string   | 否   | 语种代码或全称，如 `"zh"` / `"Chinese"` / `"en"` / `"English"` 等。不传则保持上一次的值 |
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `type` | string | 是 | 固定为 `update_hotwords` |
+| `hotwords` | string[] | 是 | 新热词列表；空数组表示清空 |
+| `src_lang` | string | 否 | 语言代码或语言名称 |
 
-**语种映射表**：
+### 二进制音频帧
 
-| 短码 | 内部名称      |
-|------|---------------|
-| `zh` | Chinese       |
-| `cn` | Chinese       |
-| `en` | English       |
-| `id` | Indonesian    |
-| `th` | Thai          |
+`start` 后持续发送 PCM bytes。
 
-### 3. 二进制 PCM 音频帧
+| 项目 | 要求 |
+|---|---|
+| 编码 | signed 16-bit little-endian PCM |
+| 采样率 | 16000 Hz |
+| 声道 | 1 |
+| 推荐 chunk | 30-80 ms |
+| 80 ms 字节数 | 2560 bytes |
 
-在 `start` 之后持续发送。每帧为原始 PCM bytes，格式要求：
-
-- 编码：pcm_s16le（16-bit 有符号小端整数）
-- 采样率：16000 Hz
-- 声道：1（mono）
-- 每毫秒 bytes 数：`16000 * 1 * 2 / 1000 = 32 bytes/ms`
-
-推荐 chunk 大小：
-
-| chunk 时长 | bytes 数 |
-|------------|----------|
-| 40 ms      | 1280     |
-| 80 ms      | 2560     |
-| 100 ms     | 3200     |
-
-服务端对单包大小无严格限制，兼容各种 chunk 大小。
-
-### 4. stop
-
-结束音频流。服务端将 flush VAD 残余音频并返回最后的 `final_asr`。
+### stop
 
 ```json
-{
-  "type": "stop"
-}
+{"type":"stop"}
 ```
 
----
+`stop` 表示本次音频输入结束。服务端会处理剩余音频并返回最终结果。
 
-## 服务端 -> 客户端消息
+## 服务端消息
 
-### 1. ready
-
-连接建立后服务端发送的首条消息，表示服务就绪。
+### ready
 
 ```json
-{
-  "type": "ready"
-}
+{"type":"ready"}
 ```
 
-### 2. partial_asr
-
-VAD 检测到语音期间，周期性输出的增量转写结果。每条 partial_asr 包含当前已累积语音的最新转写文本（非增量差分，而是当前最佳完整转写）。
+### partial / partial_asr
 
 ```json
 {
-  "type": "partial_asr",
-  "text": "你好世界",
+  "type": "partial",
+  "id": "seg-001",
+  "text": "你好",
   "language": "zh"
 }
 ```
 
-| 字段       | 类型   | 说明                                 |
-|------------|--------|--------------------------------------|
-| `type`     | string | `"partial_asr"` 或 `"partial"`（兼容） |
-| `text`     | string | 当前转写文本                         |
-| `language` | string | 识别语言                             |
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `type` | string | `partial` 或 `partial_asr` |
+| `id` | string | 语音段 ID；可能不存在 |
+| `text` | string | 当前语音段的临时转写文本 |
+| `language` | string | 检测或传入的语言 |
 
-**输出频率**：默认每 500ms 输出一次（受 `PSEUDO_STREAM_INTERVAL_MS` 环境变量控制）。主/次 ASR 模型任一启用即生效。
-
-**噪声抑制**：当 secondary ASR 启用时，如果 secondary 输出为空，则 partial 被抑制不输出，防止噪声产生误识别。
-
-**推理方式**：与 final_asr 一致，使用双路 ASR 并行推理 + 融合。
-
-### 3. final_asr
-
-VAD 检测到一段语音结束后，输出该段的最终转写结果。经过双路 ASR 融合。
+### final / final_asr
 
 ```json
 {
-  "type": "final_asr",
-  "text": "你好世界",
-  "language": "zh"
+  "type": "final",
+  "id": "seg-001",
+  "text": "你好，欢迎使用语音识别服务。",
+  "language": "zh",
+  "duration_sec": 3.42
 }
 ```
 
-| 字段       | 类型   | 说明                                   |
-|------------|--------|----------------------------------------|
-| `type`     | string | `"final_asr"` 或 `"final"`（兼容）     |
-| `text`     | string | 最终转写文本                           |
-| `language` | string | 识别语言                               |
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `type` | string | `final` 或 `final_asr` |
+| `id` | string | 语音段 ID；可能不存在 |
+| `text` | string | 最终转写文本 |
+| `language` | string | 检测或传入的语言 |
+| `duration_sec` | number | 本次推理使用的音频时长；部分流式消息可能不带 |
 
-**触发时机**：
-- 每次 VAD 检测到语音结束时（静音超过阈值）
-- 收到 `stop` 后 flush 残余音频时
-- 一个 start/stop 周期内可能产生多个 `final_asr`（对应多个 VAD 段）
-
-### 4. error
-
-发生错误时返回。
+### error
 
 ```json
 {
   "type": "error",
-  "message": "错误描述"
+  "message": "invalid start message"
 }
 ```
 
----
+客户端收到 `error` 后应记录完整 payload，并根据业务需要停止发送音频或关闭连接。
 
-## 典型调用示例
+## 可覆写配置
 
-### Python (websockets)
+常用 `start.config` 字段：
 
-```python
-import asyncio, json, websockets, ssl
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `vad_threshold` | number | VAD 判定阈值 |
+| `silence_duration_ms` | integer | 静音持续多久后切段 |
+| `min_segment_duration_ms` | integer | 短于该值的语音段会被丢弃 |
+| `enable_pseudo_stream` | boolean | 是否输出伪流式中间结果 |
+| `pseudo_stream_interval_ms` | integer | 伪流式中间结果间隔 |
+| `asr_request_timeout` | number | 单次 ASR 模型请求超时秒数 |
 
-async def transcribe(audio_pcm_bytes: bytes):
-    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ssl_ctx.check_hostname = False
-    ssl_ctx.verify_mode = ssl.CERT_NONE
+## Python WebSocket 示例
 
-    async with websockets.connect(
-        "wss://host:8443/transcribe-streaming?language=zh",
-        ssl=ssl_ctx,
-    ) as ws:
-        # 等待 ready
-        ready = json.loads(await ws.recv())
-        assert ready["type"] == "ready"
-
-        # 发送热词
-        await ws.send(json.dumps({
-            "type": "update_hotwords",
-            "hotwords": ["武新华", "挚音科技"],
-        }))
-
-        # 发送 start
-        await ws.send(json.dumps({
-            "type": "start",
-            "mode": "asr_only",
-            "format": "pcm_s16le",
-            "sample_rate_hz": 16000,
-            "channels": 1,
-        }))
-
-        # 发送音频（每 80ms 一个 chunk）
-        chunk_size = 2560  # 80ms
-        for i in range(0, len(audio_pcm_bytes), chunk_size):
-            await ws.send(audio_pcm_bytes[i:i+chunk_size])
-            await asyncio.sleep(0.08)
-
-        # 发送 stop
-        await ws.send(json.dumps({"type": "stop"}))
-
-        # 接收结果
-        async for msg in ws:
-            data = json.loads(msg)
-            if data["type"] == "partial_asr":
-                print(f"[partial] {data['text']}")
-            elif data["type"] == "final_asr":
-                print(f"[final]   {data['text']}")
-            elif data["type"] == "error":
-                print(f"[error]   {data['message']}")
-```
-
-### 测试客户端
-
-项目自带测试脚本 `tests/test_ws_client.py`：
+完整可运行脚本见 [examples/ws_transcribe.py](examples/ws_transcribe.py)。
 
 ```bash
-# 基本用法
-python tests/test_ws_client.py audio.wav
+pip install websockets numpy
 
-# 指定热词
-python tests/test_ws_client.py audio.wav --hotwords "武新华,挚音科技,张硕"
-
-# 指定语言和 chunk 大小
-python tests/test_ws_client.py audio.wav --language en --chunk-ms 100
-
-# 自定义服务地址
-python tests/test_ws_client.py audio.wav --url ws://10.0.0.1:8907/transcribe-streaming
+python docs/examples/ws_transcribe.py sample.wav \
+  --url ws://172.16.0.3:8080/transcribe-streaming \
+  --language zh \
+  --hotwords "挚音科技,张硕" \
 ```
 
----
+使用 `bash start.sh`（`wss://172.16.0.3:8443/...`）时，示例脚本可加 `--insecure` 跳过自签证书校验。
 
-## 兼容性说明
+## REST 上传接口
 
-本接口设计兼容 tiro_api 的 ASR backend 协议：
+`POST /api/asr/upload` 适合上传完整音频文件并获得一次最终转写结果。
 
-| 契约项                 | 支持情况                                     |
-|------------------------|----------------------------------------------|
-| WS 路径                | `/transcribe-streaming`                      |
-| query `language`       | 支持                                         |
-| `start` / `stop` 消息  | 完整支持                                     |
-| PCM 音频（16k/mono/s16le）| 完整支持                                  |
-| `partial_asr` / `partial` | 输出 `partial_asr`                        |
-| `final_asr` / `final`    | 输出 `final_asr`                           |
-| `error` 消息           | 完整支持                                     |
-| 握手鉴权头             | 无要求（内网免鉴权）                         |
-| `update_hotwords`      | 扩展支持（tiro_api 当前不使用，可选）        |
+### 请求
 
-tiro_api 侧对接只需修改 `TIRO_API_ASR_WS_BACKENDS` 指向本服务即可。
+| 表单字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `audio` | file | 是 | WAV 音频文件 |
+| `language` | string | 否 | 语言代码 |
+| `hotwords` | string | 否 | 逗号分隔热词，如 `挚音科技,张硕` |
 
----
+### 响应
 
-## 环境变量
+```json
+{
+  "type": "final",
+  "text": "你好，欢迎使用语音识别服务。",
+  "language": "zh",
+  "duration_sec": 3.42
+}
+```
 
-以下环境变量影响 `/transcribe-streaming` 的行为（均有默认值）：
+### Python REST 示例
 
-| 变量                         | 默认值        | 说明                               |
-|------------------------------|---------------|------------------------------------|
-| `ENABLE_PRIMARY_ASR`         | `1`           | 是否启用主 ASR 模型                |
-| `ENABLE_SECONDARY_ASR`       | `1`           | 是否启用次 ASR 模型                |
-| `ENABLE_PSEUDO_STREAM`       | `1`           | 是否启用伪流式 partial 输出        |
-| `PSEUDO_STREAM_INTERVAL_MS`  | `500`         | partial 输出最小间隔（ms）         |
-| `PRIMARY_ASR_TIMEOUT`        | `4.0`         | 主 ASR 单次请求超时（秒）          |
-| `ASR_REQUEST_TIMEOUT`        | `120`         | ASR HTTP 请求总超时（秒）          |
-| `VAD_THRESHOLD`              | `0.5`         | VAD 语音概率阈值                   |
-| `SILENCE_DURATION_MS`        | `200`         | 静音多久判定语音结束（ms）         |
-| `MIN_SEGMENT_DURATION_MS`    | `350`         | 最短 VAD 段时长（ms），更短的丢弃  |
+完整可运行脚本见 [examples/rest_upload.py](examples/rest_upload.py)。
+
+```bash
+pip install requests
+
+python docs/examples/rest_upload.py asr sample.wav \
+  --base-url http://172.16.0.3:8080 \
+  --language zh \
+  --hotwords "挚音科技,张硕" \
+```
+
+## 相关文档
+
+- [API 总览](api-reference.md)
+- [目标说话人 ASR](tsasr.md)
+- [整段情感识别](emotion-streaming-protocol.md)
+- [分段情感识别](emotion-segmented-streaming-protocol.md)

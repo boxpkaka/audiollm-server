@@ -4,13 +4,15 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title data-i18n-doc-title="emotion.titleTag" data-i18n="emotion.titleTag">Amphion Emotion Demo</title>
-  <script src="https://cdn.tailwindcss.com"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link
     href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Source+Serif+4:wght@400;500;600&display=swap"
     rel="stylesheet"
   />
+  <!-- Pre-compiled Tailwind utilities (see scripts/build_tailwind.sh).
+       Loaded before style.css so our custom rules win on equal specificity. -->
+  <link rel="stylesheet" href="tailwind.css" />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body data-page="emotion">
@@ -121,8 +123,15 @@
   </div>
 
   <script src="i18n.js"></script>
-  <script src="sidebar.js"></script>
+  <!-- All three demo pages share the same SPA shell, so every entry
+       HTML loads every page module. The router (router.js) decides
+       which one to mount based on body[data-page]. -->
   <script src="audio-upload.js"></script>
+  <script src="streaming-text.js"></script>
+  <script src="app.js"></script>
   <script src="emotion-app.js"></script>
+  <script src="tsasr-app.js"></script>
+  <script src="sidebar.js"></script>
+  <script src="router.js"></script>
 </body>
 </html>

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Any
@@ -67,18 +68,42 @@ class Config:
     tsasr_request_timeout: float = 30.0
     tsasr_enrollment_min_sec: float = 1.0
     # Long uploads are trimmed via VAD to the leading ``max_sec`` of voiced
-    # audio rather than being rejected — see ``decode_enrollment``. Five
-    # seconds is enough for TS-ASR voice conditioning and keeps the
-    # dual-audio prompt short.
-    tsasr_enrollment_max_sec: float = 5.0
+    # audio rather than being rejected — see ``decode_enrollment``. Eight
+    # seconds gives the speaker enough room to read a short prompt while
+    # still keeping the dual-audio prompt short.
+    tsasr_enrollment_max_sec: float = 8.0
     tsasr_max_audio_seconds: float = 30.0
+    # Pseudo-streaming partials. Off by default: the dedicated TS-ASR
+    # endpoint is fast enough that the user only needs to see "识别中…"
+    # while a segment is in flight; piling partial results on top adds
+    # visual noise (text rewriting itself mid-utterance) without much
+    # latency benefit on top of a 1-2s end-to-end inference.
     tsasr_enable_partial: bool = False
-    tsasr_enable_hotwords: bool = False
-    # Second-stage speech-presence gate. The Amphion TS-ASR engine has no
-    # silence/noise filter beyond the upstream VAD (the secondary ASR is
-    # disabled because Qwen3-ASR-1.7B can't take dual-audio input), so
-    # transient noise like keyboard taps that VAD misclassifies as speech
-    # would otherwise be sent straight to the model. We re-analyze each
+    # Inject ``ctx.hotwords`` into the TS-ASR prompt as a comma-joined
+    # ``Hotwords:`` line after the transcribe instruction. Aligned with
+    # template B in the v3 SFT recipe (see backend/tsasr/prompt.py), so
+    # safe to enable by default; flip off only if the deployed model
+    # checkpoint pre-dates v3 hotword training.
+    tsasr_enable_hotwords: bool = True
+    # Optional Qwen3-ASR-1.7B presence/silence gate. When True the
+    # backend runs the general-purpose secondary ASR in parallel with
+    # AmphionTSASR and suppresses the segment if either path comes back
+    # empty (cheap protection against TS-ASR hallucinating on pure
+    # noise). Off by default: the dedicated TS-ASR checkpoint and the
+    # speech-presence gate below already handle silence well, and
+    # running two models doubles the per-segment latency.
+    tsasr_enable_secondary_gate: bool = False
+    # When True, run Qwen3-ASR in parallel with AmphionTSASR on every
+    # segment / partial and surface BOTH transcripts to the client (rendered
+    # as two labeled rows on the frontend: "安菲翁:" / "千问:"). This is the
+    # comparison/demo mode and is independent from the silence gate above:
+    # the gate suppresses output when either path is empty, while this flag
+    # only controls whether the secondary text is forwarded for display.
+    tsasr_show_secondary_text: bool = True
+    # First-stage speech-presence gate. The Amphion TS-ASR engine has no
+    # silence/noise filter beyond the upstream VAD, so transient noise
+    # like keyboard taps that VAD misclassifies as speech would
+    # otherwise be sent straight to the model. We re-analyze each
     # segmented clip with a stricter per-frame probability threshold and
     # require a minimum cumulative voiced duration before invoking vLLM.
     tsasr_speech_gate_enabled: bool = True
@@ -99,6 +124,24 @@ class Config:
     # Default task variant when the client doesn't specify one in start.mode.
     # "ser" -> single label classification; "sec" -> free-form caption.
     emotion_task_mode: str = "ser"
+
+    # ---- Text cleanup LLM (DashScope OpenAI-compatible) -------------------
+    text_cleanup_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    text_cleanup_model_name: str = "qwen2.5-32b-instruct"
+    text_cleanup_api_key_env: str = "DASHSCOPE_API_KEY"
+    text_cleanup_api_key: str = ""
+    text_cleanup_timeout: float = 30.0
+    text_cleanup_max_tokens: int = 1024
+
+    @property
+    def resolved_text_cleanup_api_key(self) -> str:
+        """Return configured API key, preferring the named environment variable."""
+        env_name = self.text_cleanup_api_key_env.strip()
+        if env_name:
+            value = os.getenv(env_name, "").strip()
+            if value:
+                return value
+        return self.text_cleanup_api_key.strip()
 
     def override(self, **kwargs: Any) -> Config:
         """Return a new Config with the given fields replaced (unknown keys ignored)."""
@@ -162,6 +205,12 @@ EMOTION_VLLM_MODEL_NAME = _default.emotion_vllm_model_name
 EMOTION_REQUEST_TIMEOUT = _default.emotion_request_timeout
 EMOTION_MAX_AUDIO_SECONDS = _default.emotion_max_audio_seconds
 EMOTION_TASK_MODE = _default.emotion_task_mode
+
+TEXT_CLEANUP_BASE_URL = _default.text_cleanup_base_url
+TEXT_CLEANUP_MODEL_NAME = _default.text_cleanup_model_name
+TEXT_CLEANUP_API_KEY_ENV = _default.text_cleanup_api_key_env
+TEXT_CLEANUP_TIMEOUT = _default.text_cleanup_timeout
+TEXT_CLEANUP_MAX_TOKENS = _default.text_cleanup_max_tokens
 
 TSASR_BASE_URL = _default.tsasr_base_url
 TSASR_MODEL_NAME = _default.tsasr_model_name

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket
 from fastapi.staticfiles import StaticFiles
+from starlette.types import Receive, Scope, Send
 
 from .asr.client import query_audio_model, query_audio_model_secondary
 from .asr.fusion import choose_fused_result
@@ -17,6 +18,8 @@ from .http_client import close_client
 from .session import AudioSession
 from .streaming import StreamingSession, VadSegmentedStream, WholeUtteranceStream
 from .tasks import AsrTaskEngine, EmotionTaskEngine, TsAsrTaskEngine
+from .text_cleanup import clean_asr_text
+from .text_cleanup.client import TextCleanupConfigError
 from .tsasr.client import query_tsasr_model
 from .tsasr.enrollment import EnrollmentError, decode_enrollment
 
@@ -202,6 +205,158 @@ def _wav_to_pcm_capped(raw: bytes, max_seconds: float) -> tuple[bytes, float]:
     return new_bytes, duration
 
 
+def _model_result_payload(result: object | None) -> dict | None:
+    if result is None:
+        return None
+    if isinstance(result, Exception):
+        return {
+            "error": str(result),
+            "error_type": result.__class__.__name__,
+        }
+    if isinstance(result, dict):
+        return dict(result)
+    return {"raw": str(result)}
+
+
+def _emotion_result_payload(
+    result: object,
+    *,
+    mode: str,
+    duration_sec: float,
+    language: str,
+) -> dict:
+    if isinstance(result, Exception):
+        return {
+            "type": "error",
+            "mode": mode,
+            "message": str(result),
+            "error_type": result.__class__.__name__,
+        }
+    payload = {
+        "type": "final_emotion",
+        "mode": mode,
+        "label": result.get("label", ""),
+        "text": result.get("text", ""),
+        "duration_sec": round(duration_sec, 3),
+    }
+    if language:
+        payload["language"] = language
+    return payload
+
+
+def _public_asr_payload(result: dict) -> dict:
+    return {
+        "text": result.get("text", ""),
+        "language": result.get("language", ""),
+    }
+
+
+def _public_cleanup_payload(result: dict) -> dict:
+    return {
+        "text": result.get("text", ""),
+    }
+
+
+async def _run_dual_asr_upload(
+    wav_b64: str,
+    *,
+    cfg,
+    hotwords: list[str],
+    language: str,
+) -> dict:
+    primary_task = None
+    secondary_task = None
+    if cfg.enable_primary_asr:
+        primary_task = asyncio.create_task(
+            asyncio.wait_for(
+                query_audio_model(
+                    wav_b64,
+                    hotwords=hotwords,
+                    src_lang=language or "N/A",
+                    base_url=cfg.vllm_base_url,
+                    model_name=cfg.vllm_model_name,
+                    timeout=cfg.asr_request_timeout,
+                ),
+                timeout=cfg.primary_asr_timeout,
+            )
+        )
+    if cfg.enable_secondary_asr:
+        secondary_task = asyncio.create_task(
+            query_audio_model_secondary(
+                wav_b64,
+                hotwords=hotwords,
+                base_url=cfg.secondary_vllm_base_url,
+                model_name=cfg.secondary_vllm_model_name,
+                timeout=cfg.asr_request_timeout,
+            )
+        )
+
+    primary_res: object | None = None
+    secondary_res: object | None = None
+    if primary_task is not None:
+        try:
+            primary_res = await primary_task
+        except Exception as err:  # noqa: BLE001 - preserve failure details
+            primary_res = err
+            logger.warning("Primary ASR failed: %s", err)
+    if secondary_task is not None:
+        try:
+            secondary_res = await secondary_task
+        except Exception as err:  # noqa: BLE001
+            secondary_res = err
+            logger.warning("Secondary ASR failed: %s", err)
+
+    primary_result = None if isinstance(primary_res, Exception) else primary_res
+    secondary_result = None if isinstance(secondary_res, Exception) else secondary_res
+    if primary_result is None and secondary_result is None:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "all configured ASR models failed",
+                "primary": _model_result_payload(primary_res),
+                "secondary": _model_result_payload(secondary_res),
+            },
+        )
+
+    detected_lang = language or ""
+    fusion_payload: dict | None = None
+    if primary_result and not secondary_result:
+        text = str(primary_result.get("transcription") or "").strip()
+        detected_lang = primary_result.get("detected_language") or detected_lang
+    elif secondary_result and not primary_result:
+        text = str(secondary_result.get("transcription") or "").strip()
+    else:
+        fusion_payload = choose_fused_result(
+            primary_result,
+            secondary_result,
+            hotwords=hotwords,
+            similarity_threshold=cfg.fusion_similarity_threshold,
+            min_primary_score=cfg.fusion_min_primary_score,
+            max_repetition_ratio=cfg.fusion_max_repetition_ratio,
+            disagreement_threshold=cfg.fusion_disagreement_threshold,
+            hotword_boost=cfg.fusion_hotword_boost,
+            primary_score_margin=cfg.fusion_primary_score_margin,
+        )
+        text = str(fusion_payload.get("text") or "").strip()
+        if primary_result and primary_result.get("detected_language"):
+            detected_lang = primary_result["detected_language"]
+
+    raw_text = ""
+    if primary_result:
+        raw_text = str(primary_result.get("raw_text") or "")
+    elif secondary_result:
+        raw_text = str(secondary_result.get("raw_text") or "")
+
+    return {
+        "text": text,
+        "language": detected_lang,
+        "raw_text": raw_text,
+        "primary": _model_result_payload(primary_res),
+        "secondary": _model_result_payload(secondary_res),
+        "fusion": fusion_payload,
+    }
+
+
 @app.post("/api/asr/upload")
 async def asr_upload(
     audio: UploadFile = File(...),
@@ -219,88 +374,17 @@ async def asr_upload(
     wav_b64 = base64.b64encode(wav_bytes).decode("ascii")
     cfg = load_config()
     hw_list = _parse_csv(hotwords)
-
-    primary_task = None
-    secondary_task = None
-    if cfg.enable_primary_asr:
-        primary_task = asyncio.create_task(
-            asyncio.wait_for(
-                query_audio_model(
-                    wav_b64,
-                    hotwords=hw_list,
-                    src_lang=language or "N/A",
-                    base_url=cfg.vllm_base_url,
-                    model_name=cfg.vllm_model_name,
-                    timeout=cfg.asr_request_timeout,
-                ),
-                timeout=cfg.primary_asr_timeout,
-            )
-        )
-    if cfg.enable_secondary_asr:
-        secondary_task = asyncio.create_task(
-            query_audio_model_secondary(
-                wav_b64,
-                hotwords=hw_list,
-                base_url=cfg.secondary_vllm_base_url,
-                model_name=cfg.secondary_vllm_model_name,
-                timeout=cfg.asr_request_timeout,
-            )
-        )
-
-    primary_res: object | None = None
-    secondary_res: object | None = None
-    if primary_task is not None:
-        try:
-            primary_res = await primary_task
-        except Exception as err:  # noqa: BLE001 - mirror streaming engine
-            primary_res = err
-            logger.warning("Primary ASR failed: %s", err)
-    if secondary_task is not None:
-        try:
-            secondary_res = await secondary_task
-        except Exception as err:  # noqa: BLE001
-            secondary_res = err
-            logger.warning("Secondary ASR failed: %s", err)
-
-    primary_result = (
-        None if isinstance(primary_res, Exception) else primary_res
+    asr_result = await _run_dual_asr_upload(
+        wav_b64,
+        cfg=cfg,
+        hotwords=hw_list,
+        language=language,
     )
-    secondary_result = (
-        None if isinstance(secondary_res, Exception) else secondary_res
-    )
-    if primary_result is None and secondary_result is None:
-        raise HTTPException(
-            status_code=502, detail="all configured ASR models failed"
-        )
-
-    detected_lang = language or ""
-    if primary_result and not secondary_result:
-        text = str(primary_result.get("transcription") or "").strip()
-        detected_lang = (
-            primary_result.get("detected_language") or detected_lang
-        )
-    elif secondary_result and not primary_result:
-        text = str(secondary_result.get("transcription") or "").strip()
-    else:
-        fused = choose_fused_result(
-            primary_result,
-            secondary_result,
-            hotwords=hw_list,
-            similarity_threshold=cfg.fusion_similarity_threshold,
-            min_primary_score=cfg.fusion_min_primary_score,
-            max_repetition_ratio=cfg.fusion_max_repetition_ratio,
-            disagreement_threshold=cfg.fusion_disagreement_threshold,
-            hotword_boost=cfg.fusion_hotword_boost,
-            primary_score_margin=cfg.fusion_primary_score_margin,
-        )
-        text = str(fused.get("text") or "").strip()
-        if primary_result and primary_result.get("detected_language"):
-            detected_lang = primary_result["detected_language"]
 
     return {
         "type": "final",
-        "text": text,
-        "language": detected_lang,
+        "text": asr_result["text"],
+        "language": asr_result["language"],
         "duration_sec": round(duration_sec, 3),
     }
 
@@ -344,6 +428,117 @@ async def emotion_upload(
     if language:
         payload["language"] = language
     return payload
+
+
+@app.post("/api/audio/analyze")
+async def audio_analyze(
+    audio: UploadFile = File(...),
+    language: str = Form(""),
+    hotwords: str = Form(""),
+    emotion_mode: str = Form("both"),
+):
+    """One-shot audio analysis: ASR raw output + cleaned text + emotion."""
+    raw = await _read_audio_bytes(audio)
+    cfg = load_config()
+    hw_list = _parse_csv(hotwords)
+
+    asr_wav_bytes, duration_sec = _wav_to_pcm_capped(raw, _ASR_MAX_SECONDS)
+    asr_wav_b64 = base64.b64encode(asr_wav_bytes).decode("ascii")
+
+    emotion_cap = float(getattr(cfg, "emotion_max_audio_seconds", 0.0))
+    emotion_wav_bytes, emotion_duration_sec = _wav_to_pcm_capped(raw, emotion_cap)
+    emotion_wav_b64 = base64.b64encode(emotion_wav_bytes).decode("ascii")
+
+    asr_task = asyncio.create_task(
+        _run_dual_asr_upload(
+            asr_wav_b64,
+            cfg=cfg,
+            hotwords=hw_list,
+            language=language,
+        )
+    )
+    emotion_ser_task = asyncio.create_task(
+        query_emotion_model(
+            emotion_wav_b64,
+            mode="ser",
+            base_url=cfg.emotion_vllm_base_url,
+            model_name=cfg.emotion_vllm_model_name,
+            timeout=cfg.emotion_request_timeout,
+        )
+    )
+    emotion_sec_task = asyncio.create_task(
+        query_emotion_model(
+            emotion_wav_b64,
+            mode="sec",
+            base_url=cfg.emotion_vllm_base_url,
+            model_name=cfg.emotion_vllm_model_name,
+            timeout=cfg.emotion_request_timeout,
+            max_tokens=256,
+        )
+    )
+
+    asr_out, emotion_ser_out, emotion_sec_out = await asyncio.gather(
+        asr_task,
+        emotion_ser_task,
+        emotion_sec_task,
+        return_exceptions=True,
+    )
+    if isinstance(asr_out, HTTPException):
+        raise asr_out
+    if isinstance(asr_out, Exception):
+        logger.error("Audio analyze ASR failed: %s", asr_out)
+        raise HTTPException(status_code=502, detail=str(asr_out)) from asr_out
+    asr_result = asr_out
+
+    if isinstance(emotion_ser_out, Exception):
+        logger.error("Audio analyze SER inference failed: %s", emotion_ser_out)
+    if isinstance(emotion_sec_out, Exception):
+        logger.error("Audio analyze SEC inference failed: %s", emotion_sec_out)
+    emotion_ser = _emotion_result_payload(
+        emotion_ser_out,
+        mode="ser",
+        duration_sec=emotion_duration_sec,
+        language=language,
+    )
+    emotion_sec = _emotion_result_payload(
+        emotion_sec_out,
+        mode="sec",
+        duration_sec=emotion_duration_sec,
+        language=language,
+    )
+    emotion_payload = {
+        "type": "final_emotion_pair",
+        "mode": "both",
+        "ser": emotion_ser,
+        "sec": emotion_sec,
+    }
+
+    try:
+        cleaned = await clean_asr_text(
+            str(asr_result.get("text") or ""),
+            hotwords=[],
+            language=str(asr_result.get("language") or language or ""),
+            emotion=emotion_payload,
+            cfg=cfg,
+        )
+    except TextCleanupConfigError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Audio analyze text cleanup failed")
+        raise HTTPException(
+            status_code=502,
+            detail=f"text cleanup model failed: {exc}",
+        ) from exc
+
+    return {
+        "type": "audio_analysis",
+        "duration_sec": round(duration_sec, 3),
+        "language": asr_result.get("language") or language or "",
+        "hotwords": hw_list,
+        "asr": _public_asr_payload(asr_result),
+        "cleaned_asr": _public_cleanup_payload(cleaned),
+        "emotion": emotion_payload,
+    }
 
 
 @app.post("/api/tsasr/upload")
@@ -397,8 +592,22 @@ async def tsasr_upload(
     )
     traits = voice_traits.strip() or None
 
-    try:
-        result = await query_tsasr_model(
+    # Run AmphionTSASR + Qwen3-ASR in parallel so we can surface BOTH
+    # transcripts to the client (rendered as two labeled rows). The two
+    # behavioral flags mirror the streaming engine in ``backend/tasks/ts_asr.py``:
+    #
+    # * ``tsasr_show_secondary_text`` (default True) — forwards the Qwen3
+    #   text to the response payload alongside the TS-ASR text.
+    # * ``tsasr_enable_secondary_gate`` (default False) — uses Qwen3 as a
+    #   silence/presence gate; when on, both texts are zeroed if either
+    #   path is empty (cheap protection against TS-ASR hallucinations on
+    #   pure noise).
+    show_secondary = bool(getattr(cfg, "tsasr_show_secondary_text", True))
+    use_gate = bool(getattr(cfg, "tsasr_enable_secondary_gate", False))
+    run_secondary = show_secondary or use_gate
+
+    ts_task = asyncio.create_task(
+        query_tsasr_model(
             mixed_b64,
             enrollment.wav_base64,
             hotwords=hw_list,
@@ -408,16 +617,50 @@ async def tsasr_upload(
             timeout=timeout,
             enrollment_duration_sec=enrollment.duration_sec,
         )
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("TS-ASR upload inference failed")
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    )
+    if run_secondary:
+        sec_task = asyncio.create_task(
+            query_audio_model_secondary(
+                mixed_b64,
+                hotwords=hw_list,
+                base_url=cfg.secondary_vllm_base_url,
+                model_name=cfg.secondary_vllm_model_name,
+                timeout=cfg.asr_request_timeout,
+            )
+        )
+        ts_res, sec_res = await asyncio.gather(
+            ts_task, sec_task, return_exceptions=True
+        )
+    else:
+        ts_res = await asyncio.gather(ts_task, return_exceptions=True)
+        ts_res = ts_res[0]
+        sec_res = None
 
-    text = str(result.get("transcription") or "").strip()
-    detected_lang = result.get("detected_language") or language or ""
+    if isinstance(ts_res, Exception):
+        logger.exception("TS-ASR upload inference failed: %s", ts_res)
+        raise HTTPException(status_code=502, detail=str(ts_res)) from ts_res
+    if isinstance(sec_res, Exception):
+        # Secondary failure degrades to "empty channel" rather than
+        # failing the whole request: when the silence gate is on we
+        # still suppress (consistent with the streaming engine), but
+        # in the default show-only mode the TS-ASR text is preserved
+        # and the Qwen3 row simply renders empty.
+        logger.warning("TS-ASR upload: secondary ASR failed: %s", sec_res)
+        sec_res = None
+
+    sec_text = str((sec_res or {}).get("transcription") or "").strip()
+    ts_text = str((ts_res or {}).get("transcription") or "").strip()
+
+    if use_gate and (not sec_text or not ts_text):
+        ts_text = ""
+        sec_text = ""
+
+    detected_lang = ts_res.get("detected_language") or language or ""
     return {
         "type": "final",
         "task": "tsasr",
-        "text": text,
+        "text": ts_text,
+        "text_secondary": sec_text,
         "language": detected_lang,
         "duration_sec": round(duration_sec, 3),
         # Echo the (possibly trimmed) mixed audio back so the client can wire
@@ -426,5 +669,56 @@ async def tsasr_upload(
     }
 
 
+class _RevalidateStaticFiles(StaticFiles):
+    """Static files with tiered caching.
+
+    Browsers were aggressively caching ``app.js`` / ``style.css`` because
+    starlette's default ``StaticFiles`` ships no explicit ``Cache-Control``
+    header, leaving the heuristic up to the client. That made shipping
+    frontend fixes during a session unreliable — users had to hard-reload
+    to pick up changes. We inject ``no-cache`` so the browser still uses
+    its disk copy, but always revalidates with the server's ``ETag`` (set
+    by starlette from mtime+size); unchanged files come back as 304 so
+    bandwidth stays cheap. Cache-Control is omitted on non-200 responses
+    to avoid pinning errors.
+
+    For the assets the demo loads on every page (CSS, JS) we additionally
+    grant a short ``max-age`` so the browser can serve repeat requests
+    from disk cache without a conditional round-trip. Ten seconds is long
+    enough to cover all the navigations of a single user session yet
+    short enough that any real frontend change still appears within a
+    blink — and the ``ETag`` revalidation kicks back in once the window
+    expires. HTML is intentionally left at plain ``no-cache`` so users
+    always see the latest markup.
+    """
+
+    _CACHEABLE_EXTS = (".css", ".js")
+
+    @staticmethod
+    def _cache_header_for(path: str) -> bytes:
+        if path.endswith(_RevalidateStaticFiles._CACHEABLE_EXTS):
+            return b"no-cache, max-age=10"
+        return b"no-cache"
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        cache_header = self._cache_header_for((scope.get("path") or "").lower())
+
+        async def send_with_cache(message: dict) -> None:
+            if message["type"] == "http.response.start":
+                status = message.get("status", 0)
+                if 200 <= status < 300:
+                    headers = list(message.get("headers", []))
+                    headers = [
+                        (k, v) for (k, v) in headers if k.lower() != b"cache-control"
+                    ]
+                    headers.append((b"cache-control", cache_header))
+                    message["headers"] = headers
+            await send(message)
+
+        await super().__call__(scope, receive, send_with_cache)
+
+
 # Static mount comes last so it doesn't shadow the /api routes above.
-app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
+app.mount(
+    "/", _RevalidateStaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend"
+)

@@ -22,9 +22,11 @@ import numpy as np
 
 from ..audio.vad import VADProcessor
 from ..config import SAMPLE_RATE, Config
-from .events import PartialSnapshot, SegmentReady
+from .events import PartialSnapshot, SegmentReady, SpeechDropped, SpeechStarted
 
 logger = logging.getLogger(__name__)
+
+StreamEvent = SegmentReady | PartialSnapshot | SpeechStarted | SpeechDropped
 
 
 @runtime_checkable
@@ -34,15 +36,18 @@ class AudioStream(Protocol):
     def configure(self, cfg: Config) -> None:
         """Apply (possibly per-session-overridden) Config knobs."""
 
-    def feed(self, pcm_bytes: bytes) -> Iterable[SegmentReady | PartialSnapshot]:
+    def feed(self, pcm_bytes: bytes) -> Iterable[StreamEvent]:
         """Push raw int16 little-endian PCM bytes; return zero or more events."""
 
-    def flush(self, *, force: bool) -> Iterable[SegmentReady]:
+    def flush(self, *, force: bool) -> Iterable[StreamEvent]:
         """Drain any remaining buffered audio (called on stop / disconnect).
 
         When ``force`` is True the implementation should always emit the
         residual audio (subject to non-empty); when False it may discard
-        sub-threshold leftovers.
+        sub-threshold leftovers. Streams that announce ``SpeechStarted``
+        must also emit ``SpeechDropped`` here whenever the in-flight
+        utterance can't be recovered, so engines can retract any
+        placeholder UI they painted on speech-start.
         """
 
 
@@ -72,6 +77,11 @@ class VadSegmentedStream:
         # of how the deployment toggles pseudo-stream globally.
         self._partial_override: bool | None = enable_partial
         self._enable_partial: bool = True
+        # Tracks whether we've already emitted ``SpeechStarted`` for the
+        # current in-flight utterance. Reset every time speech ends
+        # (whether the resulting segment was usable or got dropped) so
+        # the next silent->speaking transition fires exactly one event.
+        self._announced_speech: bool = False
 
     def configure(self, cfg: Config) -> None:
         self._cfg = cfg
@@ -91,8 +101,8 @@ class VadSegmentedStream:
             raise RuntimeError("VadSegmentedStream.configure() not called")
         return self._cfg
 
-    def feed(self, pcm_bytes: bytes) -> list[SegmentReady | PartialSnapshot]:
-        events: list[SegmentReady | PartialSnapshot] = []
+    def feed(self, pcm_bytes: bytes) -> list[StreamEvent]:
+        events: list[StreamEvent] = []
         pcm = _pcm_bytes_to_float32(pcm_bytes)
 
         if self._pcm_carry.size > 0:
@@ -108,13 +118,35 @@ class VadSegmentedStream:
         min_samples = int(SAMPLE_RATE * cfg.min_segment_duration_ms / 1000)
 
         for i in range(0, used, hop):
+            was_speaking = self.vad.is_speaking
             segment = self.vad.process(pcm[i : i + hop])
+            now_speaking = self.vad.is_speaking
+
+            # Silent -> speaking transition: announce immediately so any
+            # downstream engine that wants to paint a placeholder ("识别
+            # 中…") can do so before the user has even finished the
+            # utterance.
+            if not was_speaking and now_speaking and not self._announced_speech:
+                self._announced_speech = True
+                self._last_partial_time = 0.0
+                events.append(SpeechStarted())
+
             if segment is None:
                 continue
+
+            # ``segment`` is the finalized speech buffer. Whether we
+            # forward it as a usable ``SegmentReady`` or retract the
+            # announcement via ``SpeechDropped``, the in-flight
+            # announcement window has ended.
+            announced = self._announced_speech
+            self._announced_speech = False
+
             if len(segment) < min_samples:
                 logger.info(
                     "Drop short segment (%.1fs)", len(segment) / SAMPLE_RATE
                 )
+                if announced:
+                    events.append(SpeechDropped())
                 continue
             events.append(SegmentReady(pcm=segment))
 
@@ -128,15 +160,30 @@ class VadSegmentedStream:
 
         return events
 
-    def flush(self, *, force: bool) -> list[SegmentReady]:
+    def flush(self, *, force: bool) -> list[StreamEvent]:
+        events: list[StreamEvent] = []
         remaining = self.vad.flush()
+        announced = self._announced_speech
+        self._announced_speech = False
         if remaining is None or len(remaining) == 0:
-            return []
+            # No usable tail. If we'd announced speech-start the engine
+            # is still showing a placeholder for it; let it retract.
+            if announced:
+                events.append(SpeechDropped())
+            return events
         cfg = self.cfg
         min_samples = int(SAMPLE_RATE * cfg.min_segment_duration_ms / 1000)
         if not force and len(remaining) < min_samples:
-            return []
-        return [SegmentReady(pcm=remaining, is_stop_flush=force)]
+            if announced:
+                events.append(SpeechDropped())
+            return events
+        if force and len(remaining) < min_samples:
+            # Force-flush still emits the residual but we drop the
+            # placeholder announcement marker since this segment will
+            # generate its own final.
+            pass
+        events.append(SegmentReady(pcm=remaining, is_stop_flush=force))
+        return events
 
 
 class WholeUtteranceStream:
@@ -153,13 +200,13 @@ class WholeUtteranceStream:
     def configure(self, cfg: Config) -> None:
         self._cfg = cfg
 
-    def feed(self, pcm_bytes: bytes) -> list[SegmentReady | PartialSnapshot]:
+    def feed(self, pcm_bytes: bytes) -> list[StreamEvent]:
         pcm = _pcm_bytes_to_float32(pcm_bytes)
         if pcm.size > 0:
             self._buffers.append(pcm)
         return []
 
-    def flush(self, *, force: bool) -> list[SegmentReady]:
+    def flush(self, *, force: bool) -> list[StreamEvent]:
         if not self._buffers:
             return []
         merged = np.concatenate(self._buffers)

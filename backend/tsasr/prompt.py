@@ -1,15 +1,27 @@
 """Prompt builder for Target-Speaker ASR (TS-ASR).
 
-The prompt format mirrors AmphionASR's ms-swift SFT recipe (see
-``AmphionASR/src/integrations/vllm/test_vllm_inference.py``)::
+The prompt format mirrors the v3 SFT recipe used to fine-tune the
+in-house Amphion-3B TS-ASR checkpoint (see
+``AmphionASR/src/integrations/ms_swift/data/convert.py``'s
+``build_unified_instruction``). v3 only ever saw two prompt shapes,
+both with enrollment and with the sentence-final period::
 
-    Given the speaker's voice:<audio_enroll>
-    Transcribe what this speaker says in the following audio:<audio_mixed>
+    # Template A -- no hotwords
+    Given the speaker's voice:<audio>
+    Transcribe what this speaker says in the following audio.<audio>
 
-This module intentionally exposes a *builder function* rather than a static
-string template: TS-ASR is still evolving (optional hotwords, speaker voice
-traits, styling instructions, ...), and future variants should be added here
-without touching the task engine or the client.
+    # Template B -- with hotwords
+    Given the speaker's voice:<audio>
+    Transcribe what this speaker says in the following audio.
+    Hotwords: word1,word2,...<audio>
+
+Crucially, the ``Hotwords:`` line goes *after* the transcribe
+instruction (not between enrollment and instruction) and the hotword
+list is comma-joined with no spaces and no trailing period.
+
+Optional fields not covered by v3 training (``Language:`` line,
+``Speaker traits:`` segment, the no-enrollment branch) are deliberately
+excluded so we never feed the checkpoint an OOD prompt shape.
 """
 
 from __future__ import annotations
@@ -17,7 +29,7 @@ from __future__ import annotations
 from typing import Any
 
 ENROLL_PREFIX = "Given the speaker's voice:"
-TRANSCRIBE_PREFIX = "Transcribe what this speaker says in the following audio:"
+TRANSCRIBE_PREFIX = "Transcribe what this speaker says in the following audio."
 
 
 def _audio_chunk(wav_base64: str) -> dict[str, Any]:
@@ -27,32 +39,22 @@ def _audio_chunk(wav_base64: str) -> dict[str, Any]:
     }
 
 
-def format_hotwords_segment(hotwords: list[str] | None) -> str:
-    """Format a hotwords sidecar text segment.
+def format_hotwords_line(hotwords: list[str] | None) -> str:
+    """Format the ``Hotwords:`` line for the v3 TS-ASR prompt.
 
-    Returns an empty string when the list is empty / None so callers can
-    unconditionally concatenate the result. The segment is meant to be
-    inserted between the enrollment audio and the transcribe instruction.
+    Returns ``""`` when the list is empty / None so callers can
+    unconditionally concatenate the result. The resulting line is
+    prefixed with a single ``"\\n"`` so it can be appended directly
+    to the transcribe instruction line; the hotword list is joined
+    with ``","`` (no spaces, no trailing period) to match the
+    training-time format produced by ``build_hotwords_for_sample``.
     """
     if not hotwords:
         return ""
     cleaned = [str(h).strip() for h in hotwords if str(h or "").strip()]
     if not cleaned:
         return ""
-    return "\nHotwords: " + ",".join(cleaned) + "."
-
-
-def format_voice_traits_segment(voice_traits: str | None) -> str:
-    """Format an optional speaker-trait description segment."""
-    if not voice_traits:
-        return ""
-    trimmed = str(voice_traits).strip()
-    if not trimmed:
-        return ""
-    # Normalize trailing punctuation to keep the prompt stable.
-    if trimmed.endswith(("." , "!", "?")):
-        return "\nSpeaker traits: " + trimmed
-    return "\nSpeaker traits: " + trimmed + "."
+    return "\nHotwords: " + ",".join(cleaned)
 
 
 def build_tsasr_content(
@@ -66,29 +68,31 @@ def build_tsasr_content(
 
     Output layout (positions in ``content``)::
 
-        [0]    text:  ENROLL_PREFIX
-        [1]    audio: enrollment
-        [...]  optional text sidecars (voice traits, hotwords)
-        [-2]   text:  "\\n" + TRANSCRIBE_PREFIX
-        [-1]   audio: mixed
+        [0]  text:  ENROLL_PREFIX                          # "Given the speaker's voice:"
+        [1]  audio: enrollment
+        [2]  text:  "\\n" + TRANSCRIBE_PREFIX + (optional "\\nHotwords: a,b,c")
+        [3]  audio: mixed
 
-    The enrollment + instruction ordering is fixed (aligned with the
-    training-time template). Optional sidecars are appended after the
-    enrollment audio so that they apply to the following transcribe step.
+    Joining the transcribe instruction and the optional hotword line
+    into a single ``text`` block mirrors the ``"\\n".join(lines) +
+    _AUDIO_PLACEHOLDER`` pattern used at training time -- the mixed
+    ``<audio>`` token must follow the last text line with no extra
+    newline, otherwise the model sees an OOD prompt shape and quietly
+    degrades.
+
+    ``voice_traits`` is accepted for backward compatibility with older
+    callers (the streaming engine still caches it for logging) but is
+    intentionally NOT injected into the prompt: v3 SFT data has no
+    ``Speaker traits:`` segment, so adding one would push the prompt
+    off the training distribution.
     """
-    content: list[dict[str, Any]] = [
+    del voice_traits
+
+    transcribe_text = "\n" + TRANSCRIBE_PREFIX + format_hotwords_line(hotwords)
+
+    return [
         {"type": "text", "text": ENROLL_PREFIX},
         _audio_chunk(enrollment_wav_b64),
+        {"type": "text", "text": transcribe_text},
+        _audio_chunk(mixed_wav_b64),
     ]
-
-    traits_segment = format_voice_traits_segment(voice_traits)
-    if traits_segment:
-        content.append({"type": "text", "text": traits_segment})
-
-    hotwords_segment = format_hotwords_segment(hotwords)
-    if hotwords_segment:
-        content.append({"type": "text", "text": hotwords_segment})
-
-    content.append({"type": "text", "text": "\n" + TRANSCRIBE_PREFIX})
-    content.append(_audio_chunk(mixed_wav_b64))
-    return content

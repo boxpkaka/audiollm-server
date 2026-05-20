@@ -59,6 +59,10 @@ async def query_tsasr_model(
     handles the ``tsasr_* -> vllm_*`` fallback). An explicit ``None`` here
     falls back to the module-level primary ASR endpoint so that this client
     remains usable for ad-hoc scripts.
+
+    ``voice_traits`` is accepted for backward compatibility but is dropped
+    inside :func:`build_tsasr_content` (v3 training data has no ``Speaker
+    traits:`` segment, so injecting one would feed the model an OOD prompt).
     """
     client = get_client()
     content = build_tsasr_content(

@@ -1,0 +1,15 @@
+/*
+ * Tailwind input source for the Amphion demo frontend.
+ *
+ * This file is consumed by ``scripts/build_tailwind.sh`` (which calls
+ * ``npx tailwindcss@3``) and produces ``frontend/tailwind.css``. Both
+ * files are checked into the repo so the runtime serves a static,
+ * pre-compiled stylesheet instead of the multi-hundred-millisecond JIT
+ * pass that ``cdn.tailwindcss.com`` performs on every page load.
+ *
+ * Re-run the build script whenever Tailwind classes used in
+ * ``frontend/*.html`` or ``frontend/*.js`` change.
+ */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
