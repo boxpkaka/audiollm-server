@@ -10,6 +10,11 @@ from fastapi.staticfiles import StaticFiles
 from starlette.types import Receive, Scope, Send
 
 from .asr.client import query_audio_model, query_audio_model_secondary
+from .asr.enrollment import (
+    EnrollmentError,
+    decode_and_validate,
+    get_enrollment_store,
+)
 from .asr.fusion import choose_fused_result
 from .audio.utils import wav_base64_to_pcm_16k_mono
 from .config import SAMPLE_RATE, load_config
@@ -20,11 +25,9 @@ from .emotion_spec.jobs import get_emotion_spec_job_store
 from .http_client import close_client
 from .session import AudioSession
 from .streaming import StreamingSession, VadSegmentedStream
-from .tasks import AsrTaskEngine, EmotionTaskEngine, TsAsrTaskEngine
+from .tasks import AsrTaskEngine, EmotionTaskEngine
 from .text_cleanup import clean_asr_text
 from .text_cleanup.client import TextCleanupConfigError
-from .tsasr.client import query_tsasr_model
-from .tsasr.enrollment import EnrollmentError, decode_enrollment
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -68,22 +71,6 @@ async def transcribe_streaming_ws(websocket: WebSocket, language: str = ""):
         await session.cleanup()
 
 
-@app.websocket("/transcribe-target-streaming")
-async def tsasr_streaming_ws(websocket: WebSocket, language: str = ""):
-    await websocket.accept()
-    logger.info("TS-ASR streaming connected (language=%s)", language)
-    session = StreamingSession(
-        websocket,
-        stream=VadSegmentedStream(),
-        engine=TsAsrTaskEngine(),
-        language=language,
-    )
-    try:
-        await session.run()
-    finally:
-        await session.cleanup()
-
-
 @app.websocket("/emotion-segmented-streaming")
 async def emotion_segmented_streaming_ws(websocket: WebSocket, language: str = ""):
     await websocket.accept()
@@ -115,9 +102,8 @@ async def emotion_segmented_streaming_ws(websocket: WebSocket, language: str = "
 # result" — no chunking, no VAD segmentation, no partials.
 #
 # All caps that the streaming pipeline normally enforces server-side
-# (emotion 20s tail, tsasr 30s tail, enrollment 1-5s VAD trim) are still
-# applied here so a malicious or buggy client can't bypass them by switching
-# from WS to REST.
+# (emotion 20s tail, ASR 60s tail) are still applied here so a malicious or
+# buggy client can't bypass them by switching from WS to REST.
 
 # Hard cap on multipart upload bytes. ~16-bit / 16 kHz mono WAV at 60 s is
 # ~1.9 MB; this 25 MB ceiling is generous for any clip the model would
@@ -180,7 +166,7 @@ def _wav_to_pcm_capped(raw: bytes, max_seconds: float) -> tuple[bytes, float]:
     if max_seconds > 0 and duration > max_seconds:
         # Match streaming engines: keep the trailing window. Emotion picks
         # the tail because the most recent emotion is what users care about;
-        # we use the same convention for ASR/TS-ASR for consistency.
+        # we use the same convention for ASR for consistency.
         keep = int(SAMPLE_RATE * max_seconds)
         pcm = pcm[-keep:]
         duration = pcm.size / SAMPLE_RATE
@@ -244,12 +230,22 @@ def _public_cleanup_payload(result: dict) -> dict:
     }
 
 
+def _resolve_enrollment_b64(enrollment_id: str | None) -> str | None:
+    """Look up an enrollment id, refreshing its TTL. Missing/expired ids
+    return ``None`` (caller decides to error or silently fall back)."""
+    if not enrollment_id:
+        return None
+    entry = get_enrollment_store().get(enrollment_id)
+    return entry.wav_base64 if entry is not None else None
+
+
 async def _run_dual_asr_upload(
     wav_b64: str,
     *,
     cfg,
     hotwords: list[str],
     language: str,
+    enrollment_b64: str | None = None,
 ) -> dict:
     primary_task = None
     secondary_task = None
@@ -260,6 +256,7 @@ async def _run_dual_asr_upload(
                     wav_b64,
                     hotwords=hotwords,
                     src_lang=language or "N/A",
+                    enrollment_wav_base64=enrollment_b64,
                     base_url=cfg.vllm_base_url,
                     model_name=cfg.vllm_model_name,
                     timeout=cfg.asr_request_timeout,
@@ -267,7 +264,17 @@ async def _run_dual_asr_upload(
                 timeout=cfg.primary_asr_timeout,
             )
         )
-    if cfg.enable_secondary_asr:
+    # Secondary (Qwen3) keeps single-audio prompting regardless of enrollment;
+    # it is trained as a plain ASR model with no target-speaker channel, so
+    # forcing enrollment audio in front of the mixed clip would push the model
+    # out of distribution. The fusion stage still benefits from Qwen's
+    # parallel transcription as a sanity check on the primary's output.
+    #
+    # REST uploads have no partial channel, so the secondary only earns its
+    # keep when fusion is on. Gating on `enable_dual_asr_fusion` here (rather
+    # than `enable_secondary_asr`) lets operators keep the secondary online
+    # for streaming partials while skipping it on one-shot uploads.
+    if cfg.enable_dual_asr_fusion:
         secondary_task = asyncio.create_task(
             query_audio_model_secondary(
                 wav_b64,
@@ -344,28 +351,85 @@ async def _run_dual_asr_upload(
     }
 
 
+@app.post("/api/asr/enrollment")
+async def asr_enrollment_create(audio: UploadFile = File(...)):
+    """Cache a target-speaker enrollment clip and return its opaque id.
+
+    The frontend uploads a 1–8 s clip once (file or mic recording) and
+    then passes the returned ``enrollment_id`` on every ``/api/asr/upload``
+    call and the WS ``start`` payload. The server validates duration,
+    canonicalises to 16 kHz mono WAV, and stores the base64 result so
+    primary inference can splice it into the dual-audio prompt without
+    re-decoding on every segment.
+    """
+    raw = await _read_audio_bytes(audio)
+    wav_b64 = base64.b64encode(raw).decode("ascii")
+    cfg = load_config()
+    try:
+        canonical_b64, duration_sec = decode_and_validate(
+            wav_b64,
+            min_sec=cfg.asr_enrollment_min_sec,
+            max_sec=cfg.asr_enrollment_max_sec,
+        )
+    except EnrollmentError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+
+    store = get_enrollment_store()
+    store.configure(
+        ttl_sec=cfg.asr_enrollment_ttl_sec,
+        max_entries=cfg.asr_enrollment_max_entries,
+    )
+    entry = store.put(canonical_b64, duration_sec)
+    return {
+        "enrollment_id": entry.enrollment_id,
+        "duration_sec": round(duration_sec, 3),
+    }
+
+
+@app.delete("/api/asr/enrollment/{enrollment_id}")
+async def asr_enrollment_delete(enrollment_id: str):
+    """Drop a previously uploaded enrollment clip.
+
+    Returning 204 on missing ids keeps the frontend's "clear" button
+    idempotent — repeated clears never error out.
+    """
+    get_enrollment_store().delete(enrollment_id)
+    return JSONResponse(status_code=204, content=None)
+
+
 @app.post("/api/asr/upload")
 async def asr_upload(
     audio: UploadFile = File(...),
     language: str = Form(""),
     hotwords: str = Form(""),
+    enrollment_id: str = Form(""),
 ):
     """One-shot ASR over an uploaded clip.
 
     Mirrors :class:`AsrTaskEngine.handle_segment` but operates on the entire
     clip in a single dual-model call (no VAD segmentation, no partials).
     Returns the same fields the streaming ``final`` event carries.
+
+    When ``enrollment_id`` resolves to a cached enrollment clip the primary
+    model is prompted with the dual-audio TS-ASR template (task 5/6 of the
+    v4 prompt spec). Unknown / expired ids fall back to plain ASR so a
+    stale id from a long-running tab does not break uploads.
     """
     raw = await _read_audio_bytes(audio)
     wav_bytes, duration_sec = _wav_to_pcm_capped(raw, _ASR_MAX_SECONDS)
     wav_b64 = base64.b64encode(wav_bytes).decode("ascii")
     cfg = load_config()
     hw_list = _parse_csv(hotwords)
+    enrollment_b64 = _resolve_enrollment_b64(enrollment_id)
     asr_result = await _run_dual_asr_upload(
         wav_b64,
         cfg=cfg,
         hotwords=hw_list,
         language=language,
+        enrollment_b64=enrollment_b64,
     )
 
     return {
@@ -373,6 +437,7 @@ async def asr_upload(
         "text": asr_result["text"],
         "language": asr_result["language"],
         "duration_sec": round(duration_sec, 3),
+        "enrollment_used": enrollment_b64 is not None,
     }
 
 
@@ -492,11 +557,13 @@ async def audio_analyze(
     language: str = Form(""),
     hotwords: str = Form(""),
     emotion_mode: str = Form("both"),
+    enrollment_id: str = Form(""),
 ):
     """One-shot audio analysis: ASR raw output + cleaned text + emotion."""
     raw = await _read_audio_bytes(audio)
     cfg = load_config()
     hw_list = _parse_csv(hotwords)
+    enrollment_b64 = _resolve_enrollment_b64(enrollment_id)
 
     asr_wav_bytes, duration_sec = _wav_to_pcm_capped(raw, _ASR_MAX_SECONDS)
     asr_wav_b64 = base64.b64encode(asr_wav_bytes).decode("ascii")
@@ -511,6 +578,7 @@ async def audio_analyze(
             cfg=cfg,
             hotwords=hw_list,
             language=language,
+            enrollment_b64=enrollment_b64,
         )
     )
     emotion_ser_task = asyncio.create_task(
@@ -594,134 +662,6 @@ async def audio_analyze(
         "asr": _public_asr_payload(asr_result),
         "cleaned_asr": _public_cleanup_payload(cleaned),
         "emotion": emotion_payload,
-    }
-
-
-@app.post("/api/tsasr/upload")
-async def tsasr_upload(
-    audio: UploadFile = File(...),
-    enrollment_wav_base64: str = Form(...),
-    language: str = Form(""),
-    hotwords: str = Form(""),
-    voice_traits: str = Form(""),
-):
-    """One-shot TS-ASR over an uploaded mixed clip + enrollment WAV.
-
-    Enrollment is delivered as a base64-encoded WAV form field instead of a
-    second multipart file because the frontend already keeps it in that
-    shape (``enrollWavB64``) for the live-mic flow; reusing the same field
-    avoids redundant decode/encode work in the browser.
-    """
-    raw = await _read_audio_bytes(audio)
-    cfg = load_config()
-    cap = float(getattr(cfg, "tsasr_max_audio_seconds", 0.0))
-    wav_bytes, duration_sec = _wav_to_pcm_capped(raw, cap)
-    mixed_b64 = base64.b64encode(wav_bytes).decode("ascii")
-
-    try:
-        enrollment = decode_enrollment(
-            enrollment_wav_base64,
-            min_sec=float(getattr(cfg, "tsasr_enrollment_min_sec", 1.0)),
-            max_sec=float(getattr(cfg, "tsasr_enrollment_max_sec", 5.0)),
-            audio_format="wav",
-        )
-    except EnrollmentError as err:
-        raise HTTPException(
-            status_code=400,
-            detail={"code": f"enrollment_{err.code}", "message": str(err)},
-        ) from err
-
-    base_url = (
-        getattr(cfg, "tsasr_base_url", "") or cfg.vllm_base_url
-    )
-    model_name = (
-        getattr(cfg, "tsasr_model_name", "") or cfg.vllm_model_name
-    )
-    timeout = float(
-        getattr(cfg, "tsasr_request_timeout", 0)
-        or cfg.asr_request_timeout
-    )
-    hw_list = (
-        _parse_csv(hotwords)
-        if bool(getattr(cfg, "tsasr_enable_hotwords", False))
-        else None
-    )
-    traits = voice_traits.strip() or None
-
-    # Run AmphionTSASR + Qwen3-ASR in parallel so we can surface BOTH
-    # transcripts to the client (rendered as two labeled rows). The two
-    # behavioral flags mirror the streaming engine in ``backend/tasks/ts_asr.py``:
-    #
-    # * ``tsasr_show_secondary_text`` (default True) — forwards the Qwen3
-    #   text to the response payload alongside the TS-ASR text.
-    # * ``tsasr_enable_secondary_gate`` (default False) — uses Qwen3 as a
-    #   silence/presence gate; when on, both texts are zeroed if either
-    #   path is empty (cheap protection against TS-ASR hallucinations on
-    #   pure noise).
-    show_secondary = bool(getattr(cfg, "tsasr_show_secondary_text", True))
-    use_gate = bool(getattr(cfg, "tsasr_enable_secondary_gate", False))
-    run_secondary = show_secondary or use_gate
-
-    ts_task = asyncio.create_task(
-        query_tsasr_model(
-            mixed_b64,
-            enrollment.wav_base64,
-            hotwords=hw_list,
-            voice_traits=traits,
-            base_url=base_url,
-            model_name=model_name,
-            timeout=timeout,
-            enrollment_duration_sec=enrollment.duration_sec,
-        )
-    )
-    if run_secondary:
-        sec_task = asyncio.create_task(
-            query_audio_model_secondary(
-                mixed_b64,
-                hotwords=hw_list,
-                base_url=cfg.secondary_vllm_base_url,
-                model_name=cfg.secondary_vllm_model_name,
-                timeout=cfg.asr_request_timeout,
-            )
-        )
-        ts_res, sec_res = await asyncio.gather(
-            ts_task, sec_task, return_exceptions=True
-        )
-    else:
-        ts_res = await asyncio.gather(ts_task, return_exceptions=True)
-        ts_res = ts_res[0]
-        sec_res = None
-
-    if isinstance(ts_res, Exception):
-        logger.exception("TS-ASR upload inference failed: %s", ts_res)
-        raise HTTPException(status_code=502, detail=str(ts_res)) from ts_res
-    if isinstance(sec_res, Exception):
-        # Secondary failure degrades to "empty channel" rather than
-        # failing the whole request: when the silence gate is on we
-        # still suppress (consistent with the streaming engine), but
-        # in the default show-only mode the TS-ASR text is preserved
-        # and the Qwen3 row simply renders empty.
-        logger.warning("TS-ASR upload: secondary ASR failed: %s", sec_res)
-        sec_res = None
-
-    sec_text = str((sec_res or {}).get("transcription") or "").strip()
-    ts_text = str((ts_res or {}).get("transcription") or "").strip()
-
-    if use_gate and (not sec_text or not ts_text):
-        ts_text = ""
-        sec_text = ""
-
-    detected_lang = ts_res.get("detected_language") or language or ""
-    return {
-        "type": "final",
-        "task": "tsasr",
-        "text": ts_text,
-        "text_secondary": sec_text,
-        "language": detected_lang,
-        "duration_sec": round(duration_sec, 3),
-        # Echo the (possibly trimmed) mixed audio back so the client can wire
-        # up a replay button just like the streaming ``final`` payload does.
-        "audio_b64": mixed_b64,
     }
 
 

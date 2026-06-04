@@ -159,4 +159,3 @@ python docs/examples/http_emotion_job.py sample.wav \
 
 - [API 总览](api-reference.md)
 - [分段情感识别 WebSocket](emotion-segmented-streaming-protocol.md)
-- [目标说话人 ASR](tsasr.md)

@@ -39,7 +39,10 @@ class AsrTaskEngine(BaseTaskEngine):
         primary_res: object = None
         secondary_res: object = None
 
-        if cfg.enable_secondary_asr:
+        # Final segments only run the dual pipeline when fusion is on.
+        # With fusion off (but secondary still online for partial gating)
+        # we save one vLLM call per segment by running primary-only.
+        if cfg.enable_dual_asr_fusion:
             secondary_res, primary_res = await self._dual_asr(
                 wav_b64, hw_snapshot, ctx
             )
@@ -51,6 +54,7 @@ class AsrTaskEngine(BaseTaskEngine):
                     wav_b64,
                     hotwords=hw_snapshot,
                     src_lang=ctx.src_lang,
+                    enrollment_wav_base64=ctx.enrollment_b64,
                     base_url=cfg.vllm_base_url,
                     model_name=cfg.vllm_model_name,
                     timeout=cfg.asr_request_timeout,
@@ -128,6 +132,7 @@ class AsrTaskEngine(BaseTaskEngine):
                     wav_b64,
                     hotwords=hw_snapshot,
                     src_lang=ctx.src_lang,
+                    enrollment_wav_base64=ctx.enrollment_b64,
                     base_url=cfg.vllm_base_url,
                     model_name=cfg.vllm_model_name,
                     timeout=cfg.asr_request_timeout,
@@ -234,6 +239,7 @@ class AsrTaskEngine(BaseTaskEngine):
                         wav_b64,
                         hotwords=hw_snapshot,
                         src_lang=ctx.src_lang,
+                        enrollment_wav_base64=ctx.enrollment_b64,
                         base_url=cfg.vllm_base_url,
                         model_name=cfg.vllm_model_name,
                         timeout=cfg.asr_request_timeout,

@@ -48,18 +48,6 @@
         + '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8"'
         + ' d="M9 10h.01M15 10h.01M9 15c.9.8 1.9 1.2 3 1.2s2.1-.4 3-1.2"/>',
     },
-    {
-      key: 'tsasr',
-      href: 'tsasr.html',
-      i18nKey: 'nav.tsasr',
-      icon:
-        '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8"'
-        + ' d="M16 11a4 4 0 10-8 0 4 4 0 008 0z"/>'
-        + '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8"'
-        + ' d="M4 20c1.5-3 4.5-4.5 8-4.5s6.5 1.5 8 4.5"/>'
-        + '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8"'
-        + ' d="M19 4l2 2m0-2l-2 2"/>',
-    },
   ];
 
   const BRAND_ICON_SVG =
@@ -83,7 +71,6 @@
     if (fromBody) return fromBody;
     const path = (location.pathname || '').toLowerCase();
     if (path.endsWith('emotion.html')) return 'emotion';
-    if (path.endsWith('tsasr.html')) return 'tsasr';
     return 'asr';
   }
 

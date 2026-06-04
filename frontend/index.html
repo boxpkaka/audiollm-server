@@ -130,6 +130,47 @@
                 </label>
               </div>
 
+              <!-- Target-speaker enrollment (optional).
+                   The clip is uploaded once via POST /api/asr/enrollment and the
+                   resulting opaque id is then forwarded with each WS ``start`` /
+                   REST upload, so the primary model can prepend it into the
+                   TS-ASR dual-audio prompt. Microphone capture is the typical
+                   path; file upload covers headset-less or pre-recorded usage.
+                   Both paths require the mic to be idle (must_before_start).
+              -->
+              <div id="enrollment-card" class="mb-3 pb-3"
+                   style="border-bottom:1px solid var(--line)">
+                <div class="flex items-start justify-between gap-3 mb-2">
+                  <div class="min-w-0">
+                    <span class="text-[13px] font-semibold" style="letter-spacing:0.02em"
+                          data-i18n="asr.enroll.title">Target speaker (optional)</span>
+                    <p class="text-xs text-muted mt-1"
+                       data-i18n="asr.enroll.tip">Upload or record 1–8 s of clean speech.</p>
+                  </div>
+                  <span id="enroll-status-pill" class="status-pill" data-state="waiting"
+                        data-i18n="asr.enroll.status.idle">No enrollment</span>
+                </div>
+
+                <div class="flex flex-wrap items-center gap-2">
+                  <input id="enroll-file-input" type="file" accept="audio/*" hidden />
+                  <button id="enroll-upload-btn" class="btn-secondary" type="button"
+                          data-i18n="asr.enroll.upload">Upload clip</button>
+                  <button id="enroll-record-btn" class="btn-secondary" type="button"
+                          data-i18n="asr.enroll.record">Record 3 s</button>
+                  <button id="enroll-play-btn" class="btn-secondary" type="button" hidden
+                          data-i18n-attr-aria-label="asr.enroll.play.aria"
+                          aria-label="Play enrollment clip">
+                    <svg class="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 20 20" aria-hidden="true">
+                      <path d="M6.3 2.841A1.5 1.5 0 004 4.11V15.89a1.5 1.5 0 002.3 1.269l9.344-5.89a1.5 1.5 0 000-2.538L6.3 2.84z"/>
+                    </svg>
+                    <span data-i18n="asr.enroll.play">Play</span>
+                  </button>
+                  <button id="enroll-clear-btn" class="btn-ghost" type="button" hidden
+                          data-i18n="asr.enroll.clear">Clear</button>
+                </div>
+                <p id="enroll-hint" class="text-[11px] text-faint mt-2" hidden></p>
+              </div>
+
               <div class="flex gap-2 mb-3">
                 <input id="hotword-input" type="text" class="hotword-input flex-1"
                        data-i18n-attr-placeholder="asr.hotword.placeholder"
@@ -166,9 +207,9 @@
        which one to mount based on body[data-page]. -->
   <script src="audio-upload.js"></script>
   <script src="streaming-text.js"></script>
+  <script src="enrollment.js"></script>
   <script src="app.js"></script>
   <script src="emotion-app.js"></script>
-  <script src="tsasr-app.js"></script>
   <script src="sidebar.js"></script>
   <script src="router.js"></script>
 </body>

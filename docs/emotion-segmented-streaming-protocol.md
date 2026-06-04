@@ -156,4 +156,3 @@ python tests/test_emotion_ws_client.py sample.wav \
 - [API 总览](api-reference.md)
 - [整段情感识别](emotion-streaming-protocol.md)
 - [通用流式 ASR](transcribe-streaming-protocol.md)
-- [目标说话人 ASR](tsasr.md)

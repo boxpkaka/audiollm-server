@@ -1,7 +1,7 @@
 /**
  * Whole-text crossfade helper for streaming transcripts.
  *
- * Both the realtime ASR and TS-ASR pages call ``AmphionStreamingText.apply``
+ * The realtime ASR page calls ``AmphionStreamingText.apply``
  * on every partial / final update. The previous version did a per-character
  * diff so only changed glyphs animated; this version takes a much simpler
  * approach: each new text replaces the previous one as a single block,

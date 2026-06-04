@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from ..asr.enrollment import get_enrollment_store
 from ..asr.hotword import query_text_hotwords, sanitize_hotwords
 from ..config import Config, load_config
 from .audio_stream import AudioStream
@@ -67,6 +68,12 @@ class SessionContext:
     language: str = ""
     src_lang: str = "N/A"
     hotwords: list[str] = field(default_factory=list)
+    # Optional cached target-speaker enrollment (base64 WAV). The session
+    # resolves the opaque ``enrollment_id`` once at start / on every
+    # ``update_hotwords`` and stores the WAV inline so per-segment
+    # inference doesn't re-hit the in-memory store on every call.
+    enrollment_id: str | None = None
+    enrollment_b64: str | None = None
     send_json: Callable[[dict[str, Any]], Awaitable[bool]] = None  # type: ignore[assignment]
 
     def snapshot(self) -> "SessionContext":
@@ -235,6 +242,9 @@ class StreamingSession:
             self.ctx.hotwords = sanitize_hotwords(hw_raw)
             logger.info("Hotwords from start: %d items", len(self.ctx.hotwords))
 
+        if "enrollment_id" in ctrl:
+            self._apply_enrollment(ctrl.get("enrollment_id"))
+
         fmt = ctrl.get("format", "pcm_s16le")
         sr = ctrl.get("sample_rate_hz", 16000)
         ch = ctrl.get("channels", 1)
@@ -255,10 +265,31 @@ class StreamingSession:
             if lang_val:
                 self.ctx.language = lang_val
                 self.ctx.src_lang = map_language(lang_val)
+        if "enrollment_id" in ctrl:
+            self._apply_enrollment(ctrl.get("enrollment_id"))
         logger.info(
-            "Hotwords updated: %s (src_lang=%s)",
-            self.ctx.hotwords, self.ctx.src_lang,
+            "Hotwords updated: %s (src_lang=%s, enrollment=%s)",
+            self.ctx.hotwords, self.ctx.src_lang, self.ctx.enrollment_id,
         )
+
+    def _apply_enrollment(self, raw_id: object) -> None:
+        """Resolve an enrollment id (or ``None``/empty to clear) into a
+        cached WAV. Unknown / expired ids are treated as "no enrollment"
+        so a stale id from a long-lived tab degrades to plain ASR
+        instead of breaking the WS session."""
+        if raw_id is None or not isinstance(raw_id, str) or not raw_id.strip():
+            self.ctx.enrollment_id = None
+            self.ctx.enrollment_b64 = None
+            return
+        ident = raw_id.strip()
+        entry = get_enrollment_store().get(ident)
+        if entry is None:
+            logger.warning("Enrollment id %s not found / expired", ident)
+            self.ctx.enrollment_id = None
+            self.ctx.enrollment_b64 = None
+            return
+        self.ctx.enrollment_id = ident
+        self.ctx.enrollment_b64 = entry.wav_base64
 
     def _handle_extract_hotwords(self, ctrl: dict) -> None:
         """Schedule a long-text hotword extraction in the background.

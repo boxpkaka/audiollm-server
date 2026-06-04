@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 from pathlib import Path
 
@@ -82,23 +81,6 @@ def command_emotion(args: argparse.Namespace) -> dict:
     raise SystemExit(f"emotion job {job_id} timed out after {args.timeout}s")
 
 
-def command_tsasr(args: argparse.Namespace) -> dict:
-    url = join_url(args.base_url, "/api/tsasr/upload")
-    enrollment_b64 = base64.b64encode(Path(args.enrollment).read_bytes()).decode("ascii")
-    return post_multipart(
-        url,
-        args.audio_file,
-        data={
-            "enrollment_wav_base64": enrollment_b64,
-            "language": args.language,
-            "hotwords": args.hotwords,
-            "voice_traits": args.voice_traits,
-        },
-        verify=not args.insecure,
-        timeout=args.timeout,
-    )
-
-
 def command_analyze(args: argparse.Namespace) -> dict:
     url = join_url(args.base_url, "/api/audio/analyze")
     return post_multipart(
@@ -139,13 +121,6 @@ def parse_args() -> argparse.Namespace:
     add_common(emotion)
     emotion.add_argument("--mode", choices=("ser", "sec"), default="ser", help="Emotion mode")
     emotion.set_defaults(func=command_emotion)
-
-    tsasr = subparsers.add_parser("tsasr", help="POST /api/tsasr/upload")
-    add_common(tsasr)
-    tsasr.add_argument("--enrollment", required=True, help="Target speaker enrollment WAV file")
-    tsasr.add_argument("--hotwords", default="", help="Comma-separated hotwords")
-    tsasr.add_argument("--voice-traits", default="", help="Compatibility field; usually leave empty")
-    tsasr.set_defaults(func=command_tsasr)
 
     analyze = subparsers.add_parser("analyze", help="POST /api/audio/analyze")
     add_common(analyze)

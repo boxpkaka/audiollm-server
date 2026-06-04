@@ -5,7 +5,7 @@
 #   The HTML pages used to load Tailwind from cdn.tailwindcss.com, which
 #   ships a JIT runtime that re-scans the page on every navigation. That
 #   was the largest single source of perceived "stutter" when switching
-#   between the ASR / TS-ASR / Emotion pages. We instead pre-compile a
+#   between the ASR / Emotion pages. We instead pre-compile a
 #   single ``frontend/tailwind.css`` and check it into the repo, so the
 #   server can hand the browser a static stylesheet that's instantly
 #   parseable and fully cacheable.

@@ -249,12 +249,12 @@ def vad_trim_audio(
     to silence at the end (e.g. continuous speech up to the last sample),
     the processor's internal buffer is flushed so the tail isn't dropped.
 
-    Rationale: TS-ASR enrollment only needs a few seconds of clean target
-    speech, but users often upload longer clips with leading/trailing
-    silence or a chatter preamble. Running VAD lets us throw away those
-    boring segments before we hit the ``target_sec`` cap, rather than
-    naively keeping the first N seconds (which may be silence) or the
-    last N seconds (which may be mid-word).
+    Rationale: callers typically only need a few seconds of clean speech
+    from longer clips that have leading/trailing silence or a chatter
+    preamble. Running VAD lets us throw away those boring segments before
+    we hit the ``target_sec`` cap, rather than naively keeping the first N
+    seconds (which may be silence) or the last N seconds (which may be
+    mid-word).
 
     When VAD finds no voiced frames (e.g. extremely quiet microphone or a
     silent file) we fall back to the leading ``target_sec`` window so the

@@ -132,6 +132,15 @@
   const uploadInput = document.getElementById('upload-input');
   const uploadStatus = document.getElementById('upload-status');
 
+  const enrollUploadBtn = document.getElementById('enroll-upload-btn');
+  const enrollFileInput = document.getElementById('enroll-file-input');
+  const enrollRecordBtn = document.getElementById('enroll-record-btn');
+  const enrollPlayBtn = document.getElementById('enroll-play-btn');
+  const enrollClearBtn = document.getElementById('enroll-clear-btn');
+  const enrollStatusPill = document.getElementById('enroll-status-pill');
+  const enrollHint = document.getElementById('enroll-hint');
+  let enrollmentCtrl = null;
+
   // Upload state. The upload path is a one-shot REST POST against
   // /api/asr/upload, so all we need to track is whether one is in flight
   // (to gate the mic button) plus the latest status text for re-rendering
@@ -224,12 +233,17 @@
 
   function syncHotwords() {
     if (ws && ws.readyState === WebSocket.OPEN) {
+      // The enrollment id is part of the same control message so the
+      // backend never has to handle "hotwords applied but enrollment
+      // arrives a tick later". A null id explicitly clears the
+      // server-side cache without ambiguity.
       ws.send(
         JSON.stringify({
           type: 'update_hotwords',
           hotwords: getEffectiveHotwords(),
           src_lang: apiLangFromUi(srcLangUi),
           enable_emotion: emotionEnabled,
+          enrollment_id: enrollmentCtrl ? enrollmentCtrl.getEnrollmentId() : null,
         })
       );
       setHotwordSyncStatus('synced');
@@ -521,7 +535,11 @@
         updateAIBubble(data.id, null, 'processing');
         break;
       case 'response':
-        partialSeqMap.delete(data.id);
+        // utterance 进入终态：把 seq 设成 Infinity，让所有迟到的 partial
+        // （后端 _emit_partial 已有 lifecycle 检查作根因防御；前端这一层
+        // 是冗余保险，确保即便后端漏发了 gate 也不会被 streaming 状态覆盖
+        // final 文本）自然走 seq 比较的 break 分支。
+        partialSeqMap.set(data.id, Infinity);
         updateAIBubble(data.id, data.text, 'done', data.model_hotwords, {
           textPrimary: data.text_primary,
           textSecondary: data.text_secondary,
@@ -531,11 +549,11 @@
         });
         break;
       case 'discard':
-        partialSeqMap.delete(data.id);
+        partialSeqMap.set(data.id, Infinity);
         removeSegmentBubbles(data.id);
         break;
       case 'error':
-        partialSeqMap.delete(data.id);
+        partialSeqMap.set(data.id, Infinity);
         updateAIBubble(data.id, data.message || '', 'error');
         break;
       case 'extract_hotwords_result':
@@ -596,8 +614,7 @@
     activeReplayAudio = audio;
   }
 
-  // Single-sided bubble skeleton, intentionally identical in shape to
-  // the TS-ASR page (frontend/tsasr-app.js#buildBubbleSkeleton):
+  // Single-sided bubble skeleton:
   //
   //   .ai-content
   //     .bubble-shimmer    <- visible while we're waiting on the model
@@ -846,15 +863,24 @@
       showShimmer(content, false);
       const textEl = content.querySelector('.bubble-text');
       const finalText = text || '';
-      setBubbleText(textEl, finalText);
+
+      // emotion 与 ASR 是独立信号：后端在 ASR silence + emotion 非空时
+      // 也会发 response(text="")，此时用占位文案替代 ASR 文本，让用户
+      // 知道这条 bubble 是 "仅识别到情感"。textEl 自身挂 data-dyn-key
+      // 让 i18n 切换时 applyDyn 自动重渲染。
+      const emotionInfo = debugInfo && debugInfo.emotion ? debugInfo.emotion : null;
+      const hasEmotionSignal =
+        !!emotionInfo &&
+        (String(emotionInfo.ser_label || '').trim() ||
+          String(emotionInfo.sepc_text || '').trim() ||
+          String(emotionInfo.sepc_label || '').trim());
 
       // Hotword feedback is now exclusively the inline <mark> highlight
       // applied by applyHotwordHighlights (which rewrites the current
       // text-frame's innerHTML once the final text has settled). The
       // previous "Hotword hits: N" line and the session-wide running
       // counter were redundant once the glyphs themselves are tinted,
-      // and the bubble's meta block now matches the TS-ASR layout
-      // (lang/duration only).
+      // so the bubble's meta block only carries lang/duration.
       const wordsForHighlight = Array.from(
         new Set([
           ...((Array.isArray(modelHotwords) ? modelHotwords : [])
@@ -863,7 +889,21 @@
           ...getEffectiveHotwords(),
         ])
       );
-      applyHotwordHighlights(textEl, finalText, wordsForHighlight);
+
+      if (!finalText && hasEmotionSignal) {
+        textEl.setAttribute('data-dyn-key', 'asr.emotion.onlyPlaceholder');
+        textEl.removeAttribute('data-dyn-vars');
+        textEl.style.fontStyle = 'italic';
+        textEl.style.color = 'var(--ink-mute)';
+        textEl.textContent = t('asr.emotion.onlyPlaceholder');
+      } else {
+        textEl.removeAttribute('data-dyn-key');
+        textEl.removeAttribute('data-dyn-vars');
+        textEl.style.fontStyle = '';
+        textEl.style.color = '';
+        setBubbleText(textEl, finalText);
+        applyHotwordHighlights(textEl, finalText, wordsForHighlight);
+      }
 
       const detectedRaw =
         debugInfo && debugInfo.srcLangDetected
@@ -952,6 +992,7 @@
     micIcon.setAttribute('fill', 'currentColor');
     setDynText(micStatus, 'asr.mic.listening');
     pulseRings.forEach((r) => r.classList.add('active'));
+    if (enrollmentCtrl) enrollmentCtrl.refresh();
   }
 
   function stopRecording() {
@@ -969,8 +1010,8 @@
     // holding". Without this the trailing in-progress utterance sits in
     // VAD's buffer until the WebSocket actually closes, so the user
     // never sees a final bubble (and replay button) for the last thing
-    // they said before clicking stop. Mirrors the TS-ASR ``stop``
-    // protocol, see backend/session.py _handle_control_message.
+    // they said before clicking stop. See backend/session.py
+    // _handle_control_message for the ``flush`` protocol.
     if (ws && ws.readyState === WebSocket.OPEN) {
       try { ws.send(JSON.stringify({ type: 'flush' })); } catch { /* noop */ }
     }
@@ -988,10 +1029,18 @@
     micIcon.setAttribute('fill', 'none');
     setDynText(micStatus, 'asr.mic.start');
     pulseRings.forEach((r) => r.classList.remove('active'));
+    if (enrollmentCtrl) enrollmentCtrl.refresh();
   }
 
   micBtn.addEventListener('click', () => {
     if (isUploading) return;
+    if (enrollmentCtrl && enrollmentCtrl.isBusy()) {
+      // The enrollment recorder is currently holding the mic — letting
+      // the page open a second mic capture racey both UX-wise and
+      // device-wise (the OS prompts overlap on some browsers).
+      alert(t('asr.enroll.error.busyEnrolling'));
+      return;
+    }
     if (isRecording) {
       stopRecording();
     } else {
@@ -1108,6 +1157,7 @@
         {
           language: apiLangFromUi(srcLangUi) || '',
           hotwords: (hotwords || []).join(','),
+          enrollment_id: (enrollmentCtrl && enrollmentCtrl.getEnrollmentId()) || '',
         },
         { signal: uploadController.signal, fileName: file.name || 'upload.wav' }
       );
@@ -1225,8 +1275,39 @@
     if (currentUploadDyn && uploadStatus) {
       uploadStatus.textContent = t(currentUploadDyn.key, currentUploadDyn.vars || undefined);
     }
+    if (enrollmentCtrl && enrollmentCtrl.refreshLabels) {
+      enrollmentCtrl.refreshLabels();
+    }
     applyDyn(document);
   });
+
+  // --- Enrollment controller ---
+  // Mounted before the WS connects so the first ``onopen`` -> syncHotwords
+  // already carries the (possibly null) enrollment_id; that gives the
+  // backend a consistent picture without needing a follow-up message.
+  if (window.Amphion && window.Amphion.Enrollment && enrollStatusPill) {
+    enrollmentCtrl = window.Amphion.Enrollment.attach({
+      elements: {
+        card: document.getElementById('enrollment-card'),
+        uploadBtn: enrollUploadBtn,
+        fileInput: enrollFileInput,
+        recordBtn: enrollRecordBtn,
+        playBtn: enrollPlayBtn,
+        clearBtn: enrollClearBtn,
+        statusPill: enrollStatusPill,
+        hint: enrollHint,
+      },
+      isMicRecording: () => isRecording,
+      t,
+      onChange: () => {
+        // Whenever the id flips, re-broadcast it to the server through
+        // the existing update_hotwords channel. Doing it here (rather
+        // than only on the next user-driven action) keeps the page
+        // consistent if the user toggles enrollment between recordings.
+        syncHotwords();
+      },
+    });
+  }
 
   // --- Init ---
   connectWS();
@@ -1285,6 +1366,7 @@
         try { URL.revokeObjectURL(url); } catch (_) { /* ignore */ }
       });
       segmentAudio.clear();
+      partialSeqMap.clear();
       if (uploadController) {
         try { uploadController.abort(); } catch (_) { /* ignore */ }
         uploadController = null;
@@ -1292,6 +1374,10 @@
       if (typeof i18nUnsub === 'function') {
         try { i18nUnsub(); } catch (_) { /* ignore */ }
         i18nUnsub = null;
+      }
+      if (enrollmentCtrl) {
+        try { enrollmentCtrl.dispose(); } catch (_) { /* ignore */ }
+        enrollmentCtrl = null;
       }
     };
   }

@@ -1,6 +1,6 @@
 # AudioLLM API Reference
 
-本文档面向外部系统集成方，说明如何远程调用 AudioLLM 服务完成语音转写、目标说话人转写和情感识别测试。
+本文档面向外部系统集成方，说明如何远程调用 AudioLLM 服务完成语音转写和情感识别测试。
 
 ## 基础信息
 
@@ -22,7 +22,6 @@
 | 接口 | 任务 | 适用场景 | 结果消息 |
 |---|---|---|---|
 | `/transcribe-streaming` | 通用流式 ASR | 实时语音转写、带热词的对话转写 | `partial` / `partial_asr`、`final` / `final_asr` |
-| `/transcribe-target-streaming` | 目标说话人 ASR | 给定注册音频，只转写目标说话人 | `enrollment_ok`、`partial`、`final` |
 | `/emotion-segmented-streaming` | 分段情感识别 | 长连接中按 VAD 语音段持续返回情感 | 多条 `final_emotion` |
 
 `/ws/audio` 是浏览器 Demo 使用的调试接口，包含前端专用消息和双模型调试视图。第三方系统集成建议优先使用上表中的任务接口。
@@ -31,11 +30,12 @@
 
 | 方法 | 路径 | 任务 | 表单字段 |
 |---|---|---|---|
-| POST | `/api/asr/upload` | 上传整段音频做 ASR | `audio`、`language`、`hotwords` |
+| POST | `/api/asr/upload` | 上传整段音频做 ASR | `audio`、`language`、`hotwords`、`enrollment_id` |
+| POST | `/api/asr/enrollment` | 上传目标说话人音频（1-8 秒）注册 | `audio` |
+| DELETE | `/api/asr/enrollment/{enrollment_id}` | 删除注册音频 | — |
 | POST | `/api/emotion/jobs` | 异步整段情感识别（202 + 轮询） | `audio`、`mode`、`language` |
 | GET | `/api/emotion/jobs/{job_id}` | 查询情感任务状态与结果 | — |
-| POST | `/api/tsasr/upload` | 上传注册音频和混合音频做目标说话人 ASR | `audio`、`enrollment_wav_base64`、`language`、`hotwords`、`voice_traits` |
-| POST | `/api/audio/analyze` | 非实时聚合分析：ASR 原始结果、文本清洗、情感标签和情感描述 | `audio`、`language`、`hotwords` |
+| POST | `/api/audio/analyze` | 非实时聚合分析：ASR 原始结果、文本清洗、情感标签和情感描述 | `audio`、`language`、`hotwords`、`enrollment_id` |
 
 ## WebSocket 调用流程
 
@@ -67,7 +67,7 @@ bytes_per_ms = 16000 * 1 * 2 / 1000 = 32
 }
 ```
 
-各任务可以在此基础上增加字段，例如 ASR 的 `language` / `hotwords`、情感识别的 `mode`、TS-ASR 的 `enrollment_audio`。
+各任务可以在此基础上增加字段，例如 ASR 的 `language` / `hotwords` / `enrollment_id`、情感识别的 `mode`。`/transcribe-streaming` 携带 `enrollment_id` 时会切换为目标说话人模式，详见 [通用流式 ASR WebSocket](transcribe-streaming-protocol.md)。
 
 ### 临时配置覆写
 
@@ -77,8 +77,17 @@ bytes_per_ms = 16000 * 1 * 2 / 1000 = 32
 |---|---|
 | VAD / 分段 | `vad_threshold`、`silence_duration_ms`、`min_segment_duration_ms` |
 | ASR | `enable_pseudo_stream`、`pseudo_stream_interval_ms`、`asr_request_timeout` |
+| ASR 模型组合 | `enable_primary_asr`、`enable_secondary_asr`、`enable_dual_asr_fusion` |
+| TS-ASR | `asr_enrollment_min_sec`、`asr_enrollment_max_sec`、`asr_enrollment_ttl_sec` |
 | 情感 | `emotion_task_mode`、`emotion_request_timeout`、`emotion_max_audio_seconds` |
-| TS-ASR | `tsasr_enable_partial`、`tsasr_enable_hotwords`、`tsasr_request_timeout` |
+
+ASR 模型组合开关的语义矩阵（`enable_dual_asr_fusion=true` 但 `enable_secondary_asr=false` 会在 load 时自动降级为 false）：
+
+| enable_secondary_asr | enable_dual_asr_fusion | Partial（WS） | Final（WS / REST） |
+|---|---|---|---|
+| true | true | 双调 + 副模型静音门 + 发主模型文本 | 双调 + 融合矫正 |
+| true | false | 双调 + 副模型静音门 + 发主模型文本 | 仅主模型（REST 上传也跳过副模型） |
+| false | (自动 false) | 仅主模型、无静音门 | 仅主模型 |
 
 示例：
 
@@ -164,9 +173,30 @@ python docs/examples/rest_upload.py asr sample.wav \
   "type": "final",
   "text": "你好，欢迎使用语音识别服务。",
   "language": "zh",
-  "duration_sec": 3.42
+  "duration_sec": 3.42,
+  "enrollment_used": false
 }
 ```
+
+如需让模型只转写指定说话人的话，先用 `POST /api/asr/enrollment` 上传 1-8 秒目标人语音、拿到 `enrollment_id`，再把它作为表单字段附加到 `/api/asr/upload`，响应里的 `enrollment_used` 会变为 `true`。详细字段、错误码与 Python 代码示例见 [通用流式 ASR WebSocket](transcribe-streaming-protocol.md)。
+
+### 目标说话人注册
+
+```bash
+curl -X POST http://172.16.0.3:8080/api/asr/enrollment \
+  -F "audio=@speaker_enroll.wav"
+```
+
+响应：
+
+```json
+{
+  "enrollment_id": "ule8QilVjZql30Q9oy9kiQ",
+  "duration_sec": 3.0
+}
+```
+
+校验失败（音频过短、无法解码等）返回 400 且 `detail.code` 为结构化错误码（`empty` / `too_short` / `decode_failed`）。删除使用 `DELETE /api/asr/enrollment/{enrollment_id}`。完整协议见 [通用流式 ASR WebSocket](transcribe-streaming-protocol.md)。
 
 ### 情感上传
 
@@ -187,30 +217,6 @@ python docs/examples/rest_upload.py emotion sample.wav \
   "text": "Happy",
   "duration_sec": 3.42,
   "language": "zh"
-}
-```
-
-### TS-ASR 上传
-
-```bash
-python docs/examples/rest_upload.py tsasr mixed.wav \
-  --base-url http://172.16.0.3:8080 \
-  --enrollment enrollment.wav \
-  --language zh \
-  --hotwords "产品名,人名"
-```
-
-响应示例：
-
-```json
-{
-  "type": "final",
-  "task": "tsasr",
-  "text": "目标说话人的转写文本",
-  "text_secondary": "通用 ASR 的参考文本",
-  "language": "zh",
-  "duration_sec": 5.12,
-  "audio_b64": "UklGR..."
 }
 ```
 
@@ -255,15 +261,6 @@ python tests/test_emotion_ws_client.py sample.wav \
   --language zh
 ```
 
-运行目标说话人 ASR：
-
-```bash
-python docs/examples/ws_tsasr.py mixed.wav \
-  --url ws://172.16.0.3:8080/transcribe-target-streaming \
-  --enrollment enrollment.wav \
-  --language zh
-```
-
 使用 `bash start.sh`（`https://172.16.0.3:8443`）时，示例脚本可加 `--insecure` 跳过自签证书校验。
 
 ## 错误处理
@@ -275,12 +272,13 @@ python docs/examples/ws_tsasr.py mixed.wav \
 ```json
 {
   "type": "error",
-  "code": "enrollment_missing",
-  "message": "enrollment_audio is required"
+  "message": "model inference failed"
 }
 ```
 
-部分接口只返回 `message`。客户端应至少记录完整错误 payload，并在收到错误后停止发送音频或主动关闭连接。
+部分错误事件还会带 `id`（语音段标识）或服务端自定义 `code`。客户端应至少记录完整错误 payload，并在收到错误后停止发送音频或主动关闭连接。
+
+`enrollment_id` 在 WebSocket 路径上失效不会触发 `error`：服务端会静默回退到普通 ASR 并在日志里记录原因。客户端可在 `/api/asr/enrollment` 重新注册并通过 `update_hotwords` 携带新 id 续传。
 
 ### REST 错误响应
 
@@ -293,11 +291,12 @@ REST 接口使用标准 HTTP 状态码：
 | 422 | multipart 字段类型或必填字段不符合 FastAPI 校验 |
 | 502 | 后端模型服务推理失败 |
 | 502 | `/api/audio/analyze` 的 ASR、情感或文本清洗模型调用失败 |
+| 204 | `DELETE /api/asr/enrollment/{id}` 删除成功（未知 id 也返回 204） |
 | 202 | `POST /api/emotion/jobs` 已受理（需轮询 GET） |
 | 503 | 情感任务队列已满（`Retry-After`） |
 | 404 | `GET /api/emotion/jobs/{id}` 任务不存在或已过期 |
 
-错误体示例：
+普通错误体示例：
 
 ```json
 {
@@ -305,13 +304,13 @@ REST 接口使用标准 HTTP 状态码：
 }
 ```
 
-TS-ASR 注册音频错误会返回结构化 detail：
+`/api/asr/enrollment` 返回的是结构化错误体：
 
 ```json
 {
   "detail": {
-    "code": "enrollment_too_short",
-    "message": "enrollment audio is too short"
+    "code": "too_short",
+    "message": "enrollment audio is 0.30s, need at least 1.00s"
   }
 }
 ```
@@ -321,6 +320,5 @@ TS-ASR 注册音频错误会返回结构化 detail：
 - [公网非实时音频分析 API](public-audio-analyze-api.md)
 - [非实时音频分析 API](audio-analyze-api.md)
 - [通用流式 ASR WebSocket](transcribe-streaming-protocol.md)
-- [目标说话人 ASR WebSocket](tsasr.md)
 - [整段情感识别 HTTP（异步）](emotion-streaming-protocol.md)
 - [分段情感识别 WebSocket](emotion-segmented-streaming-protocol.md)

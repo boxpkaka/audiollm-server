@@ -3,13 +3,12 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 基于 [Amphion](https://github.com/open-mmlab/Amphion) (vLLM) 的实时语音多任务 Demo，集成 TEN VAD 语音端点检测。
-支持三类任务：
+支持两类任务：
 
 - 实时语音转写（双 ASR 模型 Amphion + Qwen 并行推理 + 归一化质量评估 + 风险感知融合，可选在每条转写旁附上情感/语气）
-- 目标说话人识别（TS-ASR，注册音频 + 混合音频双路推理，附带二级语音存在性门控）
 - 情感识别（SER 8 分类 / SEC 自由文本描述，整段语音推理）
 
-前端三个 Demo 页面（ASR / TS-ASR / 情感）共享同一套侧边栏导航与 EN / 中文 实时语言切换。
+前端两个 Demo 页面（ASR / 情感）共享同一套侧边栏导航与 EN / 中文 实时语言切换。
 
 ---
 
@@ -37,12 +36,11 @@ cp backend/api.json.example backend/api.json && vim backend/api.json
 bash start.sh
 ```
 
-浏览器打开 `http://172.16.0.3:8080`（systemd 部署）或 `https://172.16.0.3:8443`（`bash start.sh` 自签 HTTPS）进入实时 ASR Demo，另两个 Demo 入口：
+浏览器打开 `http://172.16.0.3:8080`（systemd 部署）或 `https://172.16.0.3:8443`（`bash start.sh` 自签 HTTPS）进入实时 ASR Demo，另一个 Demo 入口：
 
 | 页面 | 路径 | 说明 |
 |---|---|---|
 | 实时语音转写 | / 或 /index.html | 双 ASR 模型并行 + 融合；右侧面板可开启"情感识别"开关，在每条 final 转写下附上情绪与语气 |
-| 目标说话人识别 | /tsasr.html | 录入注册音频后只识别该说话人 |
 | 情感识别 | /emotion.html | 整段语音 SER / SEC |
 
 页面右上角的 EN / 中 切换会持久化到浏览器 localStorage，下次访问保持上次的选择。
@@ -98,13 +96,12 @@ graph LR
 
 ## WebSocket 接口
 
-服务暴露四个 WebSocket 端点（流式 / 分段任务）：
+服务暴露三个 WebSocket 端点（流式 / 分段任务）：
 
 | 端点 | 任务 | VAD | 输出 | 协议文档 |
 |---|---|---|---|---|
 | `/ws/audio` | 浏览器 Demo（ASR + 双模型调试视图 + 可选情感） | 是 | response / partial_transcript，可选 response.emotion（SER 标签 + SEC 描述） | 见前端代码 |
 | `/transcribe-streaming` | 个性化语音识别 | 是 | partial / final（每段语音一条） | [docs/transcribe-streaming-protocol.md](docs/transcribe-streaming-protocol.md) |
-| `/transcribe-target-streaming` | 目标说话人识别（TS-ASR，注册音频 + 混合音频） | 是 | enrollment_ok / final（每段语音一条） | [docs/tsasr.md](docs/tsasr.md) |
 | `/emotion-segmented-streaming` | 按段流式情感识别（同模型，逐段返回） | 是 | final_emotion（每个 VAD 段一条） | [docs/emotion-segmented-streaming-protocol.md](docs/emotion-segmented-streaming-protocol.md) |
 
 新增任务的命名约定：每个任务一个独立 WebSocket 端点（`/<task>-streaming`），共享同一套 `start` / `stop` / `update_hotwords` 控制消息与 `config` 覆写机制；任务专属字段（如 ASR 的 `language`/`hotwords`、情感的输出标签集）只出现在对应端点的协议文档中。
@@ -295,7 +292,16 @@ SERVICE=my-demo scripts/restart_service.sh   # 指定其他 systemd 服务名
 | `secondary_vllm_base_url` | string | `http://172.16.0.3:8001` | 副 ASR 模型的服务地址 |
 | `secondary_vllm_model_name` | string | `Qwen/Qwen3-ASR-1.7B` | 副 ASR 模型名称 |
 | `enable_primary_asr` | bool | `true` | 是否启用主模型。关闭后只用副模型 |
-| `enable_secondary_asr` | bool | `true` | 是否启用副模型。关闭后只用主模型 |
+| `enable_secondary_asr` | bool | `true` | 副模型是否在线。决定 partial 是否有静音门、final 是否可融合 |
+| `enable_dual_asr_fusion` | bool | `true` | final 段是否走双模型融合矫正。关闭后 final 只跑主模型（partial 静音门不受影响）。`enable_secondary_asr=false` 时自动降级为 false |
+
+三档 ASR 开关组合矩阵：
+
+| `enable_secondary_asr` | `enable_dual_asr_fusion` | Partial 行为 | Final 行为 |
+|---|---|---|---|
+| true | true（默认） | 双调，副模型做静音门，发主模型文本 | 双调 + 融合矫正 |
+| true | false | 双调，副模型做静音门，发主模型文本 | 仅主模型 |
+| false | (自动降级 false) | 仅主模型，无静音门 | 仅主模型 |
 
 #### 推理控制
 
@@ -338,22 +344,6 @@ SERVICE=my-demo scripts/restart_service.sh   # 指定其他 systemd 服务名
 | `fusion_disagreement_threshold` | float | `0.55` | 两模型结果的分歧度上限。超过则回退到副模型 |
 | `fusion_hotword_boost` | float | `0.12` | 主模型命中每个热词时获得的评分加成 |
 | `fusion_primary_score_margin` | float | `0.08` | 主模型评分需超过副模型至少这么多才会被选用 |
-
-#### 目标说话人识别（仅 `/transcribe-target-streaming` 使用）
-
-| 参数 | 类型 | 默认值 | 说明 |
-|---|---|---|---|
-| `tsasr_base_url` | string | `""` | TS-ASR 模型的 vLLM 服务地址；空字符串时回落到 `vllm_base_url` |
-| `tsasr_model_name` | string | `""` | TS-ASR 模型名称；空字符串时回落到 `vllm_model_name` |
-| `tsasr_request_timeout` | float | `30.0` | 单次推理 HTTP 请求超时（秒） |
-| `tsasr_enrollment_min_sec` | float | `1.0` | 注册音频最短时长（秒），小于此值服务端拒绝 |
-| `tsasr_enrollment_max_sec` | float | `5.0` | 注册音频最长时长（秒），超过此值服务端用 VAD 抽取有声帧后截断到该上限，而不是拒绝 |
-| `tsasr_max_audio_seconds` | float | `30.0` | 单段混合音频时长上限；超过则保留尾部 |
-| `tsasr_enable_partial` | bool | `false` | 是否开启伪流式 partial；双音频推理 RTF 较高，默认关闭 |
-| `tsasr_enable_hotwords` | bool | `true` | 是否把会话热词注入 Prompt（在 Transcribe 行后追加 `Hotwords:` 行）；已与 v3 训练 prompt 对齐，默认开启 |
-| `tsasr_speech_gate_enabled` | bool | `true` | 二级语音存在性门控开关。TS-ASR 模式下副模型被关闭，对 VAD 漏判的键盘敲击等瞬时噪音再做一次过滤 |
-| `tsasr_speech_gate_prob_threshold` | float | `0.6` | 门控逐帧判帧的概率阈值，比上层 `vad_threshold` 更严格 |
-| `tsasr_speech_gate_min_voiced_ms` | int | `200` | 累计有声时长低于此值的片段会被丢弃，不再下发到 vLLM |
 
 #### 情感识别（HTTP jobs + `/emotion-segmented-streaming`）
 
@@ -399,7 +389,6 @@ backend/
     base.py                  #   TaskEngine 协议 + BaseTaskEngine 默认实现
     asr.py                   #   AsrTaskEngine：双模型 + 融合 + 伪流 partial
     emotion.py               #   EmotionTaskEngine：整段情感推理
-    ts_asr.py                #   TsAsrTaskEngine：注册音频 + 混合音频双路推理
   audio/                     # 音频信号处理
     utils.py                 #   48→16 kHz 重采样、PCM/WAV 转换
     vad.py                   #   语音端点检测（TEN VAD + 备用方案）
@@ -411,19 +400,14 @@ backend/
   emotion/                   # 情感模型交互
     client.py                #   vLLM API 调用与输出解析
     prompt.py                #   情感识别 Prompt 与标签集
-  tsasr/                     # 目标说话人识别（短期方案，独立演化）
-    client.py                #   query_tsasr_model：双音频 vLLM 请求
-    prompt.py                #   build_tsasr_content：可扩展的 Prompt 构建器
-    enrollment.py            #   注册音频解码与时长校验
   api.json                   # 可选：长文本热词抽取使用的外部 LLM 配置（OpenAI 兼容）
-frontend/                    # 静态 Web 前端（三个 Demo 页面 + 共享侧边栏 + EN/中文 i18n）
+frontend/                    # 静态 Web 前端（两个 Demo 页面 + 共享侧边栏 + EN/中文 i18n）
   index.html / app.js        #   实时 ASR 主页
-  tsasr.html / tsasr-app.js  #   TS-ASR 演示
   emotion.html / emotion-app.js  # 情感识别演示
   sidebar.js                 #   注入侧边栏导航与 EN/中 语言切换
   i18n.js                    #   极简前端 i18n（data-i18n / data-i18n-attr-* 等）
 scripts/                     # vLLM 服务启动脚本
-tests/                       # 测试工具（ASR / TS-ASR / 情感各一个客户端脚本）
+tests/                       # 测试工具（ASR / 情感客户端脚本）
 docs/                        # 协议文档（每个端点一份）
 ```
 

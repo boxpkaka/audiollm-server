@@ -7,6 +7,7 @@ import numpy as np
 from fastapi import WebSocket, WebSocketDisconnect
 
 from .asr.client import query_audio_model, query_audio_model_secondary
+from .asr.enrollment import get_enrollment_store
 from .asr.fusion import choose_fused_result
 from .asr.hotword import query_text_hotwords, sanitize_hotwords
 from .audio.utils import Resampler48to16, pcm_to_wav_base64
@@ -17,6 +18,7 @@ from .config import (
     EMOTION_SPEC_REQUEST_TIMEOUT,
     EMOTION_SPEC_VLLM_BASE_URL,
     EMOTION_SPEC_VLLM_MODEL_NAME,
+    ENABLE_DUAL_ASR_FUSION,
     ENABLE_PRIMARY_ASR,
     ENABLE_PSEUDO_STREAM,
     ENABLE_SECONDARY_ASR,
@@ -60,6 +62,13 @@ class AudioSession:
         self.hotwords: list[str] = []
         self.src_lang: str = "N/A"
         self.enable_emotion: bool = False
+        # Optional target-speaker enrollment. ``enrollment_id`` is the
+        # opaque handle returned by ``POST /api/asr/enrollment``;
+        # ``enrollment_b64`` caches the resolved WAV so we don't take a
+        # store hit on every segment. Both reset to ``None`` when the
+        # client clears the enrollment via ``update_hotwords``.
+        self.enrollment_id: str | None = None
+        self.enrollment_b64: str | None = None
         self.stop_event = asyncio.Event()
         self.extract_tasks: set[asyncio.Task] = set()
         self._ws_closed = False
@@ -150,8 +159,13 @@ class AudioSession:
             if segment is not None:
                 self._enqueue_segment(segment)
 
-        # --- Pseudo-streaming: manage utterance_id & throttled partial ---
-        if not (ENABLE_PSEUDO_STREAM and ENABLE_SECONDARY_ASR):
+        # Pseudo-streaming partials live on their own switch. We just need
+        # at least one decoder online — `_emit_partial` picks primary text
+        # when available and falls back to secondary, so disabling either
+        # model individually keeps the live caption working.
+        if not ENABLE_PSEUDO_STREAM:
+            return
+        if not ENABLE_PRIMARY_ASR and not ENABLE_SECONDARY_ASR:
             return
 
         if self.vad.is_speaking:
@@ -209,16 +223,23 @@ class AudioSession:
                 self.src_lang = normalize_client_src_lang(ctrl.get("src_lang"))
             if "enable_emotion" in ctrl:
                 self.enable_emotion = bool(ctrl.get("enable_emotion"))
+            if "enrollment_id" in ctrl:
+                self._apply_enrollment(ctrl.get("enrollment_id"))
             logger.info(
-                "Hotwords updated: %s (src_lang=%s, emotion=%s)",
+                "Hotwords updated: %s (src_lang=%s, emotion=%s, enrollment=%s)",
                 self.hotwords,
                 self.src_lang,
                 self.enable_emotion,
+                self.enrollment_id,
             )
 
         elif ctrl.get("type") == "update_emotion":
             self.enable_emotion = bool(ctrl.get("enabled"))
             logger.info("Emotion recognition toggled: %s", self.enable_emotion)
+
+        elif ctrl.get("type") == "set_enrollment":
+            self._apply_enrollment(ctrl.get("enrollment_id"))
+            logger.info("Enrollment set to %s", self.enrollment_id)
 
         elif ctrl.get("type") == "extract_hotwords":
             request_id = str(ctrl.get("request_id", "")).strip()
@@ -238,6 +259,31 @@ class AudioSession:
             # explicit flush the tail just sits in VAD's buffer until
             # the next disconnect or the next utterance overwrites it).
             self._flush_pending_audio()
+
+    def _apply_enrollment(self, raw_id: object) -> None:
+        """Resolve an enrollment id (or ``None`` to clear) into the cached WAV.
+
+        Unknown / expired ids fall back to "no enrollment" rather than
+        erroring out the WS session — they get reported via the regular
+        log path; the client can re-upload if needed.
+        """
+        if raw_id is None:
+            self.enrollment_id = None
+            self.enrollment_b64 = None
+            return
+        if not isinstance(raw_id, str) or not raw_id.strip():
+            self.enrollment_id = None
+            self.enrollment_b64 = None
+            return
+        ident = raw_id.strip()
+        entry = get_enrollment_store().get(ident)
+        if entry is None:
+            logger.warning("Enrollment id %s not found / expired", ident)
+            self.enrollment_id = None
+            self.enrollment_b64 = None
+            return
+        self.enrollment_id = ident
+        self.enrollment_b64 = entry.wav_base64
 
     def _flush_pending_audio(self) -> None:
         """Drain VAD's pending speech and enqueue it as a final segment.
@@ -312,34 +358,78 @@ class AudioSession:
     async def _emit_partial(
         self, utterance_id: str, snapshot: np.ndarray, seq: int
     ) -> None:
-        """Run both ASR models; use Secondary as silence gate, emit Primary text."""
+        """Emit a rolling partial using whichever decoder(s) are online.
+
+        - Both on  : run in parallel; secondary acts as a noise gate
+                     (primary tends to hallucinate on near-silence), and
+                     the partial text comes from primary so hotwords /
+                     language / target-speaker prompts apply.
+        - Primary only : no noise gate; better to leak an occasional
+                         hallucinated partial than to have the live
+                         caption go completely silent.
+        - Secondary only : use the secondary text directly. It is
+                           weaker (no hotwords / TS), but still useful
+                           as a live caption when primary is offline.
+        """
         try:
             wav_b64 = pcm_to_wav_base64(snapshot)
 
-            secondary_task = asyncio.create_task(
-                query_audio_model_secondary(wav_b64)
-            )
-            primary_task = asyncio.create_task(
-                query_audio_model(
-                    wav_b64,
-                    hotwords=list(self.hotwords),
-                    src_lang=self.src_lang,
-                )
-            )
+            primary_task = None
+            secondary_task = None
 
-            secondary_res = await secondary_task
-            secondary_text = str(
-                (secondary_res or {}).get("transcription") or ""
-            ).strip()
-            if not secondary_text:
-                primary_task.cancel()
+            if ENABLE_PRIMARY_ASR:
+                primary_task = asyncio.create_task(
+                    query_audio_model(
+                        wav_b64,
+                        hotwords=list(self.hotwords),
+                        src_lang=self.src_lang,
+                        enrollment_wav_base64=self.enrollment_b64,
+                    )
+                )
+            if ENABLE_SECONDARY_ASR:
+                secondary_task = asyncio.create_task(
+                    query_audio_model_secondary(wav_b64)
+                )
+
+            secondary_text = ""
+            if secondary_task is not None:
+                secondary_res = await secondary_task
+                secondary_text = str(
+                    (secondary_res or {}).get("transcription") or ""
+                ).strip()
+                # When secondary is the gate (primary present) or the
+                # sole source, an empty result means "silence" — skip.
+                if not secondary_text:
+                    if primary_task is not None:
+                        primary_task.cancel()
+                    return
+
+            if primary_task is not None:
+                primary_res = await primary_task
+                text = str(
+                    (primary_res or {}).get("transcription") or ""
+                ).strip()
+            else:
+                text = secondary_text
+
+            if not text:
                 return
 
-            primary_res = await primary_task
-            text = str(
-                (primary_res or {}).get("transcription") or ""
-            ).strip()
-            if not text:
+            # Utterance lifecycle gate: _enqueue_segment zeroes out
+            # _utterance_id when the final segment goes into the ASR
+            # queue (and a fresh speech burst would set it to a *new*
+            # id). Either way, an inflight partial whose utterance no
+            # longer matches is racing the final response — letting it
+            # through flips the bubble back to "streaming" on the client
+            # and silently overwrites the finalized text. This is the
+            # only point where we can serialize partial/final because the
+            # async task creation-to-completion interval is not lockable.
+            if self._utterance_id != utterance_id:
+                logger.debug(
+                    "Drop stale partial for %s seq=%s (utterance finalized)",
+                    utterance_id,
+                    seq,
+                )
                 return
 
             await self._send_json(
@@ -398,13 +488,22 @@ class AudioSession:
         wav_b64 = pcm_to_wav_base64(segment)
         primary_res: object = None
         secondary_res: object = None
+        # secondary 在 dual fusion 路径下兼做噪声门：如果 secondary 自己
+        # 判 silence，`_dual_asr_pipeline` 直接返回 (None, None) 并取消
+        # primary。这里把 "silence 信号" 与 "ASR 真失败" 区分开，避免下面
+        # 的失败分支把 silence 也当成 error。
+        is_silence = False
 
-        if ENABLE_SECONDARY_ASR:
+        # ENABLE_DUAL_ASR_FUSION (validated against ENABLE_SECONDARY_ASR at
+        # config load time) decides whether final segments go through the
+        # dual-model pipeline. With fusion off we still emit a final from
+        # the primary alone, saving one vLLM call per segment.
+        if ENABLE_DUAL_ASR_FUSION:
             secondary_res, primary_res = await self._dual_asr_pipeline(
                 seg_id, wav_b64, hw_snapshot, lang_snapshot
             )
             if secondary_res is None and primary_res is None:
-                return
+                is_silence = True
         else:
             if ENABLE_PRIMARY_ASR:
                 primary_res = await asyncio.wait_for(
@@ -412,6 +511,7 @@ class AudioSession:
                         wav_b64,
                         hotwords=hw_snapshot,
                         src_lang=lang_snapshot,
+                        enrollment_wav_base64=self.enrollment_b64,
                     ),
                     timeout=PRIMARY_ASR_TIMEOUT,
                 )
@@ -423,12 +523,48 @@ class AudioSession:
             logger.warning("Primary ASR failed for %s: %s", seg_id, primary_res)
         if isinstance(secondary_res, Exception):
             logger.warning("Secondary ASR failed for %s: %s", seg_id, secondary_res)
-        if primary_result is None and secondary_result is None:
+
+        asr_failed = (
+            not is_silence
+            and primary_result is None
+            and secondary_result is None
+        )
+
+        if is_silence or asr_failed:
+            text = ""
+            fused: dict | None = None
+        else:
+            fused = choose_fused_result(
+                primary_result, secondary_result, hotwords=hw_snapshot
+            )
+            text = str(fused.get("text") or "").strip()
+
+        # Emotion is a parallel semantic channel: prosody / paralinguistic
+        # cues exist independently of whether the ASR head emitted text.
+        # Run the SPEC model when the client opted in, even on silence /
+        # ASR-failure paths — the engine itself returns None when the
+        # signal is genuinely empty, so we don't fabricate output.
+        emotion_payload: dict | None = None
+        if self.enable_emotion:
+            emotion_payload = await self._run_emotion(segment)
+
+        if asr_failed and not emotion_payload:
+            # Real upstream failure with no other channel to fall back on:
+            # surface as an error to the client (matches pre-decoupling
+            # behavior) instead of silently dropping the segment.
             raise RuntimeError("Both ASR models failed for this segment.")
+        if asr_failed:
+            # ASR genuinely broken but emotion still produced a signal —
+            # we degrade to emotion-only instead of erroring, which is
+            # nicer UX but hides the ASR fault from the user. Log loud so
+            # ops can spot the upstream regression even when clients are
+            # happy seeing emotion bubbles.
+            logger.warning(
+                "ASR failed for %s, degrading to emotion-only response",
+                seg_id,
+            )
 
-        fused = choose_fused_result(primary_result, secondary_result, hotwords=hw_snapshot)
-
-        if not str(fused.get("text") or "").strip():
+        if not text and not emotion_payload:
             logger.info("Skip empty response for %s (silence)", seg_id)
             return
 
@@ -437,12 +573,12 @@ class AudioSession:
         payload: dict = {
             "type": "response",
             "id": seg_id,
-            "text": fused["text"],
-            "model_hotwords": fused["model_hotwords"],
+            "text": text,
+            "model_hotwords": fused["model_hotwords"] if fused else [],
         }
         if primary_result and primary_result.get("detected_language"):
             payload["src_lang_detected"] = primary_result["detected_language"]
-        if DEBUG_SHOW_DUAL_ASR:
+        if DEBUG_SHOW_DUAL_ASR and fused:
             payload.update(
                 {
                     "text_primary": fused["primary_text"],
@@ -450,11 +586,8 @@ class AudioSession:
                     "fusion_meta": fused["fusion"],
                 }
             )
-
-        if self.enable_emotion:
-            emotion_payload = await self._run_emotion(segment)
-            if emotion_payload is not None:
-                payload["emotion"] = emotion_payload
+        if emotion_payload:
+            payload["emotion"] = emotion_payload
 
         await self._send_json(payload)
 
@@ -553,6 +686,7 @@ class AudioSession:
                         wav_b64,
                         hotwords=hw_snapshot,
                         src_lang=lang_snapshot,
+                        enrollment_wav_base64=self.enrollment_b64,
                     ),
                     timeout=PRIMARY_ASR_TIMEOUT,
                 )

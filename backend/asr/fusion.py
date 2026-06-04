@@ -176,6 +176,16 @@ def choose_fused_result(
     hw_boost = hotword_boost if hotword_boost is not None else FUSION_HOTWORD_BOOST
     pri_margin = primary_score_margin if primary_score_margin is not None else FUSION_PRIMARY_SCORE_MARGIN
 
+    # secondary_result has three semantic states:
+    #   - None           → secondary decoder is not online (config off, or
+    #                      caller chose to skip it). Don't treat the missing
+    #                      text as a noise-gate signal.
+    #   - dict, empty    → secondary ran and produced an empty transcription
+    #                      (the legitimate "silence" gate Qwen3 is wired up
+    #                      to act as on the primary's behalf).
+    #   - dict, non-empty → secondary produced text; go through the full
+    #                      dual-model fusion logic.
+    secondary_online = secondary_result is not None
     primary_text = str((primary_result or {}).get("transcription") or "")
     secondary_text = str((secondary_result or {}).get("transcription") or "")
     primary_hotwords = _filter_reported_hotwords(
@@ -211,13 +221,39 @@ def choose_fused_result(
             },
         )
 
-    if not secondary_text:
+    # Secondary online + empty → noise-gate fires (the existing design).
+    if secondary_online and not secondary_text:
         return FusionResult(
             text="",
             model_hotwords=[],
             primary_text=primary_text,
             secondary_text=secondary_text,
             fusion=_meta("silence", "secondary_empty_force_silence"),
+        )
+
+    # Secondary offline → primary is authoritative; passing primary's text
+    # through without running the dual-model arbiter avoids the false-silence
+    # bug that used to land here (empty secondary_text was misread as
+    # noise-gate even when secondary never ran).
+    if not secondary_online:
+        if not primary_text:
+            return FusionResult(
+                text="",
+                model_hotwords=[],
+                primary_text="",
+                secondary_text="",
+                fusion=_meta("empty", "primary_only_empty"),
+            )
+        return FusionResult(
+            text=primary_text,
+            model_hotwords=primary_hotwords,
+            primary_text=primary_text,
+            secondary_text="",
+            fusion=_meta(
+                "primary_only",
+                "secondary_offline",
+                scores={"primary": 1.0, "secondary": 0.0},
+            ),
         )
 
     if secondary_text and not primary_text:
@@ -228,15 +264,6 @@ def choose_fused_result(
             secondary_text=secondary_text,
             fusion=_meta("secondary_only", "primary_empty",
                          scores={"primary": 0.0, "secondary": 1.0}),
-        )
-
-    if not primary_text and not secondary_text:
-        return FusionResult(
-            text="",
-            model_hotwords=[],
-            primary_text="",
-            secondary_text="",
-            fusion=_meta("empty", "both_empty"),
         )
 
     similarity = _text_similarity(primary_text, secondary_text)

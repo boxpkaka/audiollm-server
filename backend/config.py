@@ -34,6 +34,16 @@ class Config:
     enable_primary_asr: bool = True
     primary_asr_timeout: float = 4.0
     debug_show_dual_asr: bool = True
+    # `enable_secondary_asr` is the resource gate: when False the secondary
+    # vLLM is never queried (no partial noise gate, no final fusion).
+    # `enable_dual_asr_fusion` controls only the *final-segment* path:
+    # True  -> run primary + secondary in parallel and merge via
+    #          `choose_fused_result` (requires secondary to be on);
+    # False -> final is primary-only even if secondary is reachable,
+    #          which saves one vLLM call per segment while keeping the
+    #          partial noise gate functional. Inconsistent combinations
+    #          (fusion=True, secondary=False) are downgraded at load time.
+    enable_dual_asr_fusion: bool = True
 
     # ---- ASR: dual-model fusion knobs ------------------------------------
     fusion_similarity_threshold: float = 0.85
@@ -47,6 +57,19 @@ class Config:
     asr_request_timeout: float = 120
     enable_pseudo_stream: bool = True
     pseudo_stream_interval_ms: int = 500
+
+    # ---- ASR: target speaker enrollment ----------------------------------
+    # When a target-speaker enrollment is uploaded the primary ASR prompt
+    # switches to the dual-audio "Given the speaker's voice:<enroll>\n
+    # Transcribe what this speaker says in the following audio.<target>"
+    # template. The clip is cached server-side for the duration of a
+    # session so the WS stream does not have to retransmit it on every
+    # VAD segment. v4 SFT data trained 1–8 s enrollment clips; anything
+    # outside that window is silently OOD even when the API accepts it.
+    asr_enrollment_min_sec: float = 1.0
+    asr_enrollment_max_sec: float = 8.0
+    asr_enrollment_ttl_sec: float = 3600.0
+    asr_enrollment_max_entries: int = 256
 
     # ---- ASR: VAD segmentation -------------------------------------------
     vad_threshold: float = 0.5
@@ -107,6 +130,17 @@ class Config:
     text_cleanup_timeout: float = 30.0
     text_cleanup_max_tokens: int = 1024
 
+    def __post_init__(self) -> None:
+        # Silently enforce the invariant that fusion requires a secondary
+        # decoder. Dataclass-level so any construction path (load, override,
+        # direct ctor in tests) yields a consistent Config — downstream
+        # code can rely on `enable_dual_asr_fusion` being a clean truth.
+        # Loud WARNING happens in `load_config` against the raw input so
+        # operators notice misconfigured files; in-process overrides stay
+        # silent to avoid log spam.
+        if self.enable_dual_asr_fusion and not self.enable_secondary_asr:
+            object.__setattr__(self, "enable_dual_asr_fusion", False)
+
     @property
     def resolved_text_cleanup_api_key(self) -> str:
         """Return configured API key, preferring the named environment variable."""
@@ -129,6 +163,8 @@ class Config:
                 accepted[k] = expected(v)
             except (TypeError, ValueError):
                 logger.warning("Ignoring invalid config override %s=%r", k, v)
+        # `__post_init__` silently fixes any inconsistent combinations,
+        # which is the right behavior for in-process overrides.
         return replace(self, **accepted) if accepted else self
 
 
@@ -136,6 +172,16 @@ def load_config(path: Path | None = None) -> Config:
     raw = _load_json(path or _CONFIG_PATH)
     valid_names = {f.name for f in fields(Config)}
     filtered = {k: v for k, v in raw.items() if k in valid_names}
+    # Surface a loud WARNING when the on-disk config file specifies an
+    # impossible combination, so operators notice — silent downgrade by
+    # `__post_init__` still happens, this is just the log line.
+    if filtered.get("enable_dual_asr_fusion", True) and not filtered.get(
+        "enable_secondary_asr", True
+    ):
+        logger.warning(
+            "enable_dual_asr_fusion=true requires enable_secondary_asr=true; "
+            "downgrading fusion to false"
+        )
     return Config(**filtered) if filtered else Config()
 
 
@@ -151,6 +197,7 @@ SECONDARY_VLLM_BASE_URL = _default.secondary_vllm_base_url
 SECONDARY_VLLM_MODEL_NAME = _default.secondary_vllm_model_name
 ENABLE_SECONDARY_ASR = _default.enable_secondary_asr
 ENABLE_PRIMARY_ASR = _default.enable_primary_asr
+ENABLE_DUAL_ASR_FUSION = _default.enable_dual_asr_fusion
 PRIMARY_ASR_TIMEOUT = _default.primary_asr_timeout
 DEBUG_SHOW_DUAL_ASR = _default.debug_show_dual_asr
 
@@ -164,6 +211,11 @@ FUSION_PRIMARY_SCORE_MARGIN = _default.fusion_primary_score_margin
 ASR_REQUEST_TIMEOUT = _default.asr_request_timeout
 ENABLE_PSEUDO_STREAM = _default.enable_pseudo_stream
 PSEUDO_STREAM_INTERVAL_MS = _default.pseudo_stream_interval_ms
+
+ASR_ENROLLMENT_MIN_SEC = _default.asr_enrollment_min_sec
+ASR_ENROLLMENT_MAX_SEC = _default.asr_enrollment_max_sec
+ASR_ENROLLMENT_TTL_SEC = _default.asr_enrollment_ttl_sec
+ASR_ENROLLMENT_MAX_ENTRIES = _default.asr_enrollment_max_entries
 
 VAD_THRESHOLD = _default.vad_threshold
 SILENCE_DURATION_MS = _default.silence_duration_ms

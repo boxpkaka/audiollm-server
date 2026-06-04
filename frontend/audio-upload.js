@@ -128,7 +128,7 @@
 
   /**
    * Convert a Uint8Array WAV (or any byte array) to a base64 string. Used for
-   * passing the enrollment WAV to the TS-ASR endpoint as a form field.
+   * passing WAV payloads to REST endpoints as multipart form fields.
    */
   function bytesToBase64(bytes) {
     let binary = '';
