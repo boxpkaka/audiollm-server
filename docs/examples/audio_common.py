@@ -6,7 +6,6 @@ from pathlib import Path
 
 import numpy as np
 
-
 SAMPLE_RATE = 16000
 BYTES_PER_MS = SAMPLE_RATE * 2 // 1000
 

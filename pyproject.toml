@@ -38,3 +38,10 @@ select = ["E", "F", "I", "W"]
 [tool.ruff.lint.per-file-ignores]
 "backend/asr/prompt.py" = ["E501"]
 "tests/*" = ["E501"]
+# Runnable example scripts favor readable argparse help text over hard wrapping.
+"docs/examples/*" = ["E501"]
+
+[tool.ruff.lint.isort]
+# audio_common is the shared local helper module under docs/examples/, not a
+# third-party package; without this, isort flags every example's import block.
+known-first-party = ["audio_common"]
