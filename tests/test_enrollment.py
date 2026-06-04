@@ -37,7 +37,6 @@ from backend.asr.enrollment import (  # noqa: E402
 from backend.audio.utils import pcm_to_wav_base64  # noqa: E402
 from backend.config import SAMPLE_RATE  # noqa: E402
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

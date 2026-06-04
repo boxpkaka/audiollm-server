@@ -157,6 +157,10 @@ def _text_similarity(a: str, b: str) -> float:
 # Dual-ASR fusion
 # ---------------------------------------------------------------------------
 
+def _or_default(value: float | None, default: float) -> float:
+    return default if value is None else value
+
+
 def choose_fused_result(
     primary_result: ASRResult | None,
     secondary_result: ASRResult | None,
@@ -169,12 +173,12 @@ def choose_fused_result(
     hotword_boost: float | None = None,
     primary_score_margin: float | None = None,
 ) -> FusionResult:
-    sim_thresh = similarity_threshold if similarity_threshold is not None else FUSION_SIMILARITY_THRESHOLD
-    min_pri = min_primary_score if min_primary_score is not None else FUSION_MIN_PRIMARY_SCORE
-    max_rep = max_repetition_ratio if max_repetition_ratio is not None else FUSION_MAX_REPETITION_RATIO
-    dis_thresh = disagreement_threshold if disagreement_threshold is not None else FUSION_DISAGREEMENT_THRESHOLD
-    hw_boost = hotword_boost if hotword_boost is not None else FUSION_HOTWORD_BOOST
-    pri_margin = primary_score_margin if primary_score_margin is not None else FUSION_PRIMARY_SCORE_MARGIN
+    sim_thresh = _or_default(similarity_threshold, FUSION_SIMILARITY_THRESHOLD)
+    min_pri = _or_default(min_primary_score, FUSION_MIN_PRIMARY_SCORE)
+    max_rep = _or_default(max_repetition_ratio, FUSION_MAX_REPETITION_RATIO)
+    dis_thresh = _or_default(disagreement_threshold, FUSION_DISAGREEMENT_THRESHOLD)
+    hw_boost = _or_default(hotword_boost, FUSION_HOTWORD_BOOST)
+    pri_margin = _or_default(primary_score_margin, FUSION_PRIMARY_SCORE_MARGIN)
 
     # secondary_result has three semantic states:
     #   - None           → secondary decoder is not online (config off, or

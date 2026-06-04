@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..config import Config, load_config
-from .service import EmotionDecodeError, empty_final_emotion, infer_emotion_from_wav
+from .service import EmotionDecodeError, infer_emotion_from_wav
 
 logger = logging.getLogger(__name__)
 

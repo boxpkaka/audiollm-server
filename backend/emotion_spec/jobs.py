@@ -18,7 +18,7 @@ from typing import Any
 
 from ..config import Config, load_config
 from ..emotion.jobs import JobQueueFullError  # noqa: F401 — public re-export
-from .service import EmotionDecodeError, empty_final_emotion_spec, infer_emotion_spec_from_wav
+from .service import EmotionDecodeError, infer_emotion_spec_from_wav
 
 logger = logging.getLogger(__name__)
 

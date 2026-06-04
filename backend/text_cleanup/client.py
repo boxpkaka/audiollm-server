@@ -135,7 +135,9 @@ async def clean_asr_text(
         resp.raise_for_status()
     except httpx.HTTPStatusError as exc:
         detail = exc.response.text[:500]
-        raise RuntimeError(f"text cleanup model returned HTTP {exc.response.status_code}: {detail}") from exc
+        raise RuntimeError(
+            f"text cleanup model returned HTTP {exc.response.status_code}: {detail}"
+        ) from exc
 
     raw_text = _content_to_text(resp.json()["choices"][0]["message"]["content"])
     return TextCleanupResult(
