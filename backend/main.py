@@ -24,7 +24,7 @@ from .emotion.service import EmotionDecodeError, decode_wav_capped
 from .emotion_spec.jobs import get_emotion_spec_job_store
 from .http_client import close_client
 from .session import AudioSession
-from .streaming import StreamingSession, VadSegmentedStream
+from .streaming import AstV3Protocol, StreamingSession, VadSegmentedStream
 from .tasks import AsrTaskEngine, EmotionTaskEngine
 from .text_cleanup import clean_asr_text
 from .text_cleanup.client import TextCleanupConfigError
@@ -64,6 +64,34 @@ async def transcribe_streaming_ws(websocket: WebSocket, language: str = ""):
         stream=VadSegmentedStream(),
         engine=AsrTaskEngine(),
         language=language,
+    )
+    try:
+        await session.run()
+    finally:
+        await session.cleanup()
+
+
+@app.websocket("/tuling/ast/v3")
+async def tuling_ast_v3_ws(websocket: WebSocket):
+    """iFlytek Tuling AST v3 streaming ASR.
+
+    Same VAD-segmented dual-ASR pipeline as ``/transcribe-streaming``, but the
+    on-the-wire framing is the AST v3 ``header/parameter/payload`` envelope:
+    audio arrives base64-encoded inside JSON frames, ``header.status`` (0/1/2)
+    drives start/stop, and results are repackaged into the ``payload.result``
+    lattice. ``AstV3Protocol`` owns all of that translation; the session,
+    stream, and engine are the shared ones. ``emit_timing`` lets the engine
+    surface segment ``bg``/``ed`` to the protocol.
+
+    See ``docs/tuling-ast-v3-protocol.md``.
+    """
+    await websocket.accept()
+    logger.info("Tuling AST v3 connected (/tuling/ast/v3)")
+    session = StreamingSession(
+        websocket,
+        stream=VadSegmentedStream(),
+        engine=AsrTaskEngine(emit_timing=True),
+        protocol=AstV3Protocol(),
     )
     try:
         await session.run()

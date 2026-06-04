@@ -68,6 +68,12 @@ class VadSegmentedStream:
     def __init__(self, *, enable_partial: bool | None = None) -> None:
         self.vad = VADProcessor()
         self._pcm_carry: np.ndarray = np.empty(0, dtype=np.float32)
+        # Running count of samples the VAD has processed across all feeds.
+        # Used to stamp each segment with an approximate session-timeline
+        # position (SegmentReady.start_ms/end_ms). Carry-over samples are
+        # counted in the feed that actually processes them, so this stays a
+        # continuous, monotonic clock.
+        self._consumed_samples: int = 0
         self._cfg: Config | None = None
         self._partial_interval: float = 0.5
         self._last_partial_time: float = 0.0
@@ -117,6 +123,7 @@ class VadSegmentedStream:
         cfg = self.cfg
         min_samples = int(SAMPLE_RATE * cfg.min_segment_duration_ms / 1000)
 
+        base = self._consumed_samples
         for i in range(0, used, hop):
             was_speaking = self.vad.is_speaking
             segment = self.vad.process(pcm[i : i + hop])
@@ -148,7 +155,10 @@ class VadSegmentedStream:
                 if announced:
                     events.append(SpeechDropped())
                 continue
-            events.append(SegmentReady(pcm=segment))
+            end_sample = base + i + hop
+            events.append(self._segment_with_timing(segment, end_sample))
+
+        self._consumed_samples = base + used
 
         if self._enable_partial and self.vad.is_speaking:
             now = time.monotonic()
@@ -182,8 +192,27 @@ class VadSegmentedStream:
             # placeholder announcement marker since this segment will
             # generate its own final.
             pass
-        events.append(SegmentReady(pcm=remaining, is_stop_flush=force))
+        events.append(
+            self._segment_with_timing(
+                remaining, self._consumed_samples, is_stop_flush=force
+            )
+        )
         return events
+
+    def _segment_with_timing(
+        self,
+        segment: np.ndarray,
+        end_sample: int,
+        *,
+        is_stop_flush: bool = False,
+    ) -> SegmentReady:
+        start_sample = max(0, end_sample - len(segment))
+        return SegmentReady(
+            pcm=segment,
+            is_stop_flush=is_stop_flush,
+            start_ms=start_sample * 1000.0 / SAMPLE_RATE,
+            end_ms=end_sample * 1000.0 / SAMPLE_RATE,
+        )
 
 
 class WholeUtteranceStream:

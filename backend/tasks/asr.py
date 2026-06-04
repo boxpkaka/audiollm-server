@@ -22,6 +22,15 @@ class AsrTaskEngine(BaseTaskEngine):
 
     name = "asr"
 
+    def __init__(self, *, emit_timing: bool = False) -> None:
+        # When True, ``final`` messages carry the segment's session-timeline
+        # position as ``bg_ms`` / ``ed_ms``. The native ``/transcribe-streaming``
+        # contract is plain ``{type,text,language}``, so this stays off by
+        # default and is only enabled for protocols that surface segment timing
+        # (AST v3's ``bg`` / ``ed``). The wire protocol consumes these internal
+        # fields; they never reach a native-framed client.
+        self._emit_timing = emit_timing
+
     # ------------------------------------------------------------------
     # Final segment -> final_asr / final
     # ------------------------------------------------------------------
@@ -90,13 +99,17 @@ class AsrTaskEngine(BaseTaskEngine):
         if not text:
             return False
 
-        return await ctx.send_json(
-            {
-                "type": "final",
-                "text": text,
-                "language": detected_lang,
-            }
-        )
+        payload: dict = {
+            "type": "final",
+            "text": text,
+            "language": detected_lang,
+        }
+        if self._emit_timing:
+            if seg.start_ms is not None:
+                payload["bg_ms"] = seg.start_ms
+            if seg.end_ms is not None:
+                payload["ed_ms"] = seg.end_ms
+        return await ctx.send_json(payload)
 
     # ------------------------------------------------------------------
     # Pseudo-streaming partial

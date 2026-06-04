@@ -15,10 +15,18 @@ class SegmentReady:
     ``is_stop_flush`` is True only when this event was produced by
     ``AudioStream.flush(force=True)`` after a ``stop`` message; engines may use
     this to distinguish the last segment of a session.
+
+    ``start_ms`` / ``end_ms`` are the segment's approximate position within the
+    session's audio timeline (measured from total PCM consumed by the stream,
+    so they ignore VAD's end-of-speech detection lag and tail trimming). They
+    default to ``None`` for streams/engines that don't track timing; only
+    protocols that surface segment timing (e.g. AST v3 ``bg``/``ed``) read them.
     """
 
     pcm: np.ndarray
     is_stop_flush: bool = False
+    start_ms: float | None = None
+    end_ms: float | None = None
 
 
 @dataclass

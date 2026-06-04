@@ -15,7 +15,6 @@ It does NOT know what "ASR" or "emotion" means; that lives in the engine.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -27,6 +26,7 @@ from ..asr.hotword import query_text_hotwords, sanitize_hotwords
 from ..config import Config, load_config
 from .audio_stream import AudioStream
 from .events import PartialSnapshot, SegmentReady, SpeechDropped, SpeechStarted
+from .protocol import ControlAction, NativeProtocol, PcmAction, WireProtocol
 
 if TYPE_CHECKING:
     from ..tasks.base import TaskEngine
@@ -93,10 +93,16 @@ class StreamingSession:
         stream: AudioStream,
         engine: "TaskEngine",
         language: str = "",
+        protocol: WireProtocol | None = None,
     ) -> None:
         self.ws = websocket
         self.stream = stream
         self.engine = engine
+        # The wire protocol owns on-the-wire framing; the rest of the session
+        # only ever deals in control dicts + PCM bytes. NativeProtocol is the
+        # historical 1:1 framing so existing endpoints are byte-for-byte
+        # unchanged when no protocol is supplied.
+        self.protocol: WireProtocol = protocol or NativeProtocol()
 
         self.cfg: Config = load_config()
         self.stream.configure(self.cfg)
@@ -137,6 +143,13 @@ class StreamingSession:
             await asyncio.gather(self._receive_loop(), self._work_loop())
         except Exception:
             logger.exception("StreamingSession[%s] error", self.engine.name)
+        finally:
+            # Protocols that frame an explicit end-of-session marker (e.g. AST
+            # v3's header.status=2) emit it here, after every queued segment
+            # has drained. Native framing returns None and sends nothing.
+            terminal = self.protocol.encode_terminal()
+            if terminal is not None:
+                await self._send_wire(terminal)
 
     async def cleanup(self) -> None:
         if self._partial_task and not self._partial_task.done():
@@ -151,15 +164,27 @@ class StreamingSession:
     # IO helpers
     # ------------------------------------------------------------------
 
-    async def _send_json(self, payload: dict[str, Any]) -> bool:
+    async def _send_wire(self, wire: dict[str, Any]) -> bool:
         if self._ws_closed:
             return False
         try:
-            await self.ws.send_json(payload)
+            await self.ws.send_json(wire)
             return True
         except (WebSocketDisconnect, RuntimeError):
             self._ws_closed = True
             return False
+
+    async def _send_json(self, payload: dict[str, Any]) -> bool:
+        """Encode an internal message via the active protocol and send it.
+
+        A protocol may suppress a message (return ``None``) when it has no
+        wire representation (e.g. AST v3 has no ``ready``); that is reported
+        as success so callers don't treat the no-op as a send failure.
+        """
+        wire = self.protocol.encode_outbound(payload)
+        if wire is None:
+            return not self._ws_closed
+        return await self._send_wire(wire)
 
     # ------------------------------------------------------------------
     # Receive loop: control messages + binary PCM
@@ -172,14 +197,21 @@ class StreamingSession:
                 if msg.get("type") == "websocket.disconnect":
                     break
 
-                if "text" in msg and msg["text"]:
-                    stop_after = await self._handle_text(msg["text"])
-                    if stop_after:
-                        break
-                elif "bytes" in msg and msg["bytes"]:
-                    if not self._started or self._stopped:
-                        continue
-                    await self._handle_pcm(msg["bytes"])
+                should_stop = False
+                for action in self.protocol.decode_inbound(msg):
+                    if isinstance(action, ControlAction):
+                        if await self._handle_control(action.ctrl):
+                            should_stop = True
+                            break
+                    elif isinstance(action, PcmAction):
+                        # PCM is only meaningful between start and stop; frames
+                        # outside that window (or before the protocol has
+                        # synthesized a start) are silently dropped.
+                        if not self._started or self._stopped:
+                            continue
+                        await self._handle_pcm(action.data)
+                if should_stop:
+                    break
         except WebSocketDisconnect:
             logger.info("WebSocket disconnected (%s)", self.engine.name)
         finally:
@@ -188,10 +220,8 @@ class StreamingSession:
                 await self._dispatch_stream_event(ev)
             await self._work_queue.put(_SENTINEL)
 
-    async def _handle_text(self, text: str) -> bool:
-        ctrl = self._parse_json(text)
-        if ctrl is None:
-            return False
+    async def _handle_control(self, ctrl: dict) -> bool:
+        """Dispatch one already-parsed control message; return True to stop."""
         msg_type = ctrl.get("type", "")
         if msg_type == "start":
             await self._handle_start(ctrl)
@@ -211,13 +241,6 @@ class StreamingSession:
         except Exception:
             logger.exception("engine.on_control failed for %s", msg_type)
         return False
-
-    def _parse_json(self, text: str) -> dict | None:
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            logger.warning("Invalid JSON from client: %.200s", text)
-            return None
 
     async def _handle_start(self, ctrl: dict) -> None:
         if self._started:

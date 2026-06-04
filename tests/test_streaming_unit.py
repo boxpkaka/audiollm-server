@@ -15,6 +15,8 @@ Run with:
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import sys
 from pathlib import Path
 
@@ -31,6 +33,12 @@ from backend.streaming.audio_stream import (  # noqa: E402
     WholeUtteranceStream,
 )
 from backend.streaming.events import PartialSnapshot, SegmentReady  # noqa: E402
+from backend.streaming.protocol import (  # noqa: E402
+    AstV3Protocol,
+    ControlAction,
+    NativeProtocol,
+    PcmAction,
+)
 from backend.streaming.session import (  # noqa: E402
     SessionContext,
     StreamingSession,
@@ -620,3 +628,285 @@ def test_map_language_codes():
     assert map_language("English") == "English"
     assert map_language("") == "N/A"
     assert map_language("xx") == "N/A"
+
+
+# ---------------------------------------------------------------------------
+# AST v3 wire protocol (iFlytek Tuling)
+# ---------------------------------------------------------------------------
+
+
+def _ast_frame(header=None, parameter=None, payload=None) -> dict:
+    """Build a raw WebSocket text-frame dict carrying an AST v3 envelope."""
+    env = {
+        "header": header or {},
+        "parameter": parameter or {},
+        "payload": payload or {},
+    }
+    return {"text": json.dumps(env)}
+
+
+def _b64_pcm(n_samples: int) -> str:
+    return base64.b64encode(np.zeros(n_samples, dtype=np.int16).tobytes()).decode()
+
+
+def test_native_protocol_is_identity_passthrough():
+    """The default protocol must keep the historical 1:1 framing intact."""
+    p = NativeProtocol()
+    acts = p.decode_inbound({"text": '{"type":"start"}'})
+    assert len(acts) == 1 and isinstance(acts[0], ControlAction)
+    assert acts[0].ctrl == {"type": "start"}
+
+    acts = p.decode_inbound({"bytes": b"\x00\x01"})
+    assert len(acts) == 1 and isinstance(acts[0], PcmAction)
+    assert acts[0].data == b"\x00\x01"
+
+    assert p.decode_inbound({"text": "not json"}) == []
+
+    msg = {"type": "final", "text": "x"}
+    assert p.encode_outbound(msg) is msg
+    assert p.encode_terminal() is None
+
+
+def test_ast_v3_first_frame_synthesizes_start_with_hotwords():
+    p = AstV3Protocol()
+    pcm = np.zeros(160, dtype=np.int16).tobytes()
+    acts = p.decode_inbound(
+        _ast_frame(
+            header={"traceId": "t1", "appId": "a", "bizId": "b", "status": 0},
+            payload={
+                "text": {"text": "挚音科技,张硕"},
+                "audio": {"audio": base64.b64encode(pcm).decode()},
+            },
+        )
+    )
+    assert isinstance(acts[0], ControlAction)
+    assert acts[0].ctrl["type"] == "start"
+    assert acts[0].ctrl["hotwords"] == ["挚音科技", "张硕"]
+    assert isinstance(acts[1], PcmAction)
+    assert acts[1].data == pcm
+    assert p.trace_id == "t1"
+    assert p.sid.startswith("AST_")
+
+
+def test_ast_v3_residlist_maps_to_enrollment_id():
+    """header.resIdList[0] becomes the target-speaker enrollment id."""
+    p = AstV3Protocol()
+    acts = p.decode_inbound(
+        _ast_frame(header={"traceId": "t", "status": 0, "resIdList": ["enr-abc"]})
+    )
+    assert acts[0].ctrl["type"] == "start"
+    assert acts[0].ctrl["enrollment_id"] == "enr-abc"
+
+
+def test_ast_v3_residlist_only_uses_first_entry():
+    """Multiple resIdList entries: only the first is used (no multi-speaker)."""
+    p = AstV3Protocol()
+    acts = p.decode_inbound(
+        _ast_frame(header={"status": 0, "resIdList": ["one", "two", "three"]})
+    )
+    assert acts[0].ctrl["enrollment_id"] == "one"
+
+
+def test_ast_v3_no_enrollment_when_residlist_absent_or_empty():
+    for res in (None, [], [None]):
+        p = AstV3Protocol()
+        header = {"status": 0} if res is None else {"status": 0, "resIdList": res}
+        acts = p.decode_inbound(_ast_frame(header=header))
+        assert "enrollment_id" not in acts[0].ctrl, f"resIdList={res!r}"
+
+
+def test_ast_v3_status_two_appends_stop():
+    p = AstV3Protocol()
+    p.decode_inbound(_ast_frame(header={"status": 0}))
+    acts = p.decode_inbound(
+        _ast_frame(header={"status": 2}, payload={"audio": {"audio": _b64_pcm(80)}})
+    )
+    # Trailing audio is fed before the synthesized stop.
+    assert isinstance(acts[0], PcmAction)
+    assert acts[-1] == ControlAction({"type": "stop"})
+
+
+def test_ast_v3_status_is_parsed_leniently():
+    """A client encoding status as a string must still drive the state machine."""
+    p = AstV3Protocol()
+    p.decode_inbound(_ast_frame(header={"status": "0"}))
+    acts = p.decode_inbound(_ast_frame(header={"status": "2"}))
+    assert acts[-1] == ControlAction({"type": "stop"})
+
+
+def test_ast_v3_strips_leading_wav_header():
+    """The reference Java SDK chunks an entire .wav; the header must be stripped."""
+    from backend.audio.utils import pcm_to_wav_bytes
+
+    p = AstV3Protocol()
+    wav = pcm_to_wav_bytes(np.zeros(800, dtype=np.float32))  # 44B header + 1600B PCM
+    acts = p.decode_inbound(
+        _ast_frame(
+            header={"status": 0},
+            payload={"audio": {"audio": base64.b64encode(wav).decode()}},
+        )
+    )
+    pcm_actions = [a for a in acts if isinstance(a, PcmAction)]
+    assert pcm_actions and len(pcm_actions[0].data) == 1600
+
+
+def test_ast_v3_raw_pcm_and_odd_byte_realignment():
+    """Non-WAV streams pass through as PCM; odd-length chunks never lose bytes."""
+    p = AstV3Protocol()
+    p.decode_inbound(_ast_frame(header={"status": 0}))  # resolves start, no audio
+
+    chunk1 = bytes(range(13))  # odd length, not RIFF
+    a1 = p.decode_inbound(
+        _ast_frame(
+            header={"status": 1},
+            payload={"audio": {"audio": base64.b64encode(chunk1).decode()}},
+        )
+    )
+    pcm1 = b"".join(a.data for a in a1 if isinstance(a, PcmAction))
+    assert len(pcm1) == 12  # trailing odd byte carried for 16-bit alignment
+
+    chunk2 = bytes([99])
+    a2 = p.decode_inbound(
+        _ast_frame(
+            header={"status": 1},
+            payload={"audio": {"audio": base64.b64encode(chunk2).decode()}},
+        )
+    )
+    pcm2 = b"".join(a.data for a in a2 if isinstance(a, PcmAction))
+    assert pcm1 + pcm2 == chunk1 + chunk2  # no bytes lost across realignment
+
+
+def test_ast_v3_final_frame_units_and_counters():
+    p = AstV3Protocol()
+    p.decode_inbound(_ast_frame(header={"traceId": "tt", "status": 0}))
+
+    f1 = p.encode_outbound(
+        {
+            "type": "final",
+            "text": "你好",
+            "language": "Chinese",
+            "bg_ms": 140.0,
+            "ed_ms": 3230.0,
+        }
+    )
+    assert f1["header"]["status"] == 1
+    assert f1["header"]["code"] == 0
+    assert f1["header"]["sid"] == p.sid
+    assert f1["header"]["traceId"] == "tt"
+    r = f1["payload"]["result"]
+    assert r["segId"] == 0 and r["sn"] == 1
+    assert r["msgtype"] == "sentence"
+    # result.bg/ed in ms; vad + word offsets in 10ms frames.
+    assert r["bg"] == 140 and r["ed"] == 3230
+    assert r["vad"]["ws"] == [{"bg": 14, "ed": 323}]
+    cw = r["ws"][0]["cw"][0]
+    assert cw["w"] == "你好" and cw["lg"] == "zh"
+    assert cw["wb"] == 14 and cw["we"] == 323 and cw["wp"] == "n"
+
+    f2 = p.encode_outbound({"type": "final", "text": "兄弟", "language": "zh"})
+    assert f2["payload"]["result"]["segId"] == 1
+    assert f2["payload"]["result"]["sn"] == 2
+
+
+def test_ast_v3_partial_progressive_shares_seg_id():
+    p = AstV3Protocol()
+    p.decode_inbound(_ast_frame(header={"status": 0}))
+    part = p.encode_outbound({"type": "partial", "text": "你", "language": "zh"})
+    r = part["payload"]["result"]
+    assert r["msgtype"] == "Progressive"
+    assert r["segId"] == 0  # same segment the upcoming sentence will carry
+    assert r["ws"][0]["cw"][0]["w"] == "你"
+    # sentence-only fields are omitted for Progressive
+    assert "sn" not in r and "vad" not in r and "bg" not in r
+
+
+def test_ast_v3_suppresses_empty_final_ready_and_extract():
+    p = AstV3Protocol()
+    assert p.encode_outbound({"type": "final", "text": "", "language": "zh"}) is None
+    assert p.encode_outbound({"type": "ready"}) is None
+    assert (
+        p.encode_outbound(
+            {"type": "extract_hotwords_result", "request_id": "x", "hotwords": []}
+        )
+        is None
+    )
+
+
+def test_ast_v3_error_frame_nonzero_code():
+    p = AstV3Protocol()
+    err = p.encode_outbound({"type": "error", "message": "boom"})
+    assert err["header"]["code"] != 0
+    assert err["header"]["message"] == "boom"
+    assert "payload" not in err  # SDK returns on code!=0 before reading payload
+
+
+def test_ast_v3_terminal_is_status_two_and_idempotent():
+    p = AstV3Protocol()
+    p.encode_outbound({"type": "final", "text": "hi", "language": "zh"})  # advances seg
+    term = p.encode_terminal()
+    assert term["header"]["status"] == 2
+    assert term["payload"]["result"]["ls"] is True
+    assert "ws" not in term["payload"]["result"]  # getWs() == null -> SDK skips
+    assert p.encode_terminal() is None  # emitted at most once
+
+
+class _AstFinalEngine(BaseTaskEngine):
+    """Minimal engine that forwards a segment as a final with its timing."""
+
+    name = "ast-final"
+
+    async def handle_segment(self, seg, ctx):
+        return await ctx.send_json(
+            {
+                "type": "final",
+                "text": "hello",
+                "language": "zh",
+                "bg_ms": seg.start_ms,
+                "ed_ms": seg.end_ms,
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_session_with_ast_v3_protocol_end_to_end():
+    seg = SegmentReady(
+        pcm=np.ones(800, dtype=np.float32) * 0.1, start_ms=100.0, end_ms=600.0
+    )
+    stream = _ScriptedStream(feed_events=[[seg]], flush_events=[])
+    engine = _AstFinalEngine()
+    ws = FakeWebSocket(
+        [
+            _ast_frame(
+                header={"traceId": "tid", "status": 0},
+                payload={"audio": {"audio": _b64_pcm(160)}},
+            ),
+            _ast_frame(
+                header={"status": 2},
+                payload={"audio": {"audio": _b64_pcm(160)}},
+            ),
+        ]
+    )
+
+    session = StreamingSession(
+        ws, stream=stream, engine=engine, protocol=AstV3Protocol()
+    )
+    await session.run()
+    await session.cleanup()
+
+    # No native 'ready' leaks; every outbound frame is an AST v3 envelope.
+    assert ws.sent, "expected at least the terminal frame"
+    assert all("header" in m and "sid" in m["header"] for m in ws.sent)
+
+    statuses = [m["header"]["status"] for m in ws.sent]
+    assert statuses[-1] == 2  # terminal end-of-session frame is last
+
+    sentence = next(
+        m
+        for m in ws.sent
+        if m["header"]["status"] == 1
+        and m.get("payload", {}).get("result", {}).get("msgtype") == "sentence"
+    )
+    assert sentence["header"]["traceId"] == "tid"
+    assert sentence["payload"]["result"]["bg"] == 100
+    assert sentence["payload"]["result"]["ed"] == 600
+    assert sentence["payload"]["result"]["ws"][0]["cw"][0]["w"] == "hello"
