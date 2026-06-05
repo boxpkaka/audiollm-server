@@ -198,6 +198,83 @@ class Config:
         # which is the right behavior for in-process overrides.
         return replace(self, **accepted) if accepted else self
 
+    def override_client(self, **kwargs: Any) -> Config:
+        """Like :meth:`override` but only honors client-overridable fields.
+
+        For untrusted per-connection overrides (WebSocket ``start.config`` and
+        AST v3 ``parameter.asr_config``). Infrastructure / secret / process-wide
+        fields (model URLs -> SSRF, API keys, HTTP pools, job queues) are not in
+        ``CLIENT_OVERRIDABLE_FIELDS`` and are dropped with a WARN: an operator
+        can see a client reaching for a restricted knob, while the long-lived
+        connection is never broken. Type coercion and dataclass invariants are
+        delegated to :meth:`override`.
+        """
+        allowed: dict[str, Any] = {}
+        for k, v in kwargs.items():
+            if k in CLIENT_OVERRIDABLE_FIELDS:
+                allowed[k] = v
+            else:
+                logger.warning(
+                    "Ignoring non-overridable config field from client: %s", k
+                )
+        return self.override(**allowed)
+
+
+# Per-connection client overrides are restricted to this whitelist. Guiding
+# line: a field is overridable only if it tunes how *this session* processes its
+# own audio. Process-wide knobs (HTTP pools, job queues, cache capacity), backend
+# routing (``*_vllm_base_url`` -> SSRF, ``*_model_name``) and secrets
+# (``text_cleanup_api_key*``) are intentionally excluded so an untrusted client
+# cannot reach them via ``start.config`` / ``parameter.asr_config``.
+CLIENT_OVERRIDABLE_FIELDS: frozenset[str] = frozenset({
+    # VAD / segmentation
+    "vad_threshold",
+    "silence_duration_ms",
+    "vad_smoothing_alpha",
+    "vad_start_frames",
+    "vad_pre_speech_ms",
+    "vad_end_frames",
+    "vad_keep_tail_ms",
+    "min_segment_duration_ms",
+    # Pseudo-streaming partials
+    "enable_pseudo_stream",
+    "pseudo_stream_interval_ms",
+    # ASR model combination / timeouts
+    "enable_primary_asr",
+    "enable_secondary_asr",
+    "enable_dual_asr_fusion",
+    "primary_asr_timeout",
+    "asr_request_timeout",
+    "debug_show_dual_asr",
+    # Dual-model fusion thresholds
+    "fusion_similarity_threshold",
+    "fusion_min_primary_score",
+    "fusion_max_repetition_ratio",
+    "fusion_disagreement_threshold",
+    "fusion_hotword_boost",
+    "fusion_primary_score_margin",
+    # TS-ASR enrollment bounds
+    "asr_enrollment_min_sec",
+    "asr_enrollment_max_sec",
+    "asr_enrollment_ttl_sec",
+    # Emotion (baseline + paralinguistic spec) per-request tuning
+    "emotion_task_mode",
+    "emotion_request_timeout",
+    "emotion_max_audio_seconds",
+    "emotion_spec_task_mode",
+    "emotion_spec_request_timeout",
+    "emotion_spec_max_audio_seconds",
+})
+
+# Fail-fast: a whitelisted name that is not a real Config field is a typo that
+# would silently make a knob un-overridable forever, so reject it at import.
+_unknown_overridable = CLIENT_OVERRIDABLE_FIELDS - {f.name for f in fields(Config)}
+if _unknown_overridable:
+    raise ValueError(
+        "CLIENT_OVERRIDABLE_FIELDS has unknown Config fields: "
+        f"{sorted(_unknown_overridable)}"
+    )
+
 
 def load_config(path: Path | None = None) -> Config:
     raw = _flatten(_load_json(path or _CONFIG_PATH))

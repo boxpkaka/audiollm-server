@@ -260,6 +260,15 @@ class AstV3Protocol:
             enrollment_id = self._extract_enrollment_id(header)
             if enrollment_id:
                 start_ctrl["enrollment_id"] = enrollment_id
+            # parameter.asr_config is this service's per-connection tuning slot
+            # (distinct from the log-only iFlytek engine block). language is not
+            # a Config field so it rides start.language; the rest becomes
+            # start.config and is whitelist-filtered downstream in the session.
+            language, cfg_overrides = self._extract_asr_config(parameter)
+            if language:
+                start_ctrl["language"] = language
+            if cfg_overrides:
+                start_ctrl["config"] = cfg_overrides
             actions.append(ControlAction(start_ctrl))
 
         pcm = self._decode_audio(payload)
@@ -290,6 +299,25 @@ class AstV3Protocol:
         if isinstance(res_ids, list) and res_ids and res_ids[0] is not None:
             return str(res_ids[0]).strip()
         return ""
+
+    @staticmethod
+    def _extract_asr_config(parameter: dict) -> tuple[str, dict]:
+        """Split ``parameter.asr_config`` into ``(language, config-overrides)``.
+
+        ``asr_config`` is this service's extension slot for per-connection
+        tuning; the iFlytek ``parameter.engine`` block stays log-only. The
+        ``language`` key is pulled out because it is not a ``Config`` field (the
+        session maps it separately via ``start.language``); every other key is
+        forwarded verbatim as ``start.config`` and is whitelist-filtered by
+        ``Config.override_client`` downstream, so no validation happens here.
+        Returns ``("", {})`` when the slot is absent or not a dict.
+        """
+        cfg = parameter.get("asr_config")
+        if not isinstance(cfg, dict) or not cfg:
+            return "", {}
+        overrides = dict(cfg)
+        language = str(overrides.pop("language", "") or "").strip()
+        return language, overrides
 
     def _decode_audio(self, payload: dict) -> bytes:
         audio_obj = payload.get("audio")

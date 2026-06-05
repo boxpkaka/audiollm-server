@@ -250,7 +250,9 @@ class StreamingSession:
 
         client_config = ctrl.get("config")
         if isinstance(client_config, dict) and client_config:
-            self.cfg = self.cfg.override(**client_config)
+            # Untrusted per-connection override: only whitelisted tuning knobs
+            # are honored; infra/secret fields are dropped (see override_client).
+            self.cfg = self.cfg.override_client(**client_config)
             self.ctx.cfg = self.cfg
             self.stream.configure(self.cfg)
             logger.info("Config overridden by client: %s", list(client_config.keys()))

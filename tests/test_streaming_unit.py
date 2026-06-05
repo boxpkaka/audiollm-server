@@ -688,6 +688,47 @@ def test_ast_v3_first_frame_synthesizes_start_with_hotwords():
     assert p.sid.startswith("AST_")
 
 
+def test_ast_v3_asr_config_injects_config_and_language():
+    """parameter.asr_config -> start.config; language splits out to start.language."""
+    p = AstV3Protocol()
+    acts = p.decode_inbound(
+        _ast_frame(
+            header={"status": 0},
+            parameter={
+                "asr_config": {
+                    "language": "en",
+                    "vad_threshold": 0.3,
+                    "enable_pseudo_stream": False,
+                }
+            },
+        )
+    )
+    ctrl = acts[0].ctrl
+    assert ctrl["type"] == "start"
+    assert ctrl["language"] == "en"
+    assert ctrl["config"] == {"vad_threshold": 0.3, "enable_pseudo_stream": False}
+
+
+def test_ast_v3_no_asr_config_omits_config_and_language():
+    """Without parameter.asr_config, the synthesized start carries neither key."""
+    p = AstV3Protocol()
+    acts = p.decode_inbound(_ast_frame(header={"status": 0}, parameter={"engine": {}}))
+    ctrl = acts[0].ctrl
+    assert "config" not in ctrl
+    assert "language" not in ctrl
+
+
+def test_ast_v3_asr_config_language_only():
+    """asr_config with only language yields start.language and no empty config."""
+    p = AstV3Protocol()
+    acts = p.decode_inbound(
+        _ast_frame(header={"status": 0}, parameter={"asr_config": {"language": "zh"}})
+    )
+    ctrl = acts[0].ctrl
+    assert ctrl["language"] == "zh"
+    assert "config" not in ctrl
+
+
 def test_ast_v3_residlist_maps_to_enrollment_id():
     """header.resIdList[0] becomes the target-speaker enrollment id."""
     p = AstV3Protocol()
@@ -910,3 +951,35 @@ async def test_session_with_ast_v3_protocol_end_to_end():
     assert sentence["payload"]["result"]["bg"] == 100
     assert sentence["payload"]["result"]["ed"] == 600
     assert sentence["payload"]["result"]["ws"][0]["cw"][0]["w"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_session_ast_v3_asr_config_overrides_and_whitelist():
+    """End-to-end: parameter.asr_config tunes the session cfg; infra fields drop."""
+    stream = _ScriptedStream(feed_events=[], flush_events=[])
+    engine = _RecorderEngine()
+    ws = FakeWebSocket(
+        [
+            _ast_frame(
+                header={"status": 0},
+                parameter={
+                    "asr_config": {
+                        "vad_threshold": 0.37,
+                        "vllm_base_url": "http://evil:1",
+                    }
+                },
+                payload={"audio": {"audio": _b64_pcm(160)}},
+            ),
+            _ast_frame(header={"status": 2}),
+        ]
+    )
+    session = StreamingSession(
+        ws, stream=stream, engine=engine, protocol=AstV3Protocol()
+    )
+    base_url_before = session.cfg.vllm_base_url
+    await session.run()
+    await session.cleanup()
+
+    assert session.cfg.vad_threshold == 0.37  # whitelisted -> applied
+    assert session.cfg.vllm_base_url == base_url_before  # infra field dropped
+    assert stream.cfg.vad_threshold == 0.37  # stream reconfigured with new cfg

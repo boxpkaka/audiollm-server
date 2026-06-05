@@ -25,7 +25,7 @@
 | `/emotion-segmented-streaming` | 分段情感识别 | 长连接中按 VAD 语音段持续返回情感 | 多条 `final_emotion` |
 | `/tuling/ast/v3` | 通用流式 ASR（讯飞图灵 AST v3 协议） | 对接讯飞 tuling-ast-sdk 或按 AST v3 信封集成 | `payload.result` 词图（msgtype sentence / Progressive） |
 
-`/tuling/ast/v3` 与上面两个任务接口的转写能力一致，但线上协议不同：音频以 base64 放在 JSON 帧，`header.status`（0/1/2）驱动状态机，无 `ready`/`start`/`stop`，结果为词图结构。它支持热词（`payload.text.text`）与目标说话人（先经 `POST /api/asr/enrollment` 注册，再把 id 放进首帧 `header.resIdList[0]`）。它不遵循下文“WebSocket 调用流程”，详见 [实时转写 AST v3 WebSocket](tuling-ast-v3-protocol.md)。
+`/tuling/ast/v3` 与上面两个任务接口的转写能力一致，但线上协议不同：音频以 base64 放在 JSON 帧，`header.status`（0/1/2）驱动状态机，无 `ready`/`start`/`stop`，结果为词图结构。它支持热词（`payload.text.text`）、目标说话人（先经 `POST /api/asr/enrollment` 注册，再把 id 放进首帧 `header.resIdList[0]`）与配置覆写（首帧 `parameter.asr_config`，等价于其他端点的 `start.config`）。它不遵循下文“WebSocket 调用流程”，详见 [实时转写 AST v3 WebSocket](tuling-ast-v3-protocol.md)。
 
 `/ws/audio` 是浏览器 Demo 使用的调试接口，包含前端专用消息和双模型调试视图。第三方系统集成建议优先使用上表中的任务接口。
 
@@ -74,17 +74,20 @@ bytes_per_ms = 16000 * 1 * 2 / 1000 = 32
 
 ### 临时配置覆写
 
-参数取值优先级（后者覆盖前者）：`backend/config.py` 内置默认 → `backend/config.json` 服务端默认（实际生效默认值，重启生效）→ `start.config` 客户端临时覆写（仅当前连接生效、不落盘）。`config.py` 内置默认与 `config.json` 不一致时以 `config.json` 为准，内置默认仅为文件缺字段时的兜底。
+参数取值优先级（后者覆盖前者）：`backend/config.py` 内置默认 → `backend/config.json` 服务端默认（实际生效默认值，重启生效）→ 客户端临时覆写（仅当前连接生效、不落盘）。`config.py` 内置默认与 `config.json` 不一致时以 `config.json` 为准，内置默认仅为文件缺字段时的兜底。
 
-`start.config` 可覆写服务端允许的配置字段，仅对当前连接生效，只接受扁平字段名（与 `config.json` 是否分组无关），传入非法值或未知字段会被忽略并保持服务端默认。常用字段如下：
+客户端临时覆写对三个 WebSocket 端点统一生效，承载位置不同：`/transcribe-streaming` 与 `/emotion-segmented-streaming` 用 `start.config`，`/tuling/ast/v3` 用首帧 `parameter.asr_config`（见 [实时转写 AST v3 WebSocket](tuling-ast-v3-protocol.md)）。两者都只接受扁平字段名（与 `config.json` 是否分组无关）。
+
+覆写字段受服务端白名单（`backend/config.py` 的 `CLIENT_OVERRIDABLE_FIELDS`）约束：只放调参类字段；模型地址（`*_vllm_base_url`，避免 SSRF）、密钥（`text_cleanup_api_key*`）、连接池与任务队列等进程级基础设施字段不可覆写。白名单外字段、未知字段与非法值都会被忽略并保持服务端默认，不会中断连接。完整白名单按类别如下：
 
 | 类别 | 字段 |
 |---|---|
-| VAD / 分段 | `vad_threshold`、`silence_duration_ms`、`min_segment_duration_ms` |
-| ASR | `enable_pseudo_stream`、`pseudo_stream_interval_ms`、`asr_request_timeout` |
-| ASR 模型组合 | `enable_primary_asr`、`enable_secondary_asr`、`enable_dual_asr_fusion` |
-| TS-ASR | `asr_enrollment_min_sec`、`asr_enrollment_max_sec`、`asr_enrollment_ttl_sec` |
-| 情感 | `emotion_task_mode`、`emotion_request_timeout`、`emotion_max_audio_seconds` |
+| VAD / 分段 | vad_threshold、silence_duration_ms、vad_smoothing_alpha、vad_start_frames、vad_pre_speech_ms、vad_end_frames、vad_keep_tail_ms、min_segment_duration_ms |
+| 伪流式 | enable_pseudo_stream、pseudo_stream_interval_ms |
+| ASR 模型组合 / 超时 | enable_primary_asr、enable_secondary_asr、enable_dual_asr_fusion、primary_asr_timeout、asr_request_timeout、debug_show_dual_asr |
+| 融合阈值 | fusion_similarity_threshold、fusion_min_primary_score、fusion_max_repetition_ratio、fusion_disagreement_threshold、fusion_hotword_boost、fusion_primary_score_margin |
+| TS-ASR | asr_enrollment_min_sec、asr_enrollment_max_sec、asr_enrollment_ttl_sec |
+| 情感（仅情感端点有效） | emotion_task_mode、emotion_request_timeout、emotion_max_audio_seconds、emotion_spec_task_mode、emotion_spec_request_timeout、emotion_spec_max_audio_seconds |
 
 ASR 模型组合开关的语义矩阵（`enable_dual_asr_fusion=true` 但 `enable_secondary_asr=false` 会在 load 时自动降级为 false）：
 
@@ -108,6 +111,8 @@ ASR 模型组合开关的语义矩阵（`enable_dual_asr_fusion=true` 但 `enabl
   }
 }
 ```
+
+`/tuling/ast/v3` 没有 `start` 消息，等价覆写是把上面 `config` 里的字段放进首帧 `parameter.asr_config`（另可选 `language`），详见 [实时转写 AST v3 WebSocket](tuling-ast-v3-protocol.md)。
 
 ## REST 上传调用
 

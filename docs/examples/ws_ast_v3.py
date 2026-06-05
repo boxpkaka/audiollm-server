@@ -19,7 +19,8 @@ from audio_common import chunk_bytes, make_ssl_context, read_audio_as_pcm
 
 
 def _frame(status: int, *, trace_id: str, app_id: str, biz_id: str,
-           audio: bytes, hotwords: str = "", enrollment_id: str = "") -> str:
+           audio: bytes, hotwords: str = "", enrollment_id: str = "",
+           asr_config: dict | None = None) -> str:
     header: dict[str, object] = {"traceId": trace_id, "status": status}
     if app_id:
         header["appId"] = app_id
@@ -29,13 +30,43 @@ def _frame(status: int, *, trace_id: str, app_id: str, biz_id: str,
     # POST /api/asr/enrollment to obtain it).
     if enrollment_id:
         header["resIdList"] = [enrollment_id]
+    # engine stays log-only; asr_config carries per-connection config overrides.
+    parameter: dict[str, object] = {"engine": {}}
+    if asr_config:
+        parameter["asr_config"] = asr_config
     payload: dict[str, object] = {"audio": {"audio": base64.b64encode(audio).decode()}}
     if hotwords:
         payload["text"] = {"text": hotwords}
     return json.dumps(
-        {"header": header, "parameter": {"engine": {}}, "payload": payload},
+        {"header": header, "parameter": parameter, "payload": payload},
         ensure_ascii=False,
     )
+
+
+def _build_asr_config(args: argparse.Namespace) -> dict:
+    """Assemble parameter.asr_config from --config KEY=VALUE plus shortcuts.
+
+    Each value is parsed as JSON when possible (so 0.45 -> float, false -> bool,
+    300 -> int), otherwise kept as a string. The server whitelists and coerces
+    fields, so unknown or restricted keys are simply ignored downstream.
+    """
+    cfg: dict[str, object] = {}
+    for item in args.config:
+        key, sep, val = item.partition("=")
+        if not sep:
+            continue
+        key = key.strip()
+        try:
+            cfg[key] = json.loads(val)
+        except json.JSONDecodeError:
+            cfg[key] = val
+    if args.language:
+        cfg["language"] = args.language
+    if args.vad_threshold is not None:
+        cfg["vad_threshold"] = args.vad_threshold
+    if args.no_pseudo_stream:
+        cfg["enable_pseudo_stream"] = False
+    return cfg
 
 
 async def main_async(args: argparse.Namespace) -> None:
@@ -46,6 +77,8 @@ async def main_async(args: argparse.Namespace) -> None:
     chunks = [pcm[off : off + chunk_size] for off in range(0, max(len(pcm), 1), chunk_size)]
     if not chunks:
         chunks = [b""]
+
+    asr_config = _build_asr_config(args)
 
     async with websockets.connect(args.url, ssl=ssl_ctx, open_timeout=args.timeout) as ws:
         recv_task = asyncio.create_task(receive_messages(ws))
@@ -58,9 +91,10 @@ async def main_async(args: argparse.Namespace) -> None:
                     app_id=args.app_id,
                     biz_id=args.biz_id,
                     audio=chunk,
-                    # Hotwords + enrollment ride the first frame only.
+                    # Hotwords + enrollment + asr_config ride the first frame only.
                     hotwords=args.hotwords if i == 0 else "",
                     enrollment_id=args.enrollment_id if i == 0 else "",
+                    asr_config=asr_config if i == 0 else None,
                 )
             )
             await asyncio.sleep(args.chunk_ms / 1000)
@@ -110,6 +144,14 @@ def parse_args() -> argparse.Namespace:
                         help="Comma-separated hotwords (first frame only)")
     parser.add_argument("--enrollment-id", default="",
                         help="Target-speaker id from POST /api/asr/enrollment")
+    parser.add_argument("--language", default="",
+                        help="会话语言代码，写入 parameter.asr_config.language")
+    parser.add_argument("--vad-threshold", type=float, default=None,
+                        help="覆写 VAD 阈值 parameter.asr_config.vad_threshold")
+    parser.add_argument("--no-pseudo-stream", action="store_true",
+                        help="关闭伪流式中间结果 enable_pseudo_stream=false")
+    parser.add_argument("--config", action="append", default=[], metavar="KEY=VALUE",
+                        help="通用 parameter.asr_config 覆写，可多次，如 --config silence_duration_ms=300")
     parser.add_argument("--trace-id", default="ast-v3-demo",
                         help="header.traceId (echoed back)")
     parser.add_argument("--biz-id", default="12345", help="header.bizId (required field)")

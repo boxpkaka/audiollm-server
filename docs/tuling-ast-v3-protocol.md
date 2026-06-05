@@ -14,7 +14,7 @@
 | 鉴权 | 无内置鉴权 |
 | 音频输入 | base64 编码的 16 kHz、mono、signed 16-bit little-endian PCM；首帧若为带 RIFF/WAVE 头的整段音频会自动剥离文件头 |
 | 分段策略 | 服务端 VAD 自动切段 |
-| 中间结果 | 支持，msgtype 为 Progressive，受 `enable_pseudo_stream` 影响 |
+| 中间结果 | 支持，msgtype 为 Progressive，受 `enable_pseudo_stream` 影响，可经 `parameter.asr_config` 覆写 |
 | 最终结果 | 每个语音段一条，msgtype 为 sentence；尾帧（status=2）后 flush 残余音频 |
 
 ## 调用流程
@@ -75,6 +75,7 @@ Client                                      Server
 | 字段 | 类型 | 必传 | 说明 |
 |---|---|---|---|
 | engine | Map | 否 | 引擎透传参数，仅记录日志，当前不映射到任何行为（见已知限制）。兼容 SDK 使用的 parameter.service |
+| asr_config | Map | 否 | 本服务扩展的 per-connection 配置覆写，仅首帧（status=0）读取，仅当前连接生效、不落盘。详见“配置覆写”章节 |
 
 ### payload
 
@@ -92,6 +93,49 @@ Client                                      Server
 | 2 | 尾帧 | 先送本帧音频，再 flush 残余音频结束会话 |
 
 音频建议：每帧约 4096 字节（讯飞 SDK 默认 `32 * 128`），原则上单帧不超过 16 KB，建议至少 40 ms 语音。正常处理过程中客户端不要主动断开。首帧允许携带带 WAV 头的整段音频前缀，服务端会一次性剥离文件头后按裸 PCM 处理。
+
+## 配置覆写（parameter.asr_config）
+
+`parameter.asr_config` 是本服务在 AST v3 信封上的扩展槽位，用于按连接临时调参，与讯飞 `parameter.engine`（仅记录日志、不映射行为）并列、互不影响。仅在首帧（status=0）读取，仅对当前连接生效、不落盘；新连接或服务重启都回到服务端默认。
+
+取值优先级（后者覆盖前者）：`backend/config.py` 内置默认 → `backend/config.json` 服务端默认 → `parameter.asr_config` 客户端临时覆写。
+
+只接受白名单内的扁平字段名；未知字段、受限字段（模型地址、密钥、连接池/队列等基础设施项）以及非法值会被忽略并保持服务端默认，不会中断连接。`language` 是特例：它不是配置字段，会被用作本次会话语言（等价于 `/transcribe-streaming` 的 `start.language`）。
+
+可覆写字段与 `/transcribe-streaming` 的 `start.config` 共用同一白名单。下表为对本端点有效的 ASR 相关字段，每个字段语义见 [通用流式 ASR WebSocket](transcribe-streaming-protocol.md) 与 [API 总览](api-reference.md) 的“临时配置覆写”：
+
+| 类别 | 字段 |
+|---|---|
+| VAD / 分段 | vad_threshold、silence_duration_ms、vad_smoothing_alpha、vad_start_frames、vad_pre_speech_ms、vad_end_frames、vad_keep_tail_ms、min_segment_duration_ms |
+| 伪流式 | enable_pseudo_stream、pseudo_stream_interval_ms |
+| ASR 模型组合 / 超时 | enable_primary_asr、enable_secondary_asr、enable_dual_asr_fusion、primary_asr_timeout、asr_request_timeout、debug_show_dual_asr |
+| 融合阈值 | fusion_similarity_threshold、fusion_min_primary_score、fusion_max_repetition_ratio、fusion_disagreement_threshold、fusion_hotword_boost、fusion_primary_score_margin |
+| TS-ASR | asr_enrollment_min_sec、asr_enrollment_max_sec、asr_enrollment_ttl_sec |
+
+ASR 模型组合开关存在不变量：`enable_dual_asr_fusion=true` 但 `enable_secondary_asr=false` 会被自动降级为 false（行为矩阵见 [API 总览](api-reference.md)）。共享白名单还包含情感类字段（`emotion_*`），对本 ASR 端点无效，完整清单见 [API 总览](api-reference.md)。
+
+首帧示例（指定语言、关闭伪流式中间结果、放宽 VAD 切段）：
+
+```json
+{
+  "header": {
+    "traceId": "traceId123456",
+    "bizId": "39769795890",
+    "status": 0
+  },
+  "parameter": {
+    "asr_config": {
+      "language": "zh",
+      "enable_pseudo_stream": false,
+      "vad_threshold": 0.45,
+      "silence_duration_ms": 300
+    }
+  },
+  "payload": {
+    "audio": { "audio": "JiuY3iK9AAB..." }
+  }
+}
+```
 
 ## 目标说话人（TS-ASR）
 
@@ -233,7 +277,7 @@ result 示例（最终结果）：
 | 限制 | 说明 |
 |---|---|
 | resIdList 多说话人 | resIdList 仅取首个作目标说话人（TS-ASR），其余忽略；当前单路 ASR 不做多说话人分离 |
-| parameter.engine | 讯飞引擎透传参数（如 wdec_param_LanguageTypeChoice、wrec_param_language_name）在本服务无对应能力，仅记录日志，不影响识别 |
+| parameter.engine | 讯飞引擎透传参数（如 wdec_param_LanguageTypeChoice、wrec_param_language_name）在本服务无对应能力，仅记录日志，不影响识别；如需按连接调参请改用 parameter.asr_config（见配置覆写章节） |
 | 词级时间戳 | 见降级说明，非逐词真实值 |
 | 鉴权 | 无内置鉴权，需在网关层实现访问控制 |
 

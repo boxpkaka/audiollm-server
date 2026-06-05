@@ -79,7 +79,7 @@ def read_raw_pcm(filepath: str) -> bytes:
 
 def _frame(status: int, *, trace_id: str, app_id: str, biz_id: str,
            audio_b64: str | None = None, hotwords: str | None = None,
-           enrollment_id: str = "") -> str:
+           enrollment_id: str = "", asr_config: dict | None = None) -> str:
     """Build one AST v3 request envelope as a JSON string."""
     header: dict = {"traceId": trace_id, "status": status}
     if app_id:
@@ -90,16 +90,21 @@ def _frame(status: int, *, trace_id: str, app_id: str, biz_id: str,
     # POST /api/asr/enrollment to obtain it).
     if enrollment_id:
         header["resIdList"] = [enrollment_id]
+    # engine stays log-only; asr_config carries per-connection config overrides.
+    parameter: dict = {"engine": {}}
+    if asr_config:
+        parameter["asr_config"] = asr_config
     payload: dict = {}
     if audio_b64 is not None:
         payload["audio"] = {"audio": audio_b64}
     if hotwords:
         payload["text"] = {"text": hotwords}
-    return json.dumps({"header": header, "parameter": {"engine": {}}, "payload": payload})
+    return json.dumps({"header": header, "parameter": parameter, "payload": payload})
 
 
 async def run_client(url: str, audio_file: str, *, hotwords: str, biz_id: str,
-                     app_id: str, chunk_ms: int, enrollment_id: str = ""):
+                     app_id: str, chunk_ms: int, enrollment_id: str = "",
+                     asr_config: dict | None = None):
     suffix = Path(audio_file).suffix.lower()
     print(f"Loading audio: {audio_file}")
     if suffix in (".wav", ".wave"):
@@ -146,9 +151,10 @@ async def run_client(url: str, audio_file: str, *, hotwords: str, biz_id: str,
                     app_id=app_id,
                     biz_id=biz_id,
                     audio_b64=base64.b64encode(chunk).decode(),
-                    # Hotwords + enrollment ride the first frame only.
+                    # Hotwords + enrollment + asr_config ride the first frame only.
                     hotwords=hotwords if i == 0 else None,
                     enrollment_id=enrollment_id if i == 0 else "",
+                    asr_config=asr_config if i == 0 else None,
                 )
             )
             await asyncio.sleep(chunk_ms / 1000.0)
@@ -205,6 +211,32 @@ async def _receive_messages(ws):
     print("[connection closed]")
 
 
+def _build_asr_config(args: argparse.Namespace) -> dict:
+    """Assemble parameter.asr_config from --config KEY=VALUE plus shortcuts.
+
+    Each value is parsed as JSON when possible (0.45 -> float, false -> bool,
+    300 -> int), otherwise kept as a string. The server whitelists and coerces
+    fields, so unknown or restricted keys are simply ignored downstream.
+    """
+    cfg: dict = {}
+    for item in args.config:
+        key, sep, val = item.partition("=")
+        if not sep:
+            continue
+        key = key.strip()
+        try:
+            cfg[key] = json.loads(val)
+        except json.JSONDecodeError:
+            cfg[key] = val
+    if args.language:
+        cfg["language"] = args.language
+    if args.vad_threshold is not None:
+        cfg["vad_threshold"] = args.vad_threshold
+    if args.no_pseudo_stream:
+        cfg["enable_pseudo_stream"] = False
+    return cfg
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Test WS client for /tuling/ast/v3 (AST v3)"
@@ -219,6 +251,14 @@ def main():
                         help='Comma-separated hotwords (e.g. "挚音科技,张硕")')
     parser.add_argument("--enrollment-id", default="",
                         help="Target-speaker id from POST /api/asr/enrollment (-> resIdList[0])")
+    parser.add_argument("--language", default="",
+                        help="会话语言代码，写入 parameter.asr_config.language")
+    parser.add_argument("--vad-threshold", type=float, default=None,
+                        help="覆写 VAD 阈值 parameter.asr_config.vad_threshold")
+    parser.add_argument("--no-pseudo-stream", action="store_true",
+                        help="关闭伪流式中间结果 enable_pseudo_stream=false")
+    parser.add_argument("--config", action="append", default=[], metavar="KEY=VALUE",
+                        help="通用 parameter.asr_config 覆写，可多次，如 --config silence_duration_ms=300")
     parser.add_argument("--biz-id", default="12345", help="header.bizId (required field)")
     parser.add_argument("--app-id", default="ast", help="header.appId")
     parser.add_argument("--chunk-ms", type=int, default=128,
@@ -238,6 +278,7 @@ def main():
             app_id=args.app_id,
             chunk_ms=args.chunk_ms,
             enrollment_id=args.enrollment_id,
+            asr_config=_build_asr_config(args),
         )
     )
 

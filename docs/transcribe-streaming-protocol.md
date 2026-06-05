@@ -74,7 +74,7 @@ Client                                      Server
 | `language` | string | 否 | 语言代码；与 query 参数二选一即可 |
 | `hotwords` | string[] | 否 | 热词列表 |
 | `enrollment_id` | string | 否 | 由 `POST /api/asr/enrollment` 返回的目标说话人 id；传 `null` 或省略表示普通 ASR |
-| `config` | object | 否 | 当前连接的服务端配置覆写 |
+| `config` | object | 否 | 当前连接的服务端配置覆写，仅白名单字段生效（见“可覆写配置”） |
 
 ### update_hotwords
 
@@ -175,16 +175,21 @@ Client                                      Server
 
 ## 可覆写配置
 
-常用 `start.config` 字段：
+`start.config` 仅对当前连接生效、不落盘，只接受扁平字段名。覆写字段受服务端白名单（`backend/config.py` 的 `CLIENT_OVERRIDABLE_FIELDS`）约束：白名单外字段（如模型地址 `*_vllm_base_url`、密钥、连接池/队列等基础设施项）、未知字段与非法值都会被忽略并保持服务端默认，不会中断连接。完整白名单与 `/tuling/ast/v3` 的 `parameter.asr_config` 共用，按类别速览见 [API 总览](api-reference.md) 的“临时配置覆写”。
+
+对本端点有效的常用字段：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `vad_threshold` | number | VAD 判定阈值 |
-| `silence_duration_ms` | integer | 静音持续多久后切段 |
-| `min_segment_duration_ms` | integer | 短于该值的语音段会被丢弃 |
-| `enable_pseudo_stream` | boolean | 是否输出伪流式中间结果 |
-| `pseudo_stream_interval_ms` | integer | 伪流式中间结果间隔 |
-| `asr_request_timeout` | number | 单次 ASR 模型请求超时秒数 |
+| vad_threshold | number | VAD 判定阈值 |
+| silence_duration_ms | integer | 静音持续多久后切段 |
+| min_segment_duration_ms | integer | 短于该值的语音段会被丢弃 |
+| enable_pseudo_stream | boolean | 是否输出伪流式中间结果 |
+| pseudo_stream_interval_ms | integer | 伪流式中间结果间隔 |
+| asr_request_timeout | number | 单次 ASR 模型请求超时秒数 |
+| enable_primary_asr | boolean | 是否启用主模型 |
+| enable_secondary_asr | boolean | 是否启用副模型；关闭后无副模型静音门、无融合 |
+| enable_dual_asr_fusion | boolean | final 段是否做主副融合矫正；需副模型开启，否则自动降级为 false |
 
 ## Python WebSocket 示例
 
