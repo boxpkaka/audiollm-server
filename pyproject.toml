@@ -25,6 +25,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["ruff", "websockets"]
 
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
 [project.urls]
 Homepage = "https://github.com/open-mmlab/Amphion"
 Repository = "https://github.com/open-mmlab/Amphion"

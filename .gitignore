@@ -33,6 +33,9 @@ ENV/
 # TLS / local certs (do not commit private keys)
 *.pem
 
+# Benchmark artifacts (reproducible from scripts/bench_*.py; keep out of VCS)
+bench_results/
+
 # Testing & coverage
 .pytest_cache/
 .mypy_cache/
