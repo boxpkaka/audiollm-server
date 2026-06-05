@@ -1,56 +1,80 @@
 {
-  "vllm_base_url": "http://localhost:8009",
-  "vllm_model_name": "AmphionASR-4.3B",
-  "secondary_vllm_base_url": "http://localhost:8001",
-  "secondary_vllm_model_name": "Qwen/Qwen3-ASR-1.7B",
-  "enable_secondary_asr": true,
-  "enable_primary_asr": true,
-  "enable_dual_asr_fusion": false,
-  "primary_asr_timeout": 4.0,
-  "debug_show_dual_asr": false,
-  "fusion_similarity_threshold": 0.85,
-  "fusion_min_primary_score": 0.55,
-  "fusion_max_repetition_ratio": 0.35,
-  "fusion_disagreement_threshold": 0.55,
-  "fusion_hotword_boost": 0.12,
-  "fusion_primary_score_margin": 0.08,
-  "asr_request_timeout": 120,
-  "enable_pseudo_stream": true,
-  "pseudo_stream_interval_ms": 500,
-  "asr_enrollment_min_sec": 1.0,
-  "asr_enrollment_max_sec": 8.0,
-  "asr_enrollment_ttl_sec": 3600,
-  "asr_enrollment_max_entries": 256,
-  "vad_threshold": 0.6,
-  "silence_duration_ms": 350,
-  "vad_smoothing_alpha": 0.3,
-  "vad_start_frames": 20,
-  "vad_pre_speech_ms": 500,
-  "vad_end_frames": 18,
-  "vad_keep_tail_ms": 40,
-  "min_segment_duration_ms": 350,
-  "emotion_vllm_base_url": "http://localhost:8222",
-  "emotion_vllm_model_name": "AmphionSE",
-  "emotion_request_timeout": 30.0,
-  "emotion_max_audio_seconds": 20.0,
-  "emotion_task_mode": "ser",
-  "emotion_max_concurrent_jobs": 8,
-  "emotion_job_queue_max": 64,
-  "emotion_job_ttl_sec": 3600,
-  "emotion_spec_vllm_base_url": "http://localhost:9001",
-  "emotion_spec_vllm_model_name": "AmphionSPEC",
-  "emotion_spec_request_timeout": 30.0,
-  "emotion_spec_max_audio_seconds": 20.0,
-  "emotion_spec_task_mode": "sepc",
-  "emotion_spec_max_concurrent_jobs": 8,
-  "emotion_spec_job_queue_max": 64,
-  "emotion_spec_job_ttl_sec": 3600,
-  "http_max_connections": 32,
-  "http_max_keepalive_connections": 16,
-  "text_cleanup_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-  "text_cleanup_model_name": "qwen2.5-32b-instruct",
-  "text_cleanup_api_key_env": "DASHSCOPE_API_KEY",
-  "text_cleanup_api_key": "",
-  "text_cleanup_timeout": 30.0,
-  "text_cleanup_max_tokens": 1024
+  "asr": {
+    "primary": {
+      "vllm_base_url": "http://localhost:8009",
+      "vllm_model_name": "AmphionASR-4.3B",
+      "enable_primary_asr": true,
+      "primary_asr_timeout": 4.0
+    },
+    "secondary": {
+      "secondary_vllm_base_url": "http://localhost:8001",
+      "secondary_vllm_model_name": "Qwen/Qwen3-ASR-1.7B",
+      "enable_secondary_asr": true
+    },
+    "fusion": {
+      "enable_dual_asr_fusion": false,
+      "debug_show_dual_asr": false,
+      "fusion_similarity_threshold": 0.85,
+      "fusion_min_primary_score": 0.55,
+      "fusion_max_repetition_ratio": 0.35,
+      "fusion_disagreement_threshold": 0.55,
+      "fusion_hotword_boost": 0.12,
+      "fusion_primary_score_margin": 0.08
+    },
+    "request": {
+      "asr_request_timeout": 120
+    },
+    "pseudo_stream": {
+      "enable_pseudo_stream": true,
+      "pseudo_stream_interval_ms": 500
+    },
+    "enrollment": {
+      "asr_enrollment_min_sec": 1.0,
+      "asr_enrollment_max_sec": 8.0,
+      "asr_enrollment_ttl_sec": 3600,
+      "asr_enrollment_max_entries": 256
+    },
+    "vad": {
+      "vad_threshold": 0.6,
+      "silence_duration_ms": 350,
+      "vad_smoothing_alpha": 0.3,
+      "vad_start_frames": 20,
+      "vad_pre_speech_ms": 500,
+      "vad_end_frames": 18,
+      "vad_keep_tail_ms": 40,
+      "min_segment_duration_ms": 350
+    }
+  },
+  "emotion": {
+    "emotion_vllm_base_url": "http://localhost:8222",
+    "emotion_vllm_model_name": "AmphionSE",
+    "emotion_request_timeout": 30.0,
+    "emotion_max_audio_seconds": 20.0,
+    "emotion_task_mode": "ser",
+    "emotion_max_concurrent_jobs": 8,
+    "emotion_job_queue_max": 64,
+    "emotion_job_ttl_sec": 3600
+  },
+  "emotion_spec": {
+    "emotion_spec_vllm_base_url": "http://localhost:9001",
+    "emotion_spec_vllm_model_name": "AmphionSPEC",
+    "emotion_spec_request_timeout": 30.0,
+    "emotion_spec_max_audio_seconds": 20.0,
+    "emotion_spec_task_mode": "sepc",
+    "emotion_spec_max_concurrent_jobs": 8,
+    "emotion_spec_job_queue_max": 64,
+    "emotion_spec_job_ttl_sec": 3600
+  },
+  "http": {
+    "http_max_connections": 32,
+    "http_max_keepalive_connections": 16
+  },
+  "text_cleanup": {
+    "text_cleanup_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "text_cleanup_model_name": "qwen2.5-32b-instruct",
+    "text_cleanup_api_key_env": "DASHSCOPE_API_KEY",
+    "text_cleanup_api_key": "",
+    "text_cleanup_timeout": 30.0,
+    "text_cleanup_max_tokens": 1024
+  }
 }

@@ -277,7 +277,7 @@ SERVICE=my-demo scripts/restart_service.sh   # 指定其他 systemd 服务名
 
 ## 配置说明
 
-服务端默认配置保存在 [`backend/config.json`](backend/config.json)，修改后重启服务生效。
+服务端默认配置保存在 [`backend/config.json`](backend/config.json)，修改后重启服务生效。该文件按功能分组（`asr`、`emotion`、`emotion_spec`、`http`、`text_cleanup`）仅为便于阅读；字段名保持扁平全名（如 `vllm_base_url`、`vad_threshold`），下表与客户端覆写用的都是这些扁平字段名。
 
 客户端可在 `start` 消息的 `config` 字段中覆写其中任意一项，只需传入要修改的参数，未传入的保持服务端默认值。
 

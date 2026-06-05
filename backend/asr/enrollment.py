@@ -193,14 +193,11 @@ def get_enrollment_store() -> _Store:
     config at import time."""
     global _STORE
     if _STORE is None:
-        from ..config import (
-            ASR_ENROLLMENT_MAX_ENTRIES,
-            ASR_ENROLLMENT_TTL_SEC,
-        )
+        from ..config import default_config
 
         _STORE = _Store(
-            ttl_sec=ASR_ENROLLMENT_TTL_SEC,
-            max_entries=ASR_ENROLLMENT_MAX_ENTRIES,
+            ttl_sec=default_config.asr_enrollment_ttl_sec,
+            max_entries=default_config.asr_enrollment_max_entries,
         )
     return _STORE
 

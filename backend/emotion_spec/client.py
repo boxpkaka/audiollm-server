@@ -14,11 +14,7 @@ import json
 import logging
 from typing import Any, TypedDict, cast
 
-from ..config import (
-    EMOTION_SPEC_REQUEST_TIMEOUT,
-    EMOTION_SPEC_VLLM_BASE_URL,
-    EMOTION_SPEC_VLLM_MODEL_NAME,
-)
+from ..config import default_config
 from ..emotion.client import (  # noqa: F401 — re-export taxonomy for callers
     SER_TAXONOMY,
     _content_to_text,
@@ -139,16 +135,16 @@ async def query_emotion_spec_model(
 ) -> EmotionSpecResult:
     mode = cast(EmotionSpecMode, normalize_mode(mode))
     client = get_client()
-    base = (base_url or EMOTION_SPEC_VLLM_BASE_URL).rstrip("/")
+    base = (base_url or default_config.emotion_spec_vllm_base_url).rstrip("/")
     payload: dict[str, Any] = {
-        "model": model_name or EMOTION_SPEC_VLLM_MODEL_NAME,
+        "model": model_name or default_config.emotion_spec_vllm_model_name,
         "messages": _build_messages(audio_wav_base64, mode),
         "max_tokens": int(max_tokens) if max_tokens else (32 if mode == "ser" else 256),
     }
     resp = await client.post(
         f"{base}/v1/chat/completions",
         json=payload,
-        timeout=timeout if timeout is not None else EMOTION_SPEC_REQUEST_TIMEOUT,
+        timeout=timeout if timeout is not None else default_config.emotion_spec_request_timeout,
     )
     resp.raise_for_status()
     raw_text = _content_to_text(

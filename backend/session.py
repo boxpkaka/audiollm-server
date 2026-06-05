@@ -12,26 +12,12 @@ from .asr.fusion import choose_fused_result
 from .asr.hotword import query_text_hotwords, sanitize_hotwords
 from .audio.utils import Resampler48to16, pcm_to_wav_base64
 from .audio.vad import VADProcessor
-from .config import (
-    DEBUG_SHOW_DUAL_ASR,
-    EMOTION_SPEC_MAX_AUDIO_SECONDS,
-    EMOTION_SPEC_REQUEST_TIMEOUT,
-    EMOTION_SPEC_VLLM_BASE_URL,
-    EMOTION_SPEC_VLLM_MODEL_NAME,
-    ENABLE_DUAL_ASR_FUSION,
-    ENABLE_PRIMARY_ASR,
-    ENABLE_PSEUDO_STREAM,
-    ENABLE_SECONDARY_ASR,
-    MIN_SEGMENT_DURATION_MS,
-    PRIMARY_ASR_TIMEOUT,
-    PSEUDO_STREAM_INTERVAL_MS,
-    SAMPLE_RATE,
-)
+from .config import SAMPLE_RATE, default_config
 from .emotion_spec.client import query_emotion_spec_model
 
 logger = logging.getLogger(__name__)
 
-MIN_SEGMENT_SAMPLES = int(SAMPLE_RATE * MIN_SEGMENT_DURATION_MS / 1000)
+MIN_SEGMENT_SAMPLES = int(SAMPLE_RATE * default_config.min_segment_duration_ms / 1000)
 
 VALID_SRC_LANG = frozenset({"N/A", "Chinese", "English", "Indonesian", "Thai"})
 
@@ -78,7 +64,7 @@ class AudioSession:
         self._partial_seq: int = 0
         self._last_partial_time: float = 0.0
         self._partial_task: asyncio.Task | None = None
-        self._pseudo_stream_interval: float = PSEUDO_STREAM_INTERVAL_MS / 1000.0
+        self._pseudo_stream_interval: float = default_config.pseudo_stream_interval_ms / 1000.0
 
     async def _send_json(self, data: dict) -> bool:
         """Send JSON over WebSocket. Returns False if the connection is gone."""
@@ -163,9 +149,9 @@ class AudioSession:
         # at least one decoder online — `_emit_partial` picks primary text
         # when available and falls back to secondary, so disabling either
         # model individually keeps the live caption working.
-        if not ENABLE_PSEUDO_STREAM:
+        if not default_config.enable_pseudo_stream:
             return
-        if not ENABLE_PRIMARY_ASR and not ENABLE_SECONDARY_ASR:
+        if not default_config.enable_primary_asr and not default_config.enable_secondary_asr:
             return
 
         if self.vad.is_speaking:
@@ -198,7 +184,7 @@ class AudioSession:
             logger.info(
                 "Drop short segment (%.1fs < %.1fs)",
                 len(segment) / SAMPLE_RATE,
-                MIN_SEGMENT_DURATION_MS / 1000.0,
+                default_config.min_segment_duration_ms / 1000.0,
             )
             self._utterance_id = None
             return
@@ -309,7 +295,7 @@ class AudioSession:
             logger.info(
                 "Flush: segment too short (%.2fs < %.2fs)",
                 len(remaining) / SAMPLE_RATE,
-                MIN_SEGMENT_DURATION_MS / 1000.0,
+                default_config.min_segment_duration_ms / 1000.0,
             )
             self._utterance_id = None
             return
@@ -377,7 +363,7 @@ class AudioSession:
             primary_task = None
             secondary_task = None
 
-            if ENABLE_PRIMARY_ASR:
+            if default_config.enable_primary_asr:
                 primary_task = asyncio.create_task(
                     query_audio_model(
                         wav_b64,
@@ -386,7 +372,7 @@ class AudioSession:
                         enrollment_wav_base64=self.enrollment_b64,
                     )
                 )
-            if ENABLE_SECONDARY_ASR:
+            if default_config.enable_secondary_asr:
                 secondary_task = asyncio.create_task(
                     query_audio_model_secondary(wav_b64)
                 )
@@ -494,18 +480,18 @@ class AudioSession:
         # 的失败分支把 silence 也当成 error。
         is_silence = False
 
-        # ENABLE_DUAL_ASR_FUSION (validated against ENABLE_SECONDARY_ASR at
+        # enable_dual_asr_fusion (validated against enable_secondary_asr at
         # config load time) decides whether final segments go through the
         # dual-model pipeline. With fusion off we still emit a final from
         # the primary alone, saving one vLLM call per segment.
-        if ENABLE_DUAL_ASR_FUSION:
+        if default_config.enable_dual_asr_fusion:
             secondary_res, primary_res = await self._dual_asr_pipeline(
                 seg_id, wav_b64, hw_snapshot, lang_snapshot
             )
             if secondary_res is None and primary_res is None:
                 is_silence = True
         else:
-            if ENABLE_PRIMARY_ASR:
+            if default_config.enable_primary_asr:
                 primary_res = await asyncio.wait_for(
                     query_audio_model(
                         wav_b64,
@@ -513,7 +499,7 @@ class AudioSession:
                         src_lang=lang_snapshot,
                         enrollment_wav_base64=self.enrollment_b64,
                     ),
-                    timeout=PRIMARY_ASR_TIMEOUT,
+                    timeout=default_config.primary_asr_timeout,
                 )
 
         primary_result = None if isinstance(primary_res, Exception) else primary_res
@@ -578,7 +564,7 @@ class AudioSession:
         }
         if primary_result and primary_result.get("detected_language"):
             payload["src_lang_detected"] = primary_result["detected_language"]
-        if DEBUG_SHOW_DUAL_ASR and fused:
+        if default_config.debug_show_dual_asr and fused:
             payload.update(
                 {
                     "text_primary": fused["primary_text"],
@@ -600,10 +586,10 @@ class AudioSession:
         audio_duration = len(segment) / SAMPLE_RATE
         clip = segment
         if (
-            EMOTION_SPEC_MAX_AUDIO_SECONDS > 0
-            and audio_duration > EMOTION_SPEC_MAX_AUDIO_SECONDS
+            default_config.emotion_spec_max_audio_seconds > 0
+            and audio_duration > default_config.emotion_spec_max_audio_seconds
         ):
-            max_samples = int(SAMPLE_RATE * EMOTION_SPEC_MAX_AUDIO_SECONDS)
+            max_samples = int(SAMPLE_RATE * default_config.emotion_spec_max_audio_seconds)
             clip = segment[-max_samples:]
 
         try:
@@ -616,9 +602,9 @@ class AudioSession:
             return await query_emotion_spec_model(
                 wav_b64,
                 mode=mode,
-                base_url=EMOTION_SPEC_VLLM_BASE_URL,
-                model_name=EMOTION_SPEC_VLLM_MODEL_NAME,
-                timeout=EMOTION_SPEC_REQUEST_TIMEOUT,
+                base_url=default_config.emotion_spec_vllm_base_url,
+                model_name=default_config.emotion_spec_vllm_model_name,
+                timeout=default_config.emotion_spec_request_timeout,
             )
 
         ser_res, sepc_res = await asyncio.gather(
@@ -679,7 +665,7 @@ class AudioSession:
             query_audio_model_secondary(wav_b64, hotwords=hw_snapshot)
         )
         primary_task = None
-        if ENABLE_PRIMARY_ASR:
+        if default_config.enable_primary_asr:
             primary_task = asyncio.create_task(
                 asyncio.wait_for(
                     query_audio_model(
@@ -688,7 +674,7 @@ class AudioSession:
                         src_lang=lang_snapshot,
                         enrollment_wav_base64=self.enrollment_b64,
                     ),
-                    timeout=PRIMARY_ASR_TIMEOUT,
+                    timeout=default_config.primary_asr_timeout,
                 )
             )
 
