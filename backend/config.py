@@ -99,12 +99,16 @@ class Config:
     asr_enrollment_max_entries: int = 256
 
     # ---- ASR: VAD segmentation -------------------------------------------
-    vad_threshold: float = 0.5
-    silence_duration_ms: int = 200
-    vad_smoothing_alpha: float = 0.35
-    vad_start_frames: int = 3
+    # These VAD defaults mirror backend/config.json's vad block. They are pure
+    # tuning thresholds (no per-deployment meaning), so keeping the in-code
+    # fallback equal to the shipped values avoids a confusing third number;
+    # config.json still overrides them at load time.
+    vad_threshold: float = 0.6
+    silence_duration_ms: int = 350
+    vad_smoothing_alpha: float = 0.3
+    vad_start_frames: int = 20
     vad_pre_speech_ms: int = 500
-    vad_end_frames: int = 20
+    vad_end_frames: int = 18
     vad_keep_tail_ms: int = 40
     min_segment_duration_ms: int = 350
 

@@ -281,26 +281,36 @@ SERVICE=my-demo scripts/restart_service.sh   # 指定其他 systemd 服务名
 
 客户端可在 `start` 消息的 `config` 字段中覆写其中任意一项，只需传入要修改的参数，未传入的保持服务端默认值。
 
+### 配置优先级与覆写逻辑
+
+同一参数最多在三个层次出现，运行时按以下优先级取值（后者覆盖前者）：
+
+1. 代码内置默认：`backend/config.py` 中 `Config` dataclass 的字段默认值。仅当 `config.json` 缺少该字段（或文件不存在）时作为兜底，面向 fork/移植场景给出通用值（例如端点默认指向 `localhost:8000`、情感模型默认复用主 ASR 后端）。
+2. 服务端默认：`backend/config.json` 的值，是本部署实际生效的默认值，修改后重启服务生效。下文各表"默认值"列展示的就是这一层。
+3. 客户端临时覆写：`start` 消息 `config` 字段传入的值，仅对当前连接生效、不落盘，连接结束即失效；未传入的字段沿用服务端默认。
+
+因此当 `config.py` 内置默认与 `config.json` 不一致时（典型如端点地址、是否启用融合），以 `config.json` 为准，内置默认只是文件缺字段时的降级兜底。客户端覆写只接受扁平字段名（如 `vad_threshold`），与 `config.json` 是否分组无关；传入非法值或未知字段会被忽略并保持服务端默认。不一致的组合（如 `enable_dual_asr_fusion=true` 但 `enable_secondary_asr=false`）在加载时自动降级为 `false`。
+
 ### 客户端可配置参数
 
 #### 模型选择
 
 | 参数 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `vllm_base_url` | string | `http://172.16.0.3:8000` | 主 ASR 模型的服务地址 |
-| `vllm_model_name` | string | `Amphion/Amphion-3B` | 主 ASR 模型名称 |
-| `secondary_vllm_base_url` | string | `http://172.16.0.3:8001` | 副 ASR 模型的服务地址 |
+| `vllm_base_url` | string | `http://localhost:8009` | 主 ASR 模型的服务地址 |
+| `vllm_model_name` | string | `AmphionASR-4.3B` | 主 ASR 模型名称 |
+| `secondary_vllm_base_url` | string | `http://localhost:8001` | 副 ASR 模型的服务地址 |
 | `secondary_vllm_model_name` | string | `Qwen/Qwen3-ASR-1.7B` | 副 ASR 模型名称 |
 | `enable_primary_asr` | bool | `true` | 是否启用主模型。关闭后只用副模型 |
 | `enable_secondary_asr` | bool | `true` | 副模型是否在线。决定 partial 是否有静音门、final 是否可融合 |
-| `enable_dual_asr_fusion` | bool | `true` | final 段是否走双模型融合矫正。关闭后 final 只跑主模型（partial 静音门不受影响）。`enable_secondary_asr=false` 时自动降级为 false |
+| `enable_dual_asr_fusion` | bool | `false` | final 段是否走双模型融合矫正。关闭后 final 只跑主模型（partial 静音门不受影响）。`enable_secondary_asr=false` 时自动降级为 false |
 
-三档 ASR 开关组合矩阵：
+三档 ASR 开关组合矩阵（`backend/config.json` 默认 `enable_secondary_asr=true`、`enable_dual_asr_fusion=false`，对应下表第二行）：
 
 | `enable_secondary_asr` | `enable_dual_asr_fusion` | Partial 行为 | Final 行为 |
 |---|---|---|---|
-| true | true（默认） | 双调，副模型做静音门，发主模型文本 | 双调 + 融合矫正 |
-| true | false | 双调，副模型做静音门，发主模型文本 | 仅主模型 |
+| true | true | 双调，副模型做静音门，发主模型文本 | 双调 + 融合矫正 |
+| true（默认） | false（默认） | 双调，副模型做静音门，发主模型文本 | 仅主模型 |
 | false | (自动降级 false) | 仅主模型，无静音门 | 仅主模型 |
 
 #### 推理控制
@@ -323,12 +333,12 @@ SERVICE=my-demo scripts/restart_service.sh   # 指定其他 systemd 服务名
 
 | 参数 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `vad_threshold` | float | `0.65` | 语音判定灵敏度（0-1）。值越低越容易触发，但也更容易误判噪音为语音 |
-| `silence_duration_ms` | int | `200` | 说话停顿多久算"说完了"（毫秒）。值越大越不容易被短暂停顿打断 |
-| `vad_smoothing_alpha` | float | `0.35` | 语音概率的平滑系数（0-1）。值越大波动越小，但响应越慢 |
-| `vad_start_frames` | int | `10` | 连续多少帧检测到语音才算"开始说话"。防止瞬间噪音误触发 |
+| `vad_threshold` | float | `0.6` | 语音判定灵敏度（0-1）。值越低越容易触发，但也更容易误判噪音为语音 |
+| `silence_duration_ms` | int | `350` | 说话停顿多久算"说完了"（毫秒）。值越大越不容易被短暂停顿打断 |
+| `vad_smoothing_alpha` | float | `0.3` | 语音概率的平滑系数（0-1）。值越大波动越小，但响应越慢 |
+| `vad_start_frames` | int | `20` | 连续多少帧检测到语音才算"开始说话"。防止瞬间噪音误触发 |
 | `vad_pre_speech_ms` | int | `500` | 检测到说话后，往前多保留多少毫秒的音频。避免开头被截掉 |
-| `vad_end_frames` | int | `20` | 连续多少帧静默才算"说完了"。和 `silence_duration_ms` 配合使用 |
+| `vad_end_frames` | int | `18` | 连续多少帧静默才算"说完了"。和 `silence_duration_ms` 配合使用 |
 | `vad_keep_tail_ms` | int | `40` | 语音结束后多保留多少毫秒的尾巴音频 |
 | `min_segment_duration_ms` | int | `350` | 低于此时长的语音片段会被丢弃（过滤噪音短脉冲） |
 
@@ -349,8 +359,8 @@ SERVICE=my-demo scripts/restart_service.sh   # 指定其他 systemd 服务名
 
 | 参数 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `emotion_vllm_base_url` | string | `http://172.16.0.3:8000` | 情感识别模型的 vLLM 服务地址；默认与主 ASR 共用同一 Amphion 多任务服务 |
-| `emotion_vllm_model_name` | string | `Amphion/Amphion-3B` | 情感识别模型名称；与 AmphionASR 项目的 SER/SEC 训练模型一致 |
+| `emotion_vllm_base_url` | string | `http://localhost:8222` | 情感识别模型的 vLLM 服务地址；`backend/config.json` 默认独立部署在 8222（`config.py` 内置默认则复用主 ASR 后端） |
+| `emotion_vllm_model_name` | string | `AmphionSE` | 情感识别模型名称；独立的 AmphionSE 检查点 |
 | `emotion_request_timeout` | float | `30.0` | 情感推理 HTTP 请求总超时（秒） |
 | `emotion_max_audio_seconds` | float | `20.0` | 单次推理处理的最长音频秒数；超过则保留尾部，贴合 Amphion SER/SEC 训练时 1-20s 的 utterance 上限 |
 | `emotion_task_mode` | string | `ser` | 缺省任务变体：`ser` 输出 8 分类标签，`sec` 输出自由文本描述 |
@@ -362,7 +372,7 @@ SERVICE=my-demo scripts/restart_service.sh   # 指定其他 systemd 服务名
 
 | 参数 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `debug_show_dual_asr` | bool | `true` | 在 `/ws/audio` 响应中包含双 ASR 调试信息 |
+| `debug_show_dual_asr` | bool | `false` | 在 `/ws/audio` 响应中包含双 ASR 调试信息 |
 
 ### 服务
 
