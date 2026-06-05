@@ -1,13 +1,7 @@
 import re
 from typing import Any, TypedDict
 
-from ..config import (
-    ASR_REQUEST_TIMEOUT,
-    SECONDARY_VLLM_BASE_URL,
-    SECONDARY_VLLM_MODEL_NAME,
-    VLLM_BASE_URL,
-    VLLM_MODEL_NAME,
-)
+from ..config import default_config
 from ..http_client import get_client
 
 
@@ -278,9 +272,9 @@ async def query_audio_model(
     )
     return await _post_chat(
         messages,
-        base_url=base_url or VLLM_BASE_URL,
-        model_name=model_name or VLLM_MODEL_NAME,
-        timeout=timeout if timeout is not None else ASR_REQUEST_TIMEOUT,
+        base_url=base_url or default_config.vllm_base_url,
+        model_name=model_name or default_config.vllm_model_name,
+        timeout=timeout if timeout is not None else default_config.asr_request_timeout,
     )
 
 
@@ -296,7 +290,7 @@ async def query_audio_model_secondary(
     messages = build_audio_only_messages(audio_wav_base64)
     return await _post_chat(
         messages,
-        base_url=base_url or SECONDARY_VLLM_BASE_URL,
-        model_name=model_name or SECONDARY_VLLM_MODEL_NAME,
-        timeout=timeout if timeout is not None else ASR_REQUEST_TIMEOUT,
+        base_url=base_url or default_config.secondary_vllm_base_url,
+        model_name=model_name or default_config.secondary_vllm_model_name,
+        timeout=timeout if timeout is not None else default_config.asr_request_timeout,
     )

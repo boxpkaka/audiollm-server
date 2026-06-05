@@ -9,17 +9,7 @@ try:
 except Exception:  # pragma: no cover - depends on optional native runtime
     TenVad = None
 
-from ..config import (
-    HOP_SIZE,
-    SAMPLE_RATE,
-    SILENCE_DURATION_MS,
-    VAD_END_FRAMES,
-    VAD_KEEP_TAIL_MS,
-    VAD_PRE_SPEECH_MS,
-    VAD_SMOOTHING_ALPHA,
-    VAD_START_FRAMES,
-    VAD_THRESHOLD,
-)
+from ..config import HOP_SIZE, SAMPLE_RATE, default_config
 
 logger = logging.getLogger(__name__)
 
@@ -65,14 +55,14 @@ class VADProcessor:
     def __init__(
         self,
         hop_size: int = HOP_SIZE,
-        threshold: float = VAD_THRESHOLD,
-        silence_duration_ms: int = SILENCE_DURATION_MS,
+        threshold: float = default_config.vad_threshold,
+        silence_duration_ms: int = default_config.silence_duration_ms,
         sample_rate: int = SAMPLE_RATE,
-        smoothing_alpha: float = VAD_SMOOTHING_ALPHA,
-        start_frames: int = VAD_START_FRAMES,
-        pre_speech_ms: int = VAD_PRE_SPEECH_MS,
-        end_frames: int = VAD_END_FRAMES,
-        keep_tail_ms: int = VAD_KEEP_TAIL_MS,
+        smoothing_alpha: float = default_config.vad_smoothing_alpha,
+        start_frames: int = default_config.vad_start_frames,
+        pre_speech_ms: int = default_config.vad_pre_speech_ms,
+        end_frames: int = default_config.vad_end_frames,
+        keep_tail_ms: int = default_config.vad_keep_tail_ms,
     ):
         self.vad = self._create_vad_backend()
         backend_hop = getattr(self.vad, "hop_size", None)

@@ -3,14 +3,7 @@ import re
 import unicodedata
 from typing import Any, TypedDict
 
-from ..config import (
-    FUSION_DISAGREEMENT_THRESHOLD,
-    FUSION_HOTWORD_BOOST,
-    FUSION_MAX_REPETITION_RATIO,
-    FUSION_MIN_PRIMARY_SCORE,
-    FUSION_PRIMARY_SCORE_MARGIN,
-    FUSION_SIMILARITY_THRESHOLD,
-)
+from ..config import default_config
 from .client import ASRResult
 
 
@@ -173,12 +166,12 @@ def choose_fused_result(
     hotword_boost: float | None = None,
     primary_score_margin: float | None = None,
 ) -> FusionResult:
-    sim_thresh = _or_default(similarity_threshold, FUSION_SIMILARITY_THRESHOLD)
-    min_pri = _or_default(min_primary_score, FUSION_MIN_PRIMARY_SCORE)
-    max_rep = _or_default(max_repetition_ratio, FUSION_MAX_REPETITION_RATIO)
-    dis_thresh = _or_default(disagreement_threshold, FUSION_DISAGREEMENT_THRESHOLD)
-    hw_boost = _or_default(hotword_boost, FUSION_HOTWORD_BOOST)
-    pri_margin = _or_default(primary_score_margin, FUSION_PRIMARY_SCORE_MARGIN)
+    sim_thresh = _or_default(similarity_threshold, default_config.fusion_similarity_threshold)
+    min_pri = _or_default(min_primary_score, default_config.fusion_min_primary_score)
+    max_rep = _or_default(max_repetition_ratio, default_config.fusion_max_repetition_ratio)
+    dis_thresh = _or_default(disagreement_threshold, default_config.fusion_disagreement_threshold)
+    hw_boost = _or_default(hotword_boost, default_config.fusion_hotword_boost)
+    pri_margin = _or_default(primary_score_margin, default_config.fusion_primary_score_margin)
 
     # secondary_result has three semantic states:
     #   - None           → secondary decoder is not online (config off, or

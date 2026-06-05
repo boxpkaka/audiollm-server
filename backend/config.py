@@ -23,6 +23,33 @@ def _load_json(path: Path) -> dict[str, Any]:
         return json.load(f)
 
 
+def _flatten(raw: dict[str, Any]) -> dict[str, Any]:
+    """Collect leaf entries from a (possibly grouped) config mapping.
+
+    Nested dicts are treated purely as visual grouping containers: only their
+    non-dict leaves become config fields, so a flat (un-nested) file still
+    loads unchanged. This keeps the on-disk file groupable by feature while
+    `Config` stays a flat dataclass and `override` keeps its flat key contract.
+
+    Constraint: config values must not be objects (the dataclass has no
+    dict-typed field). A leaf key colliding across groups is a config error;
+    we keep the last value seen and warn so it is not silent.
+    """
+    flat: dict[str, Any] = {}
+
+    def walk(node: dict[str, Any]) -> None:
+        for key, value in node.items():
+            if isinstance(value, dict):
+                walk(value)
+                continue
+            if key in flat:
+                logger.warning("Duplicate config key across groups: %s", key)
+            flat[key] = value
+
+    walk(raw)
+    return flat
+
+
 @dataclass(frozen=True)
 class Config:
     # ---- ASR: primary / secondary vLLM endpoints --------------------------
@@ -72,12 +99,16 @@ class Config:
     asr_enrollment_max_entries: int = 256
 
     # ---- ASR: VAD segmentation -------------------------------------------
-    vad_threshold: float = 0.5
-    silence_duration_ms: int = 200
-    vad_smoothing_alpha: float = 0.35
-    vad_start_frames: int = 3
+    # These VAD defaults mirror backend/config.json's vad block. They are pure
+    # tuning thresholds (no per-deployment meaning), so keeping the in-code
+    # fallback equal to the shipped values avoids a confusing third number;
+    # config.json still overrides them at load time.
+    vad_threshold: float = 0.6
+    silence_duration_ms: int = 350
+    vad_smoothing_alpha: float = 0.3
+    vad_start_frames: int = 20
     vad_pre_speech_ms: int = 500
-    vad_end_frames: int = 20
+    vad_end_frames: int = 18
     vad_keep_tail_ms: int = 40
     min_segment_duration_ms: int = 350
 
@@ -169,13 +200,13 @@ class Config:
 
 
 def load_config(path: Path | None = None) -> Config:
-    raw = _load_json(path or _CONFIG_PATH)
+    raw = _flatten(_load_json(path or _CONFIG_PATH))
     valid_names = {f.name for f in fields(Config)}
     filtered = {k: v for k, v in raw.items() if k in valid_names}
     # Surface a loud WARNING when the on-disk config file specifies an
     # impossible combination, so operators notice — silent downgrade by
     # `__post_init__` still happens, this is just the log line.
-    if filtered.get("enable_dual_asr_fusion", True) and not filtered.get(
+    if raw.get("enable_dual_asr_fusion", True) and not raw.get(
         "enable_secondary_asr", True
     ):
         logger.warning(
@@ -185,70 +216,9 @@ def load_config(path: Path | None = None) -> Config:
     return Config(**filtered) if filtered else Config()
 
 
-_default = load_config()
-
-# ---------------------------------------------------------------------------
-# Module-level constants for backward compatibility.
-# Modules that don't need per-session override can keep importing these.
-# ---------------------------------------------------------------------------
-VLLM_BASE_URL = _default.vllm_base_url
-VLLM_MODEL_NAME = _default.vllm_model_name
-SECONDARY_VLLM_BASE_URL = _default.secondary_vllm_base_url
-SECONDARY_VLLM_MODEL_NAME = _default.secondary_vllm_model_name
-ENABLE_SECONDARY_ASR = _default.enable_secondary_asr
-ENABLE_PRIMARY_ASR = _default.enable_primary_asr
-ENABLE_DUAL_ASR_FUSION = _default.enable_dual_asr_fusion
-PRIMARY_ASR_TIMEOUT = _default.primary_asr_timeout
-DEBUG_SHOW_DUAL_ASR = _default.debug_show_dual_asr
-
-FUSION_SIMILARITY_THRESHOLD = _default.fusion_similarity_threshold
-FUSION_MIN_PRIMARY_SCORE = _default.fusion_min_primary_score
-FUSION_MAX_REPETITION_RATIO = _default.fusion_max_repetition_ratio
-FUSION_DISAGREEMENT_THRESHOLD = _default.fusion_disagreement_threshold
-FUSION_HOTWORD_BOOST = _default.fusion_hotword_boost
-FUSION_PRIMARY_SCORE_MARGIN = _default.fusion_primary_score_margin
-
-ASR_REQUEST_TIMEOUT = _default.asr_request_timeout
-ENABLE_PSEUDO_STREAM = _default.enable_pseudo_stream
-PSEUDO_STREAM_INTERVAL_MS = _default.pseudo_stream_interval_ms
-
-ASR_ENROLLMENT_MIN_SEC = _default.asr_enrollment_min_sec
-ASR_ENROLLMENT_MAX_SEC = _default.asr_enrollment_max_sec
-ASR_ENROLLMENT_TTL_SEC = _default.asr_enrollment_ttl_sec
-ASR_ENROLLMENT_MAX_ENTRIES = _default.asr_enrollment_max_entries
-
-VAD_THRESHOLD = _default.vad_threshold
-SILENCE_DURATION_MS = _default.silence_duration_ms
-VAD_SMOOTHING_ALPHA = _default.vad_smoothing_alpha
-VAD_START_FRAMES = _default.vad_start_frames
-VAD_PRE_SPEECH_MS = _default.vad_pre_speech_ms
-VAD_END_FRAMES = _default.vad_end_frames
-VAD_KEEP_TAIL_MS = _default.vad_keep_tail_ms
-MIN_SEGMENT_DURATION_MS = _default.min_segment_duration_ms
-
-EMOTION_VLLM_BASE_URL = _default.emotion_vllm_base_url
-EMOTION_VLLM_MODEL_NAME = _default.emotion_vllm_model_name
-EMOTION_REQUEST_TIMEOUT = _default.emotion_request_timeout
-EMOTION_MAX_AUDIO_SECONDS = _default.emotion_max_audio_seconds
-EMOTION_TASK_MODE = _default.emotion_task_mode
-EMOTION_MAX_CONCURRENT_JOBS = _default.emotion_max_concurrent_jobs
-EMOTION_JOB_QUEUE_MAX = _default.emotion_job_queue_max
-EMOTION_JOB_TTL_SEC = _default.emotion_job_ttl_sec
-
-EMOTION_SPEC_VLLM_BASE_URL = _default.emotion_spec_vllm_base_url
-EMOTION_SPEC_VLLM_MODEL_NAME = _default.emotion_spec_vllm_model_name
-EMOTION_SPEC_REQUEST_TIMEOUT = _default.emotion_spec_request_timeout
-EMOTION_SPEC_MAX_AUDIO_SECONDS = _default.emotion_spec_max_audio_seconds
-EMOTION_SPEC_TASK_MODE = _default.emotion_spec_task_mode
-EMOTION_SPEC_MAX_CONCURRENT_JOBS = _default.emotion_spec_max_concurrent_jobs
-EMOTION_SPEC_JOB_QUEUE_MAX = _default.emotion_spec_job_queue_max
-EMOTION_SPEC_JOB_TTL_SEC = _default.emotion_spec_job_ttl_sec
-
-HTTP_MAX_CONNECTIONS = _default.http_max_connections
-HTTP_MAX_KEEPALIVE_CONNECTIONS = _default.http_max_keepalive_connections
-
-TEXT_CLEANUP_BASE_URL = _default.text_cleanup_base_url
-TEXT_CLEANUP_MODEL_NAME = _default.text_cleanup_model_name
-TEXT_CLEANUP_API_KEY_ENV = _default.text_cleanup_api_key_env
-TEXT_CLEANUP_TIMEOUT = _default.text_cleanup_timeout
-TEXT_CLEANUP_MAX_TOKENS = _default.text_cleanup_max_tokens
+# Process-wide default Config singleton. Modules that don't carry a
+# per-session Config (module-level helpers, ``value or <default>`` fallbacks)
+# read fields off this instead of re-reading the file. ``load_config()``
+# stays the single entry point; this is just its cached default instance, so
+# every reader reaches config exactly one way: a Config object.
+default_config = load_config()
