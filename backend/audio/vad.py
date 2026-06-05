@@ -9,7 +9,7 @@ try:
 except Exception:  # pragma: no cover - depends on optional native runtime
     TenVad = None
 
-from ..config import HOP_SIZE, SAMPLE_RATE, default_config
+from ..config import HOP_SIZE, SAMPLE_RATE, Config, default_config
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +61,6 @@ class VADProcessor:
         smoothing_alpha: float = default_config.vad_smoothing_alpha,
         start_frames: int = default_config.vad_start_frames,
         pre_speech_ms: int = default_config.vad_pre_speech_ms,
-        end_frames: int = default_config.vad_end_frames,
         keep_tail_ms: int = default_config.vad_keep_tail_ms,
     ):
         self.vad = self._create_vad_backend()
@@ -72,13 +71,14 @@ class VADProcessor:
             self.hop_size = hop_size
         self.sample_rate = max(1, sample_rate)
         self.frame_ms = (self.hop_size / self.sample_rate) * 1000.0
-        self.threshold = threshold
-        self.silence_frames = max(1, math.ceil(silence_duration_ms / self.frame_ms))
-        self.end_frames = max(1, end_frames)
-        self.pre_speech_frames = max(1, math.ceil(pre_speech_ms / self.frame_ms))
-        self.keep_tail_frames = max(0, math.ceil(keep_tail_ms / self.frame_ms))
-        self.start_frames = max(1, start_frames)
-        self.smoothing_alpha = min(1.0, max(0.0, smoothing_alpha))
+        self._set_tunables(
+            threshold=threshold,
+            silence_duration_ms=silence_duration_ms,
+            smoothing_alpha=smoothing_alpha,
+            start_frames=start_frames,
+            pre_speech_ms=pre_speech_ms,
+            keep_tail_ms=keep_tail_ms,
+        )
         self.audio_buffer: list[np.ndarray] = []
         self.pre_speech_buffer: list[np.ndarray] = []
         self.silent_count = 0
@@ -93,6 +93,48 @@ class VADProcessor:
             self.pre_speech_frames,
             self.silence_frames,
             self.keep_tail_frames,
+        )
+
+    def _set_tunables(
+        self,
+        *,
+        threshold: float,
+        silence_duration_ms: int,
+        smoothing_alpha: float,
+        start_frames: int,
+        pre_speech_ms: int,
+        keep_tail_ms: int,
+    ) -> None:
+        """Set the threshold-style segmentation knobs in one place.
+
+        ``__init__`` and :meth:`apply_config` both route through here so the
+        ms->frame conversion and clamping live once. ``frame_ms`` (derived
+        from the backend hop at construction) must already be set. The VAD
+        backend and any in-flight buffers/counters are deliberately left
+        untouched, so this is safe to call mid-session.
+        """
+        self.threshold = threshold
+        self.smoothing_alpha = min(1.0, max(0.0, smoothing_alpha))
+        self.start_frames = max(1, start_frames)
+        self.silence_frames = max(1, math.ceil(silence_duration_ms / self.frame_ms))
+        self.pre_speech_frames = max(1, math.ceil(pre_speech_ms / self.frame_ms))
+        self.keep_tail_frames = max(0, math.ceil(keep_tail_ms / self.frame_ms))
+
+    def apply_config(self, cfg: Config) -> None:
+        """Apply per-connection VAD tunables from a :class:`Config`.
+
+        Called by the streaming layer's ``configure(cfg)`` after a client's
+        ``start.config`` / ``parameter.asr_config`` override is merged, so
+        these knobs actually take effect per connection instead of being
+        frozen at construction to the process-wide defaults.
+        """
+        self._set_tunables(
+            threshold=cfg.vad_threshold,
+            silence_duration_ms=cfg.silence_duration_ms,
+            smoothing_alpha=cfg.vad_smoothing_alpha,
+            start_frames=cfg.vad_start_frames,
+            pre_speech_ms=cfg.vad_pre_speech_ms,
+            keep_tail_ms=cfg.vad_keep_tail_ms,
         )
 
     def _prepare_vad_input(self, pcm_frame: np.ndarray) -> np.ndarray:
@@ -183,11 +225,10 @@ class VADProcessor:
             self.silent_count = 0
         else:
             self.silent_count += 1
-            end_threshold = max(self.silence_frames, self.end_frames)
-            if self.silent_count >= end_threshold:
+            if self.silent_count >= self.silence_frames:
                 # Trim trailing silence (keep a small tail for natural sound)
-                keep_tail = min(self.keep_tail_frames, end_threshold)
-                trim = end_threshold - keep_tail
+                keep_tail = min(self.keep_tail_frames, self.silence_frames)
+                trim = self.silence_frames - keep_tail
                 if trim > 0:
                     del self.audio_buffer[-trim:]
                 segment = np.concatenate(self.audio_buffer)

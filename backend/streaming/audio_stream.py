@@ -91,6 +91,11 @@ class VadSegmentedStream:
 
     def configure(self, cfg: Config) -> None:
         self._cfg = cfg
+        # Push the per-connection VAD tunables onto the live processor. Without
+        # this, start.config / parameter.asr_config overrides for vad_threshold,
+        # silence_duration_ms, etc. would silently no-op (the VAD was frozen to
+        # process-wide defaults at construction).
+        self.vad.apply_config(cfg)
         self._partial_interval = cfg.pseudo_stream_interval_ms / 1000.0
         if self._partial_override is None:
             # Partial snapshots only make sense if at least one ASR engine is

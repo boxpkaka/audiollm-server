@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -159,6 +160,24 @@ def test_vad_segmented_stream_partial_default_follows_cfg():
     s_off = VadSegmentedStream()
     s_off.configure(cfg_off)
     assert s_off._enable_partial is False
+
+
+def test_vad_segmented_stream_configure_applies_vad_overrides():
+    """Per-connection VAD overrides must reach the live VADProcessor.
+
+    Regression: configure() previously only wired pseudo-stream knobs, so
+    vad_threshold / silence_duration_ms / vad_start_frames overrides were
+    silently dropped (the VAD stayed frozen to process-wide defaults).
+    """
+    cfg = load_config().override(
+        vad_threshold=0.22, silence_duration_ms=80, vad_start_frames=3
+    )
+    stream = VadSegmentedStream()
+    stream.configure(cfg)
+    fm = stream.vad.frame_ms
+    assert stream.vad.threshold == 0.22
+    assert stream.vad.start_frames == 3
+    assert stream.vad.silence_frames == max(1, math.ceil(80 / fm))
 
 
 # ---------------------------------------------------------------------------

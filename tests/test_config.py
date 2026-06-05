@@ -89,6 +89,15 @@ def test_shipped_config_values_and_types() -> None:
     assert cfg.asr_enrollment_ttl_sec == 3600
 
 
+def test_vad_end_frames_field_removed() -> None:
+    """vad_end_frames was merged into silence_duration_ms; it must stay gone
+    from both the dataclass and the client override whitelist so it can't
+    silently reappear and reintroduce the max() config-spoofing bug."""
+    names = {f.name for f in dataclasses.fields(Config)}
+    assert "vad_end_frames" not in names
+    assert "vad_end_frames" not in CLIENT_OVERRIDABLE_FIELDS
+
+
 def test_override_uses_flat_keys_only() -> None:
     cfg = load_config()
     overridden = cfg.override(vad_threshold=0.45)

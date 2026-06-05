@@ -338,7 +338,6 @@ SERVICE=my-demo scripts/restart_service.sh   # 指定其他 systemd 服务名
 | `vad_smoothing_alpha` | float | `0.3` | 语音概率的平滑系数（0-1）。值越大波动越小，但响应越慢 |
 | `vad_start_frames` | int | `20` | 连续多少帧检测到语音才算"开始说话"。防止瞬间噪音误触发 |
 | `vad_pre_speech_ms` | int | `500` | 检测到说话后，往前多保留多少毫秒的音频。避免开头被截掉 |
-| `vad_end_frames` | int | `18` | 连续多少帧静默才算"说完了"。和 `silence_duration_ms` 配合使用 |
 | `vad_keep_tail_ms` | int | `40` | 语音结束后多保留多少毫秒的尾巴音频 |
 | `min_segment_duration_ms` | int | `350` | 低于此时长的语音片段会被丢弃（过滤噪音短脉冲） |
 

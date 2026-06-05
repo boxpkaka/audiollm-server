@@ -108,7 +108,6 @@ class Config:
     vad_smoothing_alpha: float = 0.3
     vad_start_frames: int = 20
     vad_pre_speech_ms: int = 500
-    vad_end_frames: int = 18
     vad_keep_tail_ms: int = 40
     min_segment_duration_ms: int = 350
 
@@ -233,7 +232,6 @@ CLIENT_OVERRIDABLE_FIELDS: frozenset[str] = frozenset({
     "vad_smoothing_alpha",
     "vad_start_frames",
     "vad_pre_speech_ms",
-    "vad_end_frames",
     "vad_keep_tail_ms",
     "min_segment_duration_ms",
     # Pseudo-streaming partials

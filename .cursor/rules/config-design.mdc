@@ -32,6 +32,8 @@ class Config:
 
 事故：`vad_end_frames` 与 `silence_duration_ms`（毫秒友好）都表达"切段所需的连续静音长度"，代码里 `end_threshold = max(silence_frames, end_frames)`。结果用户调 `silence_duration_ms: 200`（13 帧）完全无效，因为被 `end_frames: 25` 盖住。
 
+现状（已修复）：已按推荐做法删除 `vad_end_frames`，切段静音阈值现单一由 `silence_duration_ms` 决定（见 `backend/audio/vad.py`）。本条作为反面教材保留。
+
 正确做法（选一）：
 
 - 删除其中一个（推荐）；
