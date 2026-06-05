@@ -1,6 +1,6 @@
 # 实时转写 AST v3 WebSocket API
 
-`/tuling/ast/v3` 以讯飞图灵 AST v3 信封协议对外提供实时语音转写。它复用与 `/transcribe-streaming` 相同的 VAD 分段 + 双模型 ASR 流水线，区别仅在于线上协议：音频以 base64 编码放在 JSON 帧的 `payload.audio.audio` 中，`header.status`（0/1/2）驱动开始/中间/结束状态机，结果按 `payload.result` 词图结构返回。
+`/tuling/ast/v3` 以讯飞图灵 AST v3 信封协议对外提供实时语音转写。它复用与 `/transcribe-streaming` 相同的 VAD 分段流水线，但按端点策略恒为 primary-only：只调用主模型（默认指向独立配置的公网 Amphion-4B，见 `astv3_vllm_*`），不启用本地副模型、partial 静音门与双模型融合。另一处区别在线上协议：音频以 base64 编码放在 JSON 帧的 `payload.audio.audio` 中，`header.status`（0/1/2）驱动开始/中间/结束状态机，结果按 `payload.result` 词图结构返回。
 
 该端点与现有 `/transcribe-streaming`、`/ws/audio` 并存，互不影响。客户端可使用讯飞 `tuling-ast-sdk`（Java）或任意 WebSocket 客户端按本协议对接。
 
@@ -102,17 +102,62 @@ Client                                      Server
 
 只接受白名单内的扁平字段名；未知字段、受限字段（模型地址、密钥、连接池/队列等基础设施项）以及非法值会被忽略并保持服务端默认，不会中断连接。`language` 是特例：它不是配置字段，会被用作本次会话语言（等价于 `/transcribe-streaming` 的 `start.language`）。
 
-可覆写字段与 `/transcribe-streaming` 的 `start.config` 共用同一白名单。下表为对本端点有效的 ASR 相关字段，每个字段语义见 [通用流式 ASR WebSocket](transcribe-streaming-protocol.md) 与 [API 总览](api-reference.md) 的“临时配置覆写”：
+可覆写字段与 `/transcribe-streaming` 的 `start.config` 共用同一白名单（`backend/config.py` 的 `CLIENT_OVERRIDABLE_FIELDS`）。下面按类别逐字段说明语义：默认列为服务端 `config.json` 当前生效值，本端点列标注该字段在 AST v3 是否产生可观察效果（本端点恒为 primary-only，副模型与融合相关字段即使传入也不生效）。
 
-| 类别 | 字段 |
-|---|---|
-| VAD / 分段 | vad_threshold、silence_duration_ms、vad_smoothing_alpha、vad_start_frames、vad_pre_speech_ms、vad_end_frames、vad_keep_tail_ms、min_segment_duration_ms |
-| 伪流式 | enable_pseudo_stream、pseudo_stream_interval_ms |
-| ASR 模型组合 / 超时 | enable_primary_asr、enable_secondary_asr、enable_dual_asr_fusion、primary_asr_timeout、asr_request_timeout、debug_show_dual_asr |
-| 融合阈值 | fusion_similarity_threshold、fusion_min_primary_score、fusion_max_repetition_ratio、fusion_disagreement_threshold、fusion_hotword_boost、fusion_primary_score_margin |
-| TS-ASR | asr_enrollment_min_sec、asr_enrollment_max_sec、asr_enrollment_ttl_sec |
+VAD / 分段（凡按帧计的字段，其帧时长由 VAD 后端 hop 决定：ten-vad 约 16 ms/帧，能量兜底约 10 ms/帧）：
 
-ASR 模型组合开关存在不变量：`enable_dual_asr_fusion=true` 但 `enable_secondary_asr=false` 会被自动降级为 false（行为矩阵见 [API 总览](api-reference.md)）。共享白名单还包含情感类字段（`emotion_*`），对本 ASR 端点无效，完整清单见 [API 总览](api-reference.md)。
+| 字段 | 类型 | 默认 | 含义 | 本端点 |
+|---|---|---|---|---|
+| vad_threshold | float | 0.6 | 平滑后语音概率高于该阈值才算语音帧；越大越严格、越不易判为语音 | 生效 |
+| silence_duration_ms | int | 350 | 进入语音后连续静音达到该时长即切段，是唯一的切段静音阈值（毫秒友好，无需换算帧数） | 生效 |
+| vad_smoothing_alpha | float | 0.3 | 语音概率指数平滑系数，smoothed = alpha×上一帧 + (1−alpha)×当前帧；越大越平滑越滞后，0.3 表示当前帧权重 0.7、偏灵敏 | 生效 |
+| vad_start_frames | int | 20 | 连续多少语音帧才确认进入语音，用于起始防抖 | 生效 |
+| vad_pre_speech_ms | int | 500 | 确认语音起点后向前补回的预缓存音频时长，避免吃掉起音 | 生效 |
+| vad_keep_tail_ms | int | 40 | 切段时在结尾保留的静音尾音时长，使收尾更自然，不超过 silence_duration_ms 对应帧数 | 生效 |
+| min_segment_duration_ms | int | 350 | 短于该时长的语音段被丢弃、不送 ASR | 生效 |
+
+切段静音阈值由 `silence_duration_ms` 单独决定。上表 VAD 字段经首帧 `parameter.asr_config` 覆写后对本连接即时生效（服务端在 `configure` 时把它们应用到该连接的 VAD 实例）。
+
+伪流式：
+
+| 字段 | 类型 | 默认 | 含义 | 本端点 |
+|---|---|---|---|---|
+| enable_pseudo_stream | bool | true | 是否输出伪流式中间结果（msgtype=Progressive）；关闭后每段只在结束时发一条 sentence | 生效 |
+| pseudo_stream_interval_ms | int | 500 | 相邻中间结果之间的最小间隔 | 生效 |
+
+ASR 模型组合 / 超时：
+
+| 字段 | 类型 | 默认 | 含义 | 本端点 |
+|---|---|---|---|---|
+| enable_primary_asr | bool | true | 是否启用主模型（本端点主模型为 astv3_vllm_* 指向的公网 Amphion-4B）；置 false 则本端点无可用模型、不产出文本 | 生效 |
+| enable_secondary_asr | bool | true | 是否启用本地副模型 Qwen3，并关联副模型静音门与融合 | 无效，本端点强制为 false |
+| enable_dual_asr_fusion | bool | false | final 段是否做主副融合矫正，依赖副模型 | 无效，本端点强制为 false |
+| primary_asr_timeout | float（秒） | 4.0 | 主模型单段调用的整体墙钟超时（asyncio 层），超时即放弃本次主模型结果 | 生效 |
+| asr_request_timeout | float（秒） | 120 | 底层 HTTP 请求（httpx）的超时；主模型实际等待时间为 min(primary_asr_timeout, asr_request_timeout) | 生效 |
+| debug_show_dual_asr | bool | false | 是否在结果中附带双模型调试信息 | 无效，本端点无副模型且词图响应无调试字段 |
+
+融合阈值（仅在融合开启时参与决策；本端点融合恒关，故全部无效，列出仅为说明字段含义）：
+
+| 字段 | 类型 | 默认 | 含义 | 本端点 |
+|---|---|---|---|---|
+| fusion_similarity_threshold | float | 0.85 | 主副文本相似度（difflib 比率）不低于此值且主达标时直接采用主结果 | 无效 |
+| fusion_min_primary_score | float | 0.55 | 主模型文本质量分达标线，低于则主结果不被单独信任 | 无效 |
+| fusion_max_repetition_ratio | float | 0.35 | 主模型 token 重复率上限，超过判为复读/幻觉风险并回退副模型 | 无效 |
+| fusion_disagreement_threshold | float | 0.55 | 主副分歧度（1−相似度）上限，超过且主热词不占优时判为幻觉风险 | 无效 |
+| fusion_hotword_boost | float | 0.12 | 质量分中每命中一个热词的加分系数，累计封顶 0.35 | 无效 |
+| fusion_primary_score_margin | float | 0.08 | 主质量分需至少高出副模型该边际，才判定主明显更好 | 无效 |
+
+TS-ASR 注册参数（约束注册接口的时长校验与缓存 TTL）：
+
+| 字段 | 类型 | 默认 | 含义 | 本端点 |
+|---|---|---|---|---|
+| asr_enrollment_min_sec | float（秒） | 1.0 | 注册音频最小时长，低于返回 too_short | 首帧覆写无可观察效果，见表后说明 |
+| asr_enrollment_max_sec | float（秒） | 8.0 | 注册音频最大时长，超出尾截 | 首帧覆写无可观察效果 |
+| asr_enrollment_ttl_sec | float（秒） | 3600 | 注册缓存 TTL，最近一次使用后重新计时 | 首帧覆写无可观察效果 |
+
+这三项只在注册接口 `POST /api/asr/enrollment`（独立的 REST 调用，按服务端默认执行）生效。AST v3 首帧经 `header.resIdList` 携带的是已注册 id，本端点既不重新注册、也不消费这些值，因此在 `parameter.asr_config` 里覆写它们不会改变本连接的目标说话人行为。
+
+共享白名单还包含情感类字段（`emotion_*`，如 `emotion_task_mode`、`emotion_request_timeout` 等），仅对情感端点有效，对本 ASR 端点无效。完整白名单与各字段按类别速览见 [API 总览](api-reference.md) 的“临时配置覆写”。
 
 首帧示例（指定语言、关闭伪流式中间结果、放宽 VAD 切段）：
 

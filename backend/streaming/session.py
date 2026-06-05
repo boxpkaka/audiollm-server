@@ -94,6 +94,7 @@ class StreamingSession:
         engine: "TaskEngine",
         language: str = "",
         protocol: WireProtocol | None = None,
+        config_overrides: dict[str, Any] | None = None,
     ) -> None:
         self.ws = websocket
         self.stream = stream
@@ -104,7 +105,17 @@ class StreamingSession:
         # unchanged when no protocol is supplied.
         self.protocol: WireProtocol = protocol or NativeProtocol()
 
+        # Endpoint-level forced overrides: highest precedence. Applied here and
+        # again right after the client's start.config override (see
+        # _handle_start) so an untrusted client cannot undo an endpoint binding
+        # via parameter.asr_config / start.config. Used by /tuling/ast/v3 to
+        # pin a per-endpoint primary upstream and force primary-only
+        # (enable_secondary_asr=False -> the local secondary is never queried).
+        self._config_overrides = config_overrides
+
         self.cfg: Config = load_config()
+        if config_overrides:
+            self.cfg = self.cfg.override(**config_overrides)
         self.stream.configure(self.cfg)
 
         self.ctx = SessionContext(
@@ -256,6 +267,13 @@ class StreamingSession:
             self.ctx.cfg = self.cfg
             self.stream.configure(self.cfg)
             logger.info("Config overridden by client: %s", list(client_config.keys()))
+            # Endpoint-level overrides win over the client: re-apply them so a
+            # client cannot re-enable a force-disabled knob (e.g. AST v3's
+            # enable_secondary_asr=False) through start.config / asr_config.
+            if self._config_overrides:
+                self.cfg = self.cfg.override(**self._config_overrides)
+                self.ctx.cfg = self.cfg
+                self.stream.configure(self.cfg)
 
         lang_val = str(ctrl.get("language", "")).strip()
         if lang_val:

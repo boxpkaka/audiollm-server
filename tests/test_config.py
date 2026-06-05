@@ -79,6 +79,9 @@ def test_shipped_config_values_and_types() -> None:
     cfg = load_config()  # reads backend/config.json
     assert cfg.vllm_base_url == "http://localhost:8009"
     assert cfg.vllm_model_name == "AmphionASR-4.3B"
+    # /tuling/ast/v3 binds its own primary upstream (public Amphion-4B).
+    assert cfg.astv3_vllm_base_url == "http://159.138.9.106:8000"
+    assert cfg.astv3_vllm_model_name == "Amphion-4B"
     assert cfg.vad_threshold == 0.6
     assert cfg.enable_dual_asr_fusion is False
     assert cfg.enable_secondary_asr is True
@@ -106,6 +109,25 @@ def test_override_uses_flat_keys_only() -> None:
     # so the legacy flat override contract is preserved.
     untouched = cfg.override(**{"asr.vad.vad_threshold": 0.1})
     assert untouched.vad_threshold == cfg.vad_threshold
+
+
+def test_override_primary_does_not_touch_secondary() -> None:
+    """Endpoint-level primary rebinding (used by /tuling/ast/v3) changes only
+    the primary upstream; the secondary fields stay independent."""
+    cfg = load_config()
+    out = cfg.override(vllm_base_url="http://pub:8000", vllm_model_name="Amphion-4B")
+    assert out.vllm_base_url == "http://pub:8000"
+    assert out.vllm_model_name == "Amphion-4B"
+    assert out.secondary_vllm_base_url == cfg.secondary_vllm_base_url
+    assert out.secondary_vllm_model_name == cfg.secondary_vllm_model_name
+
+
+def test_override_secondary_off_downgrades_fusion() -> None:
+    """Forcing the AST v3 endpoint to primary-only also kills fusion."""
+    cfg = load_config().override(enable_secondary_asr=True, enable_dual_asr_fusion=True)
+    out = cfg.override(enable_secondary_asr=False)
+    assert out.enable_secondary_asr is False
+    assert out.enable_dual_asr_fusion is False
 
 
 def test_override_client_allows_whitelisted_fields() -> None:
@@ -153,6 +175,8 @@ def test_client_overridable_fields_are_real_and_safe() -> None:
     assert CLIENT_OVERRIDABLE_FIELDS <= names
     forbidden = {
         "vllm_base_url",
+        "astv3_vllm_base_url",
+        "astv3_vllm_model_name",
         "secondary_vllm_base_url",
         "emotion_vllm_base_url",
         "emotion_spec_vllm_base_url",

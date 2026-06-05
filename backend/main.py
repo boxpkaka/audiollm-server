@@ -88,11 +88,24 @@ async def tuling_ast_v3_ws(websocket: WebSocket):
     """
     await websocket.accept()
     logger.info("Tuling AST v3 connected (/tuling/ast/v3)")
+    # Endpoint policy: primary-only (no secondary / no local Qwen / no fusion),
+    # with the primary pinned to the AST v3-specific upstream when configured
+    # (empty astv3_vllm_* falls back to the global primary). These are forced
+    # overrides (see StreamingSession._config_overrides), re-applied after the
+    # client's start.config so a client cannot re-enable secondary via
+    # parameter.asr_config.
+    cfg = load_config()
+    astv3_overrides: dict[str, object] = {"enable_secondary_asr": False}
+    if cfg.astv3_vllm_base_url:
+        astv3_overrides["vllm_base_url"] = cfg.astv3_vllm_base_url
+    if cfg.astv3_vllm_model_name:
+        astv3_overrides["vllm_model_name"] = cfg.astv3_vllm_model_name
     session = StreamingSession(
         websocket,
         stream=VadSegmentedStream(),
         engine=AsrTaskEngine(emit_timing=True),
         protocol=AstV3Protocol(),
+        config_overrides=astv3_overrides,
     )
     try:
         await session.run()

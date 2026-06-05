@@ -299,11 +299,15 @@ SERVICE=my-demo scripts/restart_service.sh   # 指定其他 systemd 服务名
 |---|---|---|---|
 | `vllm_base_url` | string | `http://localhost:8009` | 主 ASR 模型的服务地址 |
 | `vllm_model_name` | string | `AmphionASR-4.3B` | 主 ASR 模型名称 |
+| `astv3_vllm_base_url` | string | `http://159.138.9.106:8000` | 仅 `/tuling/ast/v3` 端点使用的主模型地址；留空回退 `vllm_base_url`。服务端配置，不可客户端覆写 |
+| `astv3_vllm_model_name` | string | `Amphion-4B` | 仅 `/tuling/ast/v3` 端点使用的主模型名称；留空回退 `vllm_model_name`。服务端配置，不可客户端覆写 |
 | `secondary_vllm_base_url` | string | `http://localhost:8001` | 副 ASR 模型的服务地址 |
 | `secondary_vllm_model_name` | string | `Qwen/Qwen3-ASR-1.7B` | 副 ASR 模型名称 |
 | `enable_primary_asr` | bool | `true` | 是否启用主模型。关闭后只用副模型 |
 | `enable_secondary_asr` | bool | `true` | 副模型是否在线。决定 partial 是否有静音门、final 是否可融合 |
 | `enable_dual_asr_fusion` | bool | `false` | final 段是否走双模型融合矫正。关闭后 final 只跑主模型（partial 静音门不受影响）。`enable_secondary_asr=false` 时自动降级为 false |
+
+端点级主模型绑定：`/tuling/ast/v3` 恒为 primary-only（强制 `enable_secondary_asr=false`，不调用本地副模型、无 partial 静音门、无融合），其主模型默认指向上面的 `astv3_vllm_*`（公网 Amphion-4B），且客户端无法通过 `parameter.asr_config` 重新打开副模型。`/transcribe-streaming` 不受影响，按下表矩阵工作。
 
 三档 ASR 开关组合矩阵（`backend/config.json` 默认 `enable_secondary_asr=true`、`enable_dual_asr_fusion=false`，对应下表第二行）：
 

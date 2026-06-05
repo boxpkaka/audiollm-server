@@ -1002,3 +1002,73 @@ async def test_session_ast_v3_asr_config_overrides_and_whitelist():
     assert session.cfg.vad_threshold == 0.37  # whitelisted -> applied
     assert session.cfg.vllm_base_url == base_url_before  # infra field dropped
     assert stream.cfg.vad_threshold == 0.37  # stream reconfigured with new cfg
+
+
+@pytest.mark.asyncio
+async def test_session_config_overrides_force_primary_only():
+    """Endpoint-level config_overrides rebind primary and force primary-only
+    (the /tuling/ast/v3 binding) at construction, before any client frame."""
+    stream = _ScriptedStream(feed_events=[], flush_events=[])
+    engine = _RecorderEngine()
+    ws = FakeWebSocket([{"text": '{"type":"stop"}'}])
+    session = StreamingSession(
+        ws,
+        stream=stream,
+        engine=engine,
+        config_overrides={
+            "vllm_base_url": "http://pub:8000",
+            "vllm_model_name": "Amphion-4B",
+            "enable_secondary_asr": False,
+        },
+    )
+    assert session.cfg.vllm_base_url == "http://pub:8000"
+    assert session.cfg.vllm_model_name == "Amphion-4B"
+    assert session.cfg.enable_secondary_asr is False
+    assert session.cfg.enable_dual_asr_fusion is False  # auto-downgraded
+    await session.run()
+    await session.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_session_endpoint_overrides_win_over_client():
+    """A client cannot re-enable a force-disabled secondary via asr_config.
+
+    Mirrors /tuling/ast/v3: the endpoint forces primary-only, but the AST v3
+    first frame carries asr_config.enable_secondary_asr=true (a whitelisted
+    field). The re-apply after override_client must keep secondary off while
+    still honoring the client's other tuning (vad_threshold).
+    """
+    stream = _ScriptedStream(feed_events=[], flush_events=[])
+    engine = _RecorderEngine()
+    ws = FakeWebSocket(
+        [
+            _ast_frame(
+                header={"status": 0},
+                parameter={
+                    "asr_config": {
+                        "enable_secondary_asr": True,
+                        "vad_threshold": 0.4,
+                    }
+                },
+                payload={"audio": {"audio": _b64_pcm(160)}},
+            ),
+            _ast_frame(header={"status": 2}),
+        ]
+    )
+    session = StreamingSession(
+        ws,
+        stream=stream,
+        engine=engine,
+        protocol=AstV3Protocol(),
+        config_overrides={
+            "enable_secondary_asr": False,
+            "vllm_base_url": "http://pub:8000",
+        },
+    )
+    await session.run()
+    await session.cleanup()
+
+    assert session.cfg.enable_secondary_asr is False  # endpoint lock holds
+    assert session.cfg.vllm_base_url == "http://pub:8000"
+    assert session.cfg.vad_threshold == 0.4  # client tuning still applied
+    assert stream.cfg.enable_secondary_asr is False  # stream reconfigured too

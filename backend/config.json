@@ -6,6 +6,10 @@
       "enable_primary_asr": true,
       "primary_asr_timeout": 4.0
     },
+    "astv3": {
+      "astv3_vllm_base_url": "http://159.138.9.106:8000",
+      "astv3_vllm_model_name": "Amphion-4B"
+    },
     "secondary": {
       "secondary_vllm_base_url": "http://localhost:8001",
       "secondary_vllm_model_name": "Qwen/Qwen3-ASR-1.7B",

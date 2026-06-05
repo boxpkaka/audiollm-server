@@ -72,6 +72,17 @@ class Config:
     #          (fusion=True, secondary=False) are downgraded at load time.
     enable_dual_asr_fusion: bool = True
 
+    # ---- ASR: per-endpoint primary override (/tuling/ast/v3) -------------
+    # The AST v3 endpoint serves a *different* primary model than the global
+    # ``vllm_base_url``. Empty string means "fall back to the global primary";
+    # a non-empty value routes only the ``/tuling/ast/v3`` endpoint's primary
+    # to this upstream (binding wired in ``backend/main.py``). These stay out
+    # of ``CLIENT_OVERRIDABLE_FIELDS`` — model URLs are SSRF-sensitive. That
+    # endpoint also runs primary-only: secondary is force-disabled at the
+    # route, so the local Qwen is never queried there.
+    astv3_vllm_base_url: str = ""
+    astv3_vllm_model_name: str = ""
+
     # ---- ASR: dual-model fusion knobs ------------------------------------
     fusion_similarity_threshold: float = 0.85
     fusion_min_primary_score: float = 0.55
