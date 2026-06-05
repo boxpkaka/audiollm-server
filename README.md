@@ -327,6 +327,27 @@ SERVICE=my-demo scripts/restart_service.sh   # 指定其他 systemd 服务名
 | `enable_pseudo_stream` | bool | `true` | 是否开启"伪流式"——说话过程中提前输出中间结果 |
 | `pseudo_stream_interval_ms` | int | `500` | 伪流式输出的最小间隔（毫秒），值越小更新越频繁 |
 
+#### 文本规范化 (ITN / 车牌)
+
+final 转写默认做逆文本规范化（口语数字→阿拉伯数字）与车牌格式规范化；partial 保持口语形式不变（避免抖动）。通用 ITN 由本地 wetext 实现（不依赖 pynini、不联网），车牌层为零依赖正则。两者仅作用于 final，且任何异常都回退原文，不影响 ASR 主流程。
+
+| 参数 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `enable_asr_itn` | bool | `true` | 是否对 final 做通用 ITN（仅中文）：六五四三八→65438、二零二四年→2024年，以及电话/金额/百分比等 |
+| `asr_itn_enable_0_to_9` | bool | `false` | ITN 是否转换孤立个位数字（如单独的"三"）。默认 false，避免"一下/三个"类被误转 |
+| `enable_asr_plate_normalize` | bool | `true` | 是否对 final 做车牌规范化：字母大写、去车牌内分隔符、口语数字按位转阿拉伯，并按 GB 车牌形态校验后才改写 |
+
+两个开关相互独立，组合矩阵：
+
+| `enable_asr_itn` | `enable_asr_plate_normalize` | 行为 |
+|---|---|---|
+| true | true | 通用 ITN + 车牌规范化（默认） |
+| true | false | 仅通用 ITN（车牌数字串经 ITN 也会转，但不做去分隔/大写/形态校验） |
+| false | true | 仅车牌规范化（零依赖），不做通用数字 ITN |
+| false | false | 不改写，等于模型原始输出 |
+
+已知边界：省份简称被声学误识别成字母（如"冀"→"J"）属于识别错误而非格式问题，ITN/车牌层不做猜测式还原——会把数字与字母修对（车牌号为JR六五四三八→车牌号为JR65438），但省份位仍是错字。这类问题应通过热词偏置或模型层面解决。
+
 #### 语音检测 (VAD)
 
 控制服务端如何判断"用户开始说话"和"用户说完了"。

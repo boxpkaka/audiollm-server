@@ -10,6 +10,7 @@ from .asr.client import query_audio_model, query_audio_model_secondary
 from .asr.enrollment import get_enrollment_store
 from .asr.fusion import choose_fused_result
 from .asr.hotword import query_text_hotwords, sanitize_hotwords
+from .asr.itn import normalize_final_text
 from .audio.utils import Resampler48to16, pcm_to_wav_base64
 from .audio.vad import VADProcessor
 from .config import SAMPLE_RATE, default_config
@@ -524,6 +525,15 @@ class AudioSession:
                 primary_result, secondary_result, hotwords=hw_snapshot
             )
             text = str(fused.get("text") or "").strip()
+            if text:
+                # Final-only display transform (ITN + plate); partials emitted
+                # by _emit_partial deliberately stay spoken-form.
+                lang = (
+                    primary_result.get("detected_language")
+                    if primary_result
+                    else None
+                ) or ""
+                text = normalize_final_text(text, lang, default_config)
 
         # Emotion is a parallel semantic channel: prosody / paralinguistic
         # cues exist independently of whether the ASR head emitted text.

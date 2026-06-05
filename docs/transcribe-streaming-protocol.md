@@ -139,7 +139,7 @@ Client                                      Server
 |---|---|---|
 | `type` | string | `partial` 或 `partial_asr` |
 | `id` | string | 语音段 ID；可能不存在 |
-| `text` | string | 当前语音段的临时转写文本 |
+| `text` | string | 当前语音段的临时转写文本，保持口语形式（不做 ITN/车牌规范化） |
 | `language` | string | 检测或传入的语言 |
 
 ### final / final_asr
@@ -158,9 +158,16 @@ Client                                      Server
 |---|---|---|
 | `type` | string | `final` 或 `final_asr` |
 | `id` | string | 语音段 ID；可能不存在 |
-| `text` | string | 最终转写文本 |
+| `text` | string | 最终转写文本，默认已做逆文本规范化（ITN）与车牌规范化，见下方说明 |
 | `language` | string | 检测或传入的语言 |
 | `duration_sec` | number | 本次推理使用的音频时长；部分流式消息可能不带 |
+
+文本规范化（仅 final）：服务端默认对 final 文本做两类本地后处理，partial 不变：
+
+- 通用 ITN（`enable_asr_itn`，仅中文）：口语数字转写成阿拉伯形式，如 `六五四三八`→`65438`、`二零二四年`→`2024年`，电话/金额/百分比同理。
+- 车牌规范化（`enable_asr_plate_normalize`）：字母大写、去车牌内分隔符、口语数字按位转阿拉伯，并按 GB 车牌形态校验后才改写，如 `辽b二四五零七`→`辽B24507`。
+- 已知边界：省份简称被声学误识别成字母（`冀`→`J`）属识别错误，后处理只修数字与字母（`车牌号为JR六五四三八`→`车牌号为JR65438`），不还原省份字。
+- 两个开关均为服务端配置（`backend/config.json` 的 `asr.itn` 分组），不在客户端可覆写白名单内；任一处理异常都回退原文，不影响转写主流程。
 
 ### error
 
@@ -233,6 +240,7 @@ python docs/examples/ws_transcribe.py sample.wav \
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
+| `text` | string | 最终转写文本；与流式 final 一致，默认已做 ITN 与车牌规范化（开关见上文“文本规范化（仅 final）”） |
 | `enrollment_used` | boolean | 本次推理是否实际使用了目标说话人。`enrollment_id` 已过期或不存在时为 `false` |
 
 ### Python REST 示例

@@ -82,12 +82,14 @@ bytes_per_ms = 16000 * 1 * 2 / 1000 = 32
 
 | 类别 | 字段 |
 |---|---|
-| VAD / 分段 | vad_threshold、silence_duration_ms、vad_smoothing_alpha、vad_start_frames、vad_pre_speech_ms、vad_end_frames、vad_keep_tail_ms、min_segment_duration_ms |
+| VAD / 分段 | vad_threshold、silence_duration_ms、vad_smoothing_alpha、vad_start_frames、vad_pre_speech_ms、vad_keep_tail_ms、min_segment_duration_ms |
 | 伪流式 | enable_pseudo_stream、pseudo_stream_interval_ms |
 | ASR 模型组合 / 超时 | enable_primary_asr、enable_secondary_asr、enable_dual_asr_fusion、primary_asr_timeout、asr_request_timeout、debug_show_dual_asr |
 | 融合阈值 | fusion_similarity_threshold、fusion_min_primary_score、fusion_max_repetition_ratio、fusion_disagreement_threshold、fusion_hotword_boost、fusion_primary_score_margin |
 | TS-ASR | asr_enrollment_min_sec、asr_enrollment_max_sec、asr_enrollment_ttl_sec |
 | 情感（仅情感端点有效） | emotion_task_mode、emotion_request_timeout、emotion_max_audio_seconds、emotion_spec_task_mode、emotion_spec_request_timeout、emotion_spec_max_audio_seconds |
+
+final 文本规范化开关（enable_asr_itn、asr_itn_enable_0_to_9、enable_asr_plate_normalize）为服务端 config.json 配置，不在上表白名单内，客户端无法临时覆写。语义与示例见各协议文档的“文本规范化”小节与 [README 文本规范化](../README.md)。
 
 ASR 模型组合开关的语义矩阵（`enable_dual_asr_fusion=true` 但 `enable_secondary_asr=false` 会在 load 时自动降级为 false）：
 
@@ -187,6 +189,8 @@ python docs/examples/rest_upload.py asr sample.wav \
   "enrollment_used": false
 }
 ```
+
+`text`（流式 `final` 与上传响应一致）默认已做逆文本规范化（ITN，仅中文）与车牌规范化：`六五四三八`→`65438`、`辽b二四五零七`→`辽B24507`；`partial`/中间结果保持口语形式。省份简称被声学误识别成字母（`冀`→`J`）属识别错误，后处理只修数字/字母、不还原省份字。开关 `enable_asr_itn`、`asr_itn_enable_0_to_9`、`enable_asr_plate_normalize` 为服务端 `config.json` 配置（`asr.itn` 分组），不在客户端覆写白名单内；详见各协议文档的“文本规范化”小节。
 
 如需让模型只转写指定说话人的话，先用 `POST /api/asr/enrollment` 上传 1-8 秒目标人语音、拿到 `enrollment_id`，再把它作为表单字段附加到 `/api/asr/upload`，响应里的 `enrollment_used` 会变为 `true`。详细字段、错误码与 Python 代码示例见 [通用流式 ASR WebSocket](transcribe-streaming-protocol.md)。
 

@@ -21,6 +21,11 @@
       "fusion_hotword_boost": 0.12,
       "fusion_primary_score_margin": 0.08
     },
+    "itn": {
+      "enable_asr_itn": true,
+      "asr_itn_enable_0_to_9": false,
+      "enable_asr_plate_normalize": true
+    },
     "request": {
       "asr_request_timeout": 120
     },

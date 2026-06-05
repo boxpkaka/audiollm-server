@@ -217,7 +217,7 @@ ASR 模型组合开关存在不变量：`enable_dual_asr_fusion=true` 但 `enabl
 |---|---|---|
 | ws[].bg | int | 词语开始时间，单位 10 ms 帧 |
 | ws[].cw | Array | 词语识别候选 |
-| cw[].w | String | 识别文本 |
+| cw[].w | String | 识别文本；msgtype=sentence（最终结果）默认已做 ITN 与车牌规范化，msgtype=Progressive（中间结果）保持口语形式。见“文本规范化”一节 |
 | cw[].lg | String | 语种，如 zh |
 | cw[].wb | int | 词开始位置，单位 10 ms 帧（数值 ×10 为毫秒） |
 | cw[].we | int | 词结束位置，单位 10 ms 帧 |
@@ -254,6 +254,15 @@ result 示例（最终结果）：
   ]
 }
 ```
+
+## 文本规范化（仅最终结果）
+
+服务端默认对最终结果（msgtype=sentence）的 cw[].w 文本做两类本地后处理，中间结果（msgtype=Progressive）不变：
+
+- 通用 ITN（enable_asr_itn，仅中文）：口语数字转阿拉伯，如 六五四三八→65438、二零二四年→2024年。
+- 车牌规范化（enable_asr_plate_normalize）：字母大写、去车牌内分隔符、口语数字按位转阿拉伯，并按 GB 车牌形态校验后才改写，如 辽b二四五零七→辽B24507。
+- 已知边界：省份简称被声学误识别成字母（冀→J）属识别错误，后处理只修数字与字母（车牌号为JR六五四三八→车牌号为JR65438），不还原省份字。
+- 两个开关均为服务端配置（backend/config.json 的 asr.itn 分组），不在 parameter.asr_config 可覆写白名单内；任一处理异常都回退原文。
 
 ## 降级说明（重要）
 

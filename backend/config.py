@@ -80,6 +80,20 @@ class Config:
     fusion_hotword_boost: float = 0.12
     fusion_primary_score_margin: float = 0.08
 
+    # ---- ASR: inverse text normalization (ITN) + license plate -----------
+    # The model emits spoken-form text (六五四三八, 二零二四年); for display we
+    # normalize finals to written form. Two independent switches (final only —
+    # partials stay spoken-form to avoid flicker):
+    #   enable_asr_itn             -> general ITN via wetext (Chinese only)
+    #   enable_asr_plate_normalize -> zero-dep plate pass: uppercase plate
+    #                                 letters, strip in-plate separators, map
+    #                                 spoken digits, GB-plate-shape validated.
+    # A province abbreviation misheard as a Latin letter (冀->J) is a
+    # recognition error and is intentionally NOT recovered here.
+    enable_asr_itn: bool = True
+    asr_itn_enable_0_to_9: bool = False
+    enable_asr_plate_normalize: bool = True
+
     # ---- Common: HTTP / pseudo-streaming ---------------------------------
     asr_request_timeout: float = 120
     enable_pseudo_stream: bool = True

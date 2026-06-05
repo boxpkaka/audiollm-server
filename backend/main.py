@@ -16,6 +16,7 @@ from .asr.enrollment import (
     get_enrollment_store,
 )
 from .asr.fusion import choose_fused_result
+from .asr.itn import normalize_final_text
 from .audio.utils import wav_base64_to_pcm_16k_mono
 from .config import SAMPLE_RATE, load_config
 from .emotion.client import query_emotion_model
@@ -362,6 +363,11 @@ async def _run_dual_asr_upload(
         text = str(fusion_payload.get("text") or "").strip()
         if primary_result and primary_result.get("detected_language"):
             detected_lang = primary_result["detected_language"]
+
+    # Final-only display transform (ITN + plate normalization), matching the
+    # streaming engines so REST and WS clients see the same written form.
+    if text:
+        text = normalize_final_text(text, detected_lang, cfg)
 
     raw_text = ""
     if primary_result:

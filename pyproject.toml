@@ -19,6 +19,7 @@ dependencies = [
     "python-multipart",
     "ten-vad",
     "uvicorn[standard]",
+    "wetext>=0.1.2",
 ]
 
 [project.optional-dependencies]

@@ -8,6 +8,7 @@ import time
 
 from ..asr.client import query_audio_model, query_audio_model_secondary
 from ..asr.fusion import choose_fused_result
+from ..asr.itn import normalize_final_text
 from ..audio.utils import pcm_to_wav_base64
 from ..config import SAMPLE_RATE
 from ..streaming.events import PartialSnapshot, SegmentReady
@@ -88,6 +89,10 @@ class AsrTaskEngine(BaseTaskEngine):
         text, detected_lang = self._select_text(
             primary_result, secondary_result, hw_snapshot, ctx
         )
+        # ITN + plate normalization is a final-only display transform; partials
+        # stay spoken-form (see handle_partial).
+        if text:
+            text = normalize_final_text(text, detected_lang, cfg)
 
         elapsed = time.monotonic() - t0
         rtf = elapsed / audio_duration if audio_duration > 0 else 0.0
