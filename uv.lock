@@ -59,13 +59,13 @@ dependencies = [
     { name = "python-multipart" },
     { name = "ten-vad" },
     { name = "uvicorn", extra = ["standard"] },
+    { name = "websockets" },
     { name = "wetext" },
 ]
 
 [package.optional-dependencies]
 dev = [
     { name = "ruff" },
-    { name = "websockets" },
 ]
 
 [package.metadata]
@@ -77,7 +77,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "ten-vad" },
     { name = "uvicorn", extras = ["standard"] },
-    { name = "websockets", marker = "extra == 'dev'" },
+    { name = "websockets" },
     { name = "wetext", specifier = ">=0.1.2" },
 ]
 provides-extras = ["dev"]
