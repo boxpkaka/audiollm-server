@@ -192,7 +192,8 @@ Client                                      Server
 | silence_duration_ms | integer | 静音持续多久后切段 |
 | min_segment_duration_ms | integer | 短于该值的语音段会被丢弃 |
 | enable_pseudo_stream | boolean | 是否输出伪流式中间结果 |
-| pseudo_stream_interval_ms | integer | 伪流式中间结果间隔 |
+| pseudo_stream_interval_ms | integer | 伪流式中间结果间隔（仅节流首个之后的刷新，不影响首字） |
+| pseudo_stream_first_partial_ms | integer | 每段语音首个 partial（伪流式中间结果）的触发门槛，从 min_segment_duration_ms 解耦（config.json 默认 200，已低于 min_segment 350）；与 vad_start_frames 按 max 决定首字延迟 |
 | asr_request_timeout | number | 单次 ASR 模型请求超时秒数 |
 | enable_primary_asr | boolean | 是否启用主模型 |
 | enable_secondary_asr | boolean | 是否启用副模型；关闭后无副模型静音门、无融合 |

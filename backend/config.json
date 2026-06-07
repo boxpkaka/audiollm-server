@@ -7,8 +7,8 @@
       "primary_asr_timeout": 4.0
     },
     "astv3": {
-      "astv3_vllm_base_url": "http://159.138.9.106:8000",
-      "astv3_vllm_model_name": "Amphion-4B"
+      "astv3_vllm_base_url": "",
+      "astv3_vllm_model_name": ""
     },
     "secondary": {
       "secondary_vllm_base_url": "http://localhost:8001",
@@ -35,7 +35,8 @@
     },
     "pseudo_stream": {
       "enable_pseudo_stream": true,
-      "pseudo_stream_interval_ms": 500
+      "pseudo_stream_interval_ms": 500,
+      "pseudo_stream_first_partial_ms": 200
     },
     "enrollment": {
       "asr_enrollment_min_sec": 1.0,

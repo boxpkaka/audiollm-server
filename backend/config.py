@@ -135,6 +135,18 @@ class Config:
     vad_pre_speech_ms: int = 500
     vad_keep_tail_ms: int = 40
     min_segment_duration_ms: int = 350
+    # 每段语音"首个 partial(伪流式中间结果)"的触发门槛:VAD 累积音频达到它才发出
+    # 第一个 partial。因一段语音内 snapshot 单调增长(audio_buffer 只增不减),过了
+    # 门槛后续 partial 必然更长,该门槛只对每段的首个 partial 真正 binding,故它实质
+    # 是首字延迟旋钮 —— 与 vad_start_frames 一起按 max 决定首字(见
+    # docs/tuling-ast-v3-protocol.md "首字延迟优化")。从 min_segment_duration_ms 解耦
+    # 的原因:后者一参多职(还管 final 段过滤、flush 残余过滤),直接调它会放松短噪声
+    # 段过滤。这里的 dataclass 默认 350(= min_segment_duration_ms)是"文件缺字段时的
+    # 中性兜底";随附的 backend/config.json 显式设 200,即默认部署选择全局低延迟首字
+    # (对所有产 partial 的端点生效,不止 tuling)。注意只把它降到 200 而 vad_start_frames
+    # 仍 20 时,首字 max 仍由起音确认(约 320ms)主导,需同时调小 vad_start_frames 才到
+    # 最优。不变量 first_partial<=min_segment 见 __post_init__。
+    pseudo_stream_first_partial_ms: int = 350
 
     # ---- Emotion recognition: vLLM endpoint ------------------------------
     # The Amphion multi-task model is trained to handle SER/SEC alongside ASR
@@ -195,6 +207,13 @@ class Config:
         # silent to avoid log spam.
         if self.enable_dual_asr_fusion and not self.enable_secondary_asr:
             object.__setattr__(self, "enable_dual_asr_fusion", False)
+        # 首个 partial 门槛若严于 final 段最小时长,partial 就会永远比 final 晚、失去
+        # "中间结果"意义;夹到 <= min_segment_duration_ms。和 fusion 不变量一样下沉
+        # 到 dataclass,确保 load/override/直接构造(测试)各路径都一致。
+        if self.pseudo_stream_first_partial_ms > self.min_segment_duration_ms:
+            object.__setattr__(
+                self, "pseudo_stream_first_partial_ms", self.min_segment_duration_ms
+            )
 
     @property
     def resolved_text_cleanup_api_key(self) -> str:
@@ -262,6 +281,7 @@ CLIENT_OVERRIDABLE_FIELDS: frozenset[str] = frozenset({
     # Pseudo-streaming partials
     "enable_pseudo_stream",
     "pseudo_stream_interval_ms",
+    "pseudo_stream_first_partial_ms",
     # ASR model combination / timeouts
     "enable_primary_asr",
     "enable_secondary_asr",

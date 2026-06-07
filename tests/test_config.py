@@ -79,10 +79,16 @@ def test_shipped_config_values_and_types() -> None:
     cfg = load_config()  # reads backend/config.json
     assert cfg.vllm_base_url == "http://localhost:8009"
     assert cfg.vllm_model_name == "AmphionASR-4.3B"
-    # /tuling/ast/v3 binds its own primary upstream (public Amphion-4B).
-    assert cfg.astv3_vllm_base_url == "http://159.138.9.106:8000"
-    assert cfg.astv3_vllm_model_name == "Amphion-4B"
+    # /tuling/ast/v3 leaves its per-endpoint primary empty -> falls back to
+    # the global primary (vllm_base_url / vllm_model_name above).
+    assert cfg.astv3_vllm_base_url == ""
+    assert cfg.astv3_vllm_model_name == ""
     assert cfg.vad_threshold == 0.6
+    # config.json 显式给 pseudo_stream_first_partial_ms=200(< min_segment 350):默认
+    # 部署选择全局低延迟首字(对所有产 partial 的端点生效)。dataclass 兜底是中性 350,
+    # 见 test_pseudo_stream_first_partial_dataclass_default_is_neutral。
+    assert cfg.min_segment_duration_ms == 350
+    assert cfg.pseudo_stream_first_partial_ms == 200
     assert cfg.enable_dual_asr_fusion is False
     assert cfg.enable_secondary_asr is True
     assert cfg.emotion_task_mode == "ser"
@@ -99,6 +105,39 @@ def test_vad_end_frames_field_removed() -> None:
     names = {f.name for f in dataclasses.fields(Config)}
     assert "vad_end_frames" not in names
     assert "vad_end_frames" not in CLIENT_OVERRIDABLE_FIELDS
+
+
+def test_pseudo_stream_first_partial_dataclass_default_is_neutral() -> None:
+    """dataclass 兜底默认(无 config.json、直接 Config())== min_segment_duration_ms,即
+    文件缺字段时首个 partial 门槛中性。随附 config.json 显式设 200(低延迟),shipped 值见
+    test_shipped_config_values_and_types;两者分层:代码兜底中性、部署选择激进。"""
+    cfg = Config()
+    assert cfg.pseudo_stream_first_partial_ms == cfg.min_segment_duration_ms == 350
+
+
+def test_pseudo_stream_first_partial_clamped_to_min_segment() -> None:
+    """不变量:首字门槛不得严于 final 段最小时长。任何构造路径(含测试里直接
+    Config(...))都被 __post_init__ 夹到 <= min_segment_duration_ms。"""
+    clamped = Config(pseudo_stream_first_partial_ms=500, min_segment_duration_ms=350)
+    assert clamped.pseudo_stream_first_partial_ms == 350
+    # 合法的更低值保持不变。
+    lower = Config(pseudo_stream_first_partial_ms=200, min_segment_duration_ms=350)
+    assert lower.pseudo_stream_first_partial_ms == 200
+
+
+def test_pseudo_stream_first_partial_client_overridable() -> None:
+    """tuling 低延迟靠 per-connection 覆写 pseudo_stream_first_partial_ms 激活。"""
+    assert "pseudo_stream_first_partial_ms" in CLIENT_OVERRIDABLE_FIELDS
+    out = load_config().override_client(pseudo_stream_first_partial_ms=200)
+    assert out.pseudo_stream_first_partial_ms == 200
+
+
+def test_pseudo_stream_first_partial_clamp_applies_on_override() -> None:
+    """覆写路径(override -> replace -> __post_init__)同样执行 clamp:首字门槛被设得
+    比当前 min_segment 还大时夹到 min_segment。"""
+    cfg = load_config().override(min_segment_duration_ms=300)
+    out = cfg.override_client(pseudo_stream_first_partial_ms=400)
+    assert out.pseudo_stream_first_partial_ms == 300
 
 
 def test_override_uses_flat_keys_only() -> None:

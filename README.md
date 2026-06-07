@@ -299,15 +299,15 @@ SERVICE=my-demo scripts/restart_service.sh   # 指定其他 systemd 服务名
 |---|---|---|---|
 | `vllm_base_url` | string | `http://localhost:8009` | 主 ASR 模型的服务地址 |
 | `vllm_model_name` | string | `AmphionASR-4.3B` | 主 ASR 模型名称 |
-| `astv3_vllm_base_url` | string | `http://159.138.9.106:8000` | 仅 `/tuling/ast/v3` 端点使用的主模型地址；留空回退 `vllm_base_url`。服务端配置，不可客户端覆写 |
-| `astv3_vllm_model_name` | string | `Amphion-4B` | 仅 `/tuling/ast/v3` 端点使用的主模型名称；留空回退 `vllm_model_name`。服务端配置，不可客户端覆写 |
+| `astv3_vllm_base_url` | string | `""` | 仅 `/tuling/ast/v3` 端点使用的主模型地址；当前留空，回退全局 `vllm_base_url`（即 `http://localhost:8009`）。服务端配置，不可客户端覆写 |
+| `astv3_vllm_model_name` | string | `""` | 仅 `/tuling/ast/v3` 端点使用的主模型名称；当前留空，回退全局 `vllm_model_name`（即 `AmphionASR-4.3B`）。服务端配置，不可客户端覆写 |
 | `secondary_vllm_base_url` | string | `http://localhost:8001` | 副 ASR 模型的服务地址 |
 | `secondary_vllm_model_name` | string | `Qwen/Qwen3-ASR-1.7B` | 副 ASR 模型名称 |
 | `enable_primary_asr` | bool | `true` | 是否启用主模型。关闭后只用副模型 |
 | `enable_secondary_asr` | bool | `true` | 副模型是否在线。决定 partial 是否有静音门、final 是否可融合 |
 | `enable_dual_asr_fusion` | bool | `false` | final 段是否走双模型融合矫正。关闭后 final 只跑主模型（partial 静音门不受影响）。`enable_secondary_asr=false` 时自动降级为 false |
 
-端点级主模型绑定：`/tuling/ast/v3` 恒为 primary-only（强制 `enable_secondary_asr=false`，不调用本地副模型、无 partial 静音门、无融合），其主模型默认指向上面的 `astv3_vllm_*`（公网 Amphion-4B），且客户端无法通过 `parameter.asr_config` 重新打开副模型。`/transcribe-streaming` 不受影响，按下表矩阵工作。
+端点级主模型绑定：`/tuling/ast/v3` 恒为 primary-only（强制 `enable_secondary_asr=false`，不调用本地副模型、无 partial 静音门、无融合），其主模型由上面的 `astv3_vllm_*` 指定，当前留空，回退全局 primary（`vllm_base_url`，即 `http://localhost:8009` 的 `AmphionASR-4.3B`），且客户端无法通过 `parameter.asr_config` 重新打开副模型。`/transcribe-streaming` 不受影响，按下表矩阵工作。
 
 三档 ASR 开关组合矩阵（`backend/config.json` 默认 `enable_secondary_asr=true`、`enable_dual_asr_fusion=false`，对应下表第二行）：
 
@@ -329,7 +329,8 @@ SERVICE=my-demo scripts/restart_service.sh   # 指定其他 systemd 服务名
 | 参数 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `enable_pseudo_stream` | bool | `true` | 是否开启"伪流式"——说话过程中提前输出中间结果 |
-| `pseudo_stream_interval_ms` | int | `500` | 伪流式输出的最小间隔（毫秒），值越小更新越频繁 |
+| `pseudo_stream_interval_ms` | int | `500` | 伪流式输出的最小间隔（毫秒），值越小更新越频繁；仅节流首个之后的刷新，不影响首字 |
+| `pseudo_stream_first_partial_ms` | int | `200` | 每段语音首个 partial（伪流式中间结果）的触发门槛，从 `min_segment_duration_ms` 解耦（dataclass 兜底 350，config.json 默认设 200 走低延迟）；与 `vad_start_frames` 按 max 决定首字延迟 |
 
 #### 文本规范化 (ITN / 车牌)
 

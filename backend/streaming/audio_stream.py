@@ -127,6 +127,17 @@ class VadSegmentedStream:
 
         cfg = self.cfg
         min_samples = int(SAMPLE_RATE * cfg.min_segment_duration_ms / 1000)
+        # The first partial of each utterance uses its own decoupled floor:
+        # lowering it speeds up the first partial without relaxing the
+        # final-segment short-noise filter, which keeps using ``min_samples``
+        # (line below and in ``flush``). Snapshots grow monotonically within an
+        # utterance, so this floor only ever gates the first partial; later ones
+        # are already longer. ``Config.__post_init__`` guarantees
+        # pseudo_stream_first_partial_ms <= min_segment_duration_ms, so this
+        # floor is never stricter than final's.
+        first_partial_min_samples = int(
+            SAMPLE_RATE * cfg.pseudo_stream_first_partial_ms / 1000
+        )
 
         base = self._consumed_samples
         for i in range(0, used, hop):
@@ -169,7 +180,7 @@ class VadSegmentedStream:
             now = time.monotonic()
             if now - self._last_partial_time >= self._partial_interval:
                 snapshot = self.vad.snapshot_incomplete_speech()
-                if snapshot is not None and len(snapshot) >= min_samples:
+                if snapshot is not None and len(snapshot) >= first_partial_min_samples:
                     self._last_partial_time = now
                     events.append(PartialSnapshot(pcm=snapshot))
 

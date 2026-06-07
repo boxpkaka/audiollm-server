@@ -4,7 +4,8 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket
+import websockets
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.types import Receive, Scope, Send
@@ -111,6 +112,90 @@ async def tuling_ast_v3_ws(websocket: WebSocket):
         await session.run()
     finally:
         await session.cleanup()
+
+
+# Hard-coded remote AST v3 backend that the "实时语音识别（测试用）" page targets.
+# It speaks plaintext ws://, so an HTTPS-served frontend (playground.amphion.top)
+# cannot open it directly — the browser's mixed-content policy forbids ws:// from
+# an https:// page. The same-origin proxy below bridges the browser's wss://
+# connection to it. Temporary test scaffolding: the address is intentionally
+# pinned here, not exposed as config.
+ASTV3_TEST_PROXY_UPSTREAM = "ws://159.138.9.106:18080/tuling/ast/v3"
+
+
+async def _astv3_proxy_pump_to_upstream(client: WebSocket, upstream) -> None:
+    """Relay browser -> upstream frames verbatim (text or binary)."""
+    try:
+        while True:
+            message = await client.receive()
+            if message["type"] == "websocket.disconnect":
+                break
+            text = message.get("text")
+            if text is not None:
+                await upstream.send(text)
+                continue
+            data = message.get("bytes")
+            if data is not None:
+                await upstream.send(data)
+    except (WebSocketDisconnect, websockets.ConnectionClosed, RuntimeError):
+        pass
+    finally:
+        # Closing the upstream unblocks the opposite pump's async-for so the
+        # whole proxy tears down once either side goes away.
+        await upstream.close()
+
+
+async def _astv3_proxy_pump_to_client(upstream, client: WebSocket) -> None:
+    """Relay upstream -> browser frames verbatim (text or binary)."""
+    try:
+        async for message in upstream:
+            if isinstance(message, (bytes, bytearray)):
+                await client.send_bytes(bytes(message))
+            else:
+                await client.send_text(message)
+    except (websockets.ConnectionClosed, WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
+        try:
+            await client.close()
+        except RuntimeError:
+            # client transport already closed; nothing to do
+            pass
+
+
+@app.websocket("/astv3-test-proxy")
+async def astv3_test_proxy_ws(websocket: WebSocket):
+    """Same-origin WebSocket proxy for the AST v3 test page.
+
+    The "实时语音识别（测试用）" page is served over HTTPS but its target backend
+    speaks plaintext ws:// (``ASTV3_TEST_PROXY_UPSTREAM``), which the browser's
+    mixed-content policy forbids opening from an HTTPS page. This endpoint accepts
+    the browser's same-origin (wss://) connection and relays every frame, in both
+    directions, to/from that upstream without inspecting the AST v3 envelope. It
+    is a transparent byte pump, so the on-the-wire contract is identical to
+    ``/tuling/ast/v3`` (see ``docs/tuling-ast-v3-protocol.md``).
+
+    Temporary test scaffolding: the upstream address is hard-coded.
+    """
+    await websocket.accept()
+    logger.info("AST v3 test proxy connected -> %s", ASTV3_TEST_PROXY_UPSTREAM)
+    try:
+        async with websockets.connect(
+            ASTV3_TEST_PROXY_UPSTREAM, max_size=None, open_timeout=10
+        ) as upstream:
+            await asyncio.gather(
+                _astv3_proxy_pump_to_upstream(websocket, upstream),
+                _astv3_proxy_pump_to_client(upstream, websocket),
+            )
+    except WebSocketDisconnect:
+        # Browser hung up before/while the upstream was being dialed.
+        pass
+    except Exception as exc:  # upstream connect / handshake failure
+        logger.warning("AST v3 test proxy upstream error: %s", exc)
+        try:
+            await websocket.close(code=1011)
+        except RuntimeError:
+            pass
 
 
 @app.websocket("/emotion-segmented-streaming")

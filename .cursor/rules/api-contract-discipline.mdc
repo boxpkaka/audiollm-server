@@ -44,6 +44,7 @@ alwaysApply: true
 | `@app.websocket("/ws/audio")` | `docs/api-reference.md`（浏览器 demo 调试接口；外部集成不推荐） |
 | `@app.websocket("/transcribe-streaming")` | `docs/transcribe-streaming-protocol.md` + `docs/api-reference.md` 速览 |
 | `@app.websocket("/tuling/ast/v3")` | `docs/tuling-ast-v3-protocol.md` + `docs/api-reference.md` 速览 |
+| `@app.websocket("/astv3-test-proxy")` | `docs/api-reference.md`（AST v3 测试页同源代理；透明转发，无独立协议） |
 | `@app.websocket("/emotion-segmented-streaming")` | `docs/emotion-segmented-streaming-protocol.md` + `docs/api-reference.md` 速览 |
 | `@app.post("/api/asr/upload")` | `docs/api-reference.md` |
 | `@app.post("/api/asr/enrollment")` | `docs/api-reference.md` + `docs/transcribe-streaming-protocol.md` 注册接口章节 |

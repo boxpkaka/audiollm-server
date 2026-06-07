@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from backend.config import load_config  # noqa: E402
+from backend.config import SAMPLE_RATE, load_config  # noqa: E402
 from backend.streaming.audio_stream import (  # noqa: E402
     VadSegmentedStream,
     WholeUtteranceStream,
@@ -178,6 +178,67 @@ def test_vad_segmented_stream_configure_applies_vad_overrides():
     assert stream.vad.threshold == 0.22
     assert stream.vad.start_frames == 3
     assert stream.vad.silence_frames == max(1, math.ceil(80 / fm))
+
+
+class _SpeakingFakeVad:
+    """受控 VAD 替身:首帧即进入 speaking、process 永不切段、snapshot 返回固定
+    长度。用来隔离 partial 门槛逻辑,不依赖真实 TenVad/energy 的语音判定。"""
+
+    def __init__(self, *, snapshot_samples: int, hop_size: int = 256):
+        self.hop_size = hop_size
+        self.is_speaking = False
+        self._snap = np.zeros(snapshot_samples, dtype=np.float32)
+
+    def apply_config(self, cfg) -> None:  # noqa: D401 - test stub
+        pass
+
+    def process(self, frame):
+        self.is_speaking = True
+        return None  # 永不返回 segment -> 维持 speaking,只走 partial 路径
+
+    def snapshot_incomplete_speech(self):
+        return self._snap if self.is_speaking else None
+
+    def flush(self):
+        return None
+
+
+def test_partial_uses_decoupled_floor_below_min_segment():
+    """解耦核心:snapshot 时长介于 partial 门槛(200ms)与 min_segment(350ms)之间
+    时仍产出 PartialSnapshot。回归点:解耦前 partial 复用 min_segment 的 min_samples,
+    250ms 的 snapshot 会被 350ms 卡住、首字延后。"""
+    cfg = load_config().override(
+        pseudo_stream_first_partial_ms=200,
+        min_segment_duration_ms=350,
+        enable_pseudo_stream=True,
+    )
+    stream = VadSegmentedStream()
+    stream.configure(cfg)
+    snap_samples = int(SAMPLE_RATE * 250 / 1000)  # 250ms
+    stream.vad = _SpeakingFakeVad(snapshot_samples=snap_samples)
+
+    events = list(stream.feed(_tone_pcm_bytes(stream.vad.hop_size * 4)))
+    kinds = [type(e).__name__ for e in events]
+    assert "SpeechStarted" in kinds
+    partials = [e for e in events if isinstance(e, PartialSnapshot)]
+    assert len(partials) == 1
+    assert partials[0].pcm.shape == (snap_samples,)
+
+
+def test_partial_floor_still_blocks_too_short_snapshot():
+    """对照:snapshot 短于 partial 门槛时不产 partial(门槛仍生效,只是被调低)。"""
+    cfg = load_config().override(
+        pseudo_stream_first_partial_ms=200,
+        min_segment_duration_ms=350,
+        enable_pseudo_stream=True,
+    )
+    stream = VadSegmentedStream()
+    stream.configure(cfg)
+    snap_samples = int(SAMPLE_RATE * 120 / 1000)  # 120ms < 200ms 门槛
+    stream.vad = _SpeakingFakeVad(snapshot_samples=snap_samples)
+
+    events = list(stream.feed(_tone_pcm_bytes(stream.vad.hop_size * 4)))
+    assert not any(isinstance(e, PartialSnapshot) for e in events)
 
 
 # ---------------------------------------------------------------------------

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title data-i18n-doc-title="asr.titleTag" data-i18n="asr.titleTag">Amphion Demo</title>
+  <title data-i18n-doc-title="asrtest.titleTag" data-i18n="asrtest.titleTag">Amphion Demo (Test)</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link
@@ -15,14 +15,14 @@
   <link rel="stylesheet" href="tailwind.css" />
   <link rel="stylesheet" href="style.css" />
 </head>
-<body data-page="asr">
+<body data-page="asr-test">
   <div class="app-shell">
     <!-- Sidebar is injected by sidebar.js -->
     <main class="app-main">
       <header class="page-header">
         <div>
-          <h1 class="page-title" data-i18n="asr.title">Realtime ASR</h1>
-          <p class="page-sub" data-i18n="asr.subtitle">Stream your voice and watch the transcript arrive as you speak.</p>
+          <h1 class="page-title" data-i18n="asrtest.title">Realtime ASR (Test)</h1>
+          <p class="page-sub" data-i18n="asrtest.subtitle">Stream your voice and watch the transcript arrive as you speak.</p>
         </div>
       </header>
 
@@ -38,7 +38,7 @@
                             d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/>
                     </svg>
                   </div>
-                  <div class="chat-bubble chat-bubble-ai leading-relaxed" data-i18n-html="asr.greeting.html">
+                  <div class="chat-bubble chat-bubble-ai leading-relaxed" data-i18n-html="asrtest.greeting.html">
                     Ready when you are. Click the microphone to begin speaking and I'll transcribe your audio in real time.
                     <br/><br/>
                     <span class="text-muted">Tip: add hotwords in the right panel to improve recognition on domain-specific terms.</span>
@@ -202,9 +202,9 @@
   </div>
 
   <script src="i18n.js"></script>
-  <!-- All three demo pages share the same SPA shell, so every entry
-       HTML loads every page module. The router (router.js) decides
-       which one to mount based on body[data-page]. -->
+  <!-- All demo pages share the same SPA shell, so every entry HTML loads
+       every page module. The router (router.js) decides which one to mount
+       based on body[data-page]. app-test.js is the AST v3 test page module. -->
   <script src="audio-upload.js"></script>
   <script src="streaming-text.js"></script>
   <script src="enrollment.js"></script>

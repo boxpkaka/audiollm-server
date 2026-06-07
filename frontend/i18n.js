@@ -56,6 +56,24 @@
       "Ready when you are. Click the microphone to begin speaking and I'll transcribe your audio in real time."
       + '<br/><br/>'
       + '<span class="text-muted">Tip: add hotwords in the right panel to improve recognition on domain-specific terms.</span>',
+
+    // ---- ASR test page (AST v3) ----
+    'nav.asrTest': 'Realtime ASR (Test)',
+    'asrtest.titleTag': 'Amphion Demo (Test)',
+    'asrtest.title': 'Realtime ASR (Test)',
+    'asrtest.subtitle': "Stream your voice and watch the transcript arrive as you speak.",
+    'asrtest.greeting.html':
+      "Ready when you are. Click the microphone to begin speaking and I'll transcribe your audio in real time."
+      + '<br/><br/>'
+      + '<span class="text-muted">Tip: add hotwords in the right panel to improve recognition on domain-specific terms.</span>',
+    'asrtest.unsupported': 'Not supported by AST v3',
+    'asrtest.mic.insecure':
+      'Microphone unavailable. Open this page over HTTPS or http://localhost — '
+      + 'plain HTTP on a remote host is a non-secure context where the browser blocks the mic.',
+    'asrtest.ws.blocked':
+      'The browser blocked the WebSocket. An HTTPS page cannot open a plaintext ws:// (mixed content); '
+      + 'open the page over HTTP/localhost, or serve the backend over wss://.',
+
     'asr.mic.start': 'Click to start',
     'asr.mic.listening': 'Listening...',
     'asr.mic.aria': 'Toggle microphone',
@@ -275,6 +293,24 @@
       '准备就绪。点击麦克风开始说话，我会实时转写你的语音。'
       + '<br/><br/>'
       + '<span class="text-muted">提示：在右侧添加热词，可提升专业术语的识别效果。</span>',
+
+    // ---- 实时识别测试页 (AST v3) ----
+    'nav.asrTest': '实时识别(测试)',
+    'asrtest.titleTag': 'Amphion 演示（测试）',
+    'asrtest.title': '实时语音识别（测试用）',
+    'asrtest.subtitle': '边说边看，转写实时呈现。',
+    'asrtest.greeting.html':
+      '准备就绪。点击麦克风开始说话，我会实时转写你的语音。'
+      + '<br/><br/>'
+      + '<span class="text-muted">提示：在右侧添加热词，可提升专业术语的识别效果。</span>',
+    'asrtest.unsupported': 'AST v3 暂不支持',
+    'asrtest.mic.insecure':
+      '麦克风不可用：请用 HTTPS 或 http://localhost 打开本页。'
+      + '通过远程 IP 的明文 HTTP 属于非安全上下文，浏览器会禁用麦克风。',
+    'asrtest.ws.blocked':
+      '浏览器阻止了 WebSocket 连接：HTTPS 页面无法连接明文 ws://（混合内容）。'
+      + '请改用 HTTP/localhost 打开本页，或让后端提供 wss://。',
+
     'asr.mic.start': '点击开始',
     'asr.mic.listening': '聆听中…',
     'asr.mic.aria': '切换麦克风',

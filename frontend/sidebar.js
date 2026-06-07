@@ -48,6 +48,15 @@
         + '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8"'
         + ' d="M9 10h.01M15 10h.01M9 15c.9.8 1.9 1.2 3 1.2s2.1-.4 3-1.2"/>',
     },
+    {
+      key: 'asr-test',
+      href: 'asr-test.html',
+      i18nKey: 'nav.asrTest',
+      icon:
+        '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8"'
+        + ' d="M9 3h6M10 3v6.5L5.2 18.2A1.6 1.6 0 006.6 20.6h10.8a1.6 1.6 0 001.4-2.4L14 9.5V3"/>'
+        + '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M8.5 14h7"/>',
+    },
   ];
 
   const BRAND_ICON_SVG =

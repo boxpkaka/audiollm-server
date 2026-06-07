@@ -1,6 +1,6 @@
 # 实时转写 AST v3 WebSocket API
 
-`/tuling/ast/v3` 以讯飞图灵 AST v3 信封协议对外提供实时语音转写。它复用与 `/transcribe-streaming` 相同的 VAD 分段流水线，但按端点策略恒为 primary-only：只调用主模型（默认指向独立配置的公网 Amphion-4B，见 `astv3_vllm_*`），不启用本地副模型、partial 静音门与双模型融合。另一处区别在线上协议：音频以 base64 编码放在 JSON 帧的 `payload.audio.audio` 中，`header.status`（0/1/2）驱动开始/中间/结束状态机，结果按 `payload.result` 词图结构返回。
+`/tuling/ast/v3` 以讯飞图灵 AST v3 信封协议对外提供实时语音转写。它复用与 `/transcribe-streaming` 相同的 VAD 分段流水线，但按端点策略恒为 primary-only：只调用主模型（由 `astv3_vllm_*` 指定，当前留空，回退全局 primary `vllm_base_url`），不启用本地副模型、partial 静音门与双模型融合。另一处区别在线上协议：音频以 base64 编码放在 JSON 帧的 `payload.audio.audio` 中，`header.status`（0/1/2）驱动开始/中间/结束状态机，结果按 `payload.result` 词图结构返回。
 
 该端点与现有 `/transcribe-streaming`、`/ws/audio` 并存，互不影响。客户端可使用讯飞 `tuling-ast-sdk`（Java）或任意 WebSocket 客户端按本协议对接。
 
@@ -123,13 +123,14 @@ VAD / 分段（凡按帧计的字段，其帧时长由 VAD 后端 hop 决定：t
 | 字段 | 类型 | 默认 | 含义 | 本端点 |
 |---|---|---|---|---|
 | enable_pseudo_stream | bool | true | 是否输出伪流式中间结果（msgtype=Progressive）；关闭后每段只在结束时发一条 sentence | 生效 |
-| pseudo_stream_interval_ms | int | 500 | 相邻中间结果之间的最小间隔 | 生效 |
+| pseudo_stream_interval_ms | int | 500 | 相邻中间结果之间的最小间隔（仅节流首个之后的刷新，不影响首字） | 生效 |
+| pseudo_stream_first_partial_ms | int | 200 | 每段语音首个 partial 的触发门槛，从 min_segment_duration_ms 解耦（dataclass 兜底 350，config.json 默认设 200 走低延迟）；与 vad_start_frames 按 max 决定首字，min_segment_duration_ms 仍独立控制 final 段短噪声过滤 | 生效 |
 
 ASR 模型组合 / 超时：
 
 | 字段 | 类型 | 默认 | 含义 | 本端点 |
 |---|---|---|---|---|
-| enable_primary_asr | bool | true | 是否启用主模型（本端点主模型为 astv3_vllm_* 指向的公网 Amphion-4B）；置 false 则本端点无可用模型、不产出文本 | 生效 |
+| enable_primary_asr | bool | true | 是否启用主模型（本端点主模型由 astv3_vllm_* 指定，当前留空，回退全局 vllm_base_url）；置 false 则本端点无可用模型、不产出文本 | 生效 |
 | enable_secondary_asr | bool | true | 是否启用本地副模型 Qwen3，并关联副模型静音门与融合 | 无效，本端点强制为 false |
 | enable_dual_asr_fusion | bool | false | final 段是否做主副融合矫正，依赖副模型 | 无效，本端点强制为 false |
 | primary_asr_timeout | float（秒） | 4.0 | 主模型单段调用的整体墙钟超时（asyncio 层），超时即放弃本次主模型结果 | 生效 |
@@ -158,6 +159,33 @@ TS-ASR 注册参数（约束注册接口的时长校验与缓存 TTL）：
 这三项只在注册接口 `POST /api/asr/enrollment`（独立的 REST 调用，按服务端默认执行）生效。AST v3 首帧经 `header.resIdList` 携带的是已注册 id，本端点既不重新注册、也不消费这些值，因此在 `parameter.asr_config` 里覆写它们不会改变本连接的目标说话人行为。
 
 共享白名单还包含情感类字段（`emotion_*`，如 `emotion_task_mode`、`emotion_request_timeout` 等），仅对情感端点有效，对本 ASR 端点无效。完整白名单与各字段按类别速览见 [API 总览](api-reference.md) 的“临时配置覆写”。
+
+### 首字延迟优化（低延迟场景）
+
+实时麦克风场景下，首字延迟（首个非空 partial 相对第一帧发送）由两个串联门槛的较大者决定（max）：起音确认（`vad_start_frames` × 每帧约 16 ms）与首个 partial 的音频门槛（`pseudo_stream_first_partial_ms`）。服务端默认已把 `pseudo_stream_first_partial_ms` 设为 200 ms（低延迟），但 `vad_start_frames` 默认仍是 20（起音确认约 320 ms），它才是 max 的 binding 项，故默认首字门槛约 320 ms。要进一步压低，集成方在首帧 `parameter.asr_config` 把 `vad_start_frames` 也降下来即可（partial 门槛默认已是 200，通常无需再覆写）：
+
+| 参数 | 服务端默认 | 低延迟推荐 | 作用 |
+|---|---|---|---|
+| vad_start_frames | 20 | 10 | 起音确认帧数；默认 20（约 320 ms）是首字 max 的 binding 项，降到 10（约 160 ms）让 max 落到 partial 门槛 200 ms，是当前默认下压低首字的主要手段 |
+| pseudo_stream_first_partial_ms | 200 | 200 | 首个 partial 的累积音频门槛；服务端默认已设 200 ms，无需再覆写（再低也会被 vad_start_frames 卡住） |
+
+发送侧建议用较小音频帧（chunk 32-64 ms）而非大块（如 500 ms），让起音确认颗粒更细、边发边出字；首字出来后无需切换大块。
+
+实测参考（kespeech 短句，realtime，chunk 64 ms，20 条）：`vad_start_frames=10` + `pseudo_stream_first_partial_ms=200` 时首字 p50 约 223 ms、mean 约 362 ms、全程 0 漏识别；作为对比，旧的全 350/20 默认 p50 约 360 ms。当前服务端默认（200/20）按 max 模型估算约 320 ms（partial 门槛已降但起音确认未降，介于两者之间）。`vad_start_frames` 由 10 再降到 8 的额外收益已饱和（p50 仅再降约 2 ms），不建议更激进，以免在含噪环境抬高误触发率。
+
+首帧 `parameter.asr_config` 的覆写仅对本连接生效、不改变服务端默认；`min_segment_duration_ms` 仍独立控制 final 段的短噪声过滤（保持 350 ms 不变）。注意 `pseudo_stream_first_partial_ms=200` 是服务端全局默认，对所有产 partial 的端点（含 `/transcribe-streaming`）都已生效，并非本端点专属。
+
+低延迟首帧示例：
+
+```json
+{
+  "header": { "traceId": "demo-low-latency", "status": 0 },
+  "parameter": {
+    "asr_config": { "vad_start_frames": 10 }
+  },
+  "payload": { "audio": { "audio": "<base64 PCM>" } }
+}
+```
 
 首帧示例（指定语言、关闭伪流式中间结果、放宽 VAD 切段）：
 
