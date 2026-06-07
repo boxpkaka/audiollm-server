@@ -128,7 +128,7 @@ class Config:
     # tuning thresholds (no per-deployment meaning), so keeping the in-code
     # fallback equal to the shipped values avoids a confusing third number;
     # config.json still overrides them at load time.
-    vad_threshold: float = 0.6
+    vad_threshold: float = 0.65
     silence_duration_ms: int = 350
     vad_smoothing_alpha: float = 0.3
     vad_start_frames: int = 20

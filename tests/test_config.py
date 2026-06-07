@@ -83,7 +83,7 @@ def test_shipped_config_values_and_types() -> None:
     # the global primary (vllm_base_url / vllm_model_name above).
     assert cfg.astv3_vllm_base_url == ""
     assert cfg.astv3_vllm_model_name == ""
-    assert cfg.vad_threshold == 0.6
+    assert cfg.vad_threshold == 0.65
     # config.json 显式给 pseudo_stream_first_partial_ms=200(< min_segment 350):默认
     # 部署选择全局低延迟首字(对所有产 partial 的端点生效)。dataclass 兜底是中性 350,
     # 见 test_pseudo_stream_first_partial_dataclass_default_is_neutral。

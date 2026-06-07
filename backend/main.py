@@ -120,7 +120,7 @@ async def tuling_ast_v3_ws(websocket: WebSocket):
 # an https:// page. The same-origin proxy below bridges the browser's wss://
 # connection to it. Temporary test scaffolding: the address is intentionally
 # pinned here, not exposed as config.
-ASTV3_TEST_PROXY_UPSTREAM = "ws://159.138.9.106:18080/tuling/ast/v3"
+ASTV3_TEST_PROXY_UPSTREAM = "ws://159.138.9.106:18082/tuling/ast/v3"
 
 
 async def _astv3_proxy_pump_to_upstream(client: WebSocket, upstream) -> None:

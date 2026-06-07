@@ -333,7 +333,14 @@
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
       const frame = {
         header: { traceId, bizId, status: 0 },
-        parameter: { asr_config: { language: apiLangFromUi(srcLangUi) } },
+        // 低延迟调参：首帧 asr_config 覆写仅对本连接生效、不落盘，字段属与 /transcribe-streaming 共用的覆写白名单（见 docs/tuling-ast-v3-protocol.md 配置覆写）。
+        parameter: {
+          asr_config: {
+            language: apiLangFromUi(srcLangUi),
+            vad_start_frames: 10,
+            pseudo_stream_first_partial_ms: 100,
+          },
+        },
         payload: { audio: { audio: '' } },
       };
       const hw = getEffectiveHotwords();
@@ -391,17 +398,6 @@
       return s;
     }
 
-    function latticeLang(result) {
-      const wsArr = Array.isArray(result.ws) ? result.ws : [];
-      for (const w of wsArr) {
-        const cws = Array.isArray(w.cw) ? w.cw : [];
-        for (const c of cws) {
-          if (c && c.lg) return String(c.lg);
-        }
-      }
-      return '';
-    }
-
     function handleServerMessage(frame) {
       const header = frame.header || {};
       if (typeof header.code === 'number' && header.code !== 0) {
@@ -436,9 +432,7 @@
       } else if (result.msgtype === 'sentence' && !result.ls) {
         if (!document.getElementById(`ai-${segId}`)) addAIBubble(segId);
         doneSegs.add(segId);
-        updateAIBubble(segId, text, 'done', null, {
-          srcLangDetected: latticeLang(result),
-        });
+        updateAIBubble(segId, text, 'done');
       }
     }
 
@@ -473,20 +467,12 @@
                 <p class="text-sm leading-relaxed flex-1 bubble-text"></p>
                 <span class="bubble-replay-slot"></span>
               </div>
-              <div class="bubble-meta-slot"></div>
             </div>
           </div>
         </div>
       `;
       chatArea.appendChild(wrapper);
       scrollChatToBottom();
-    }
-
-    function langDisplayName(value) {
-      if (!value) return '';
-      const v = String(value).trim();
-      if (!v) return '';
-      return t(`lang.name.${v}`, { defaultValue: v });
     }
 
     function setBubbleText(textEl, text) {
@@ -505,16 +491,6 @@
       const body = content.querySelector('.bubble-content');
       if (shimmer) shimmer.hidden = !show;
       if (body) body.hidden = show;
-    }
-
-    function applyMeta(content, metaHtml) {
-      const slot = content.querySelector('.bubble-meta-slot');
-      if (!slot) return;
-      if (!metaHtml) {
-        slot.outerHTML = '<div class="bubble-meta-slot"></div>';
-        return;
-      }
-      slot.outerHTML = `<div class="bubble-meta-slot mt-1 space-y-1">${metaHtml}</div>`;
     }
 
     function applyHotwordHighlights(textEl, text, words) {
@@ -536,7 +512,7 @@
       return ranges.length;
     }
 
-    function updateAIBubble(segId, text, status, _modelHotwords = null, debugInfo = null) {
+    function updateAIBubble(segId, text, status, _modelHotwords = null, _debugInfo = null) {
       const bubble = document.getElementById(`ai-${segId}`);
       if (!bubble) return;
       const content = bubble.querySelector('.ai-content');
@@ -566,20 +542,6 @@
         textEl.style.color = '';
         setBubbleText(textEl, finalText);
         applyHotwordHighlights(textEl, finalText, wordsForHighlight);
-
-        const detectedRaw =
-          debugInfo && debugInfo.srcLangDetected
-            ? String(debugInfo.srcLangDetected).trim()
-            : '';
-        const langDetectedMeta =
-          detectedRaw && srcLangUi === 'auto'
-            ? `<div class="text-[11px]" style="color:var(--info)"
-                    data-dyn-key="asr.debug.langDetected"
-                    data-dyn-vars='${escapeHtml(JSON.stringify({ lang: detectedRaw }))}'>${escapeHtml(
-                t('asr.debug.langDetected', { lang: langDisplayName(detectedRaw) })
-              )}</div>`
-            : '';
-        applyMeta(content, langDetectedMeta);
       } else if (status === 'error') {
         showShimmer(content, false);
         const body = content.querySelector('.bubble-content');

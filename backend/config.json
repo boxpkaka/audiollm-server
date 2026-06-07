@@ -45,7 +45,7 @@
       "asr_enrollment_max_entries": 256
     },
     "vad": {
-      "vad_threshold": 0.6,
+      "vad_threshold": 0.65,
       "silence_duration_ms": 350,
       "vad_smoothing_alpha": 0.3,
       "vad_start_frames": 20,

@@ -9,7 +9,11 @@
 /tuling/ast/v3 流水线，测到的才是集成方实际感受到的首字延迟。
 
 指标（均给 p50/p90/p99/mean/max，单位毫秒）：
-  ttft_text   首个非空文本（partial 与 final 取较早者）相对"第一帧发送"——主指标
+  ttft_onset  首字相对"用户开始说话(起音点)"——主指标，realtime 模式专用。
+              = ttft_text - 该条音频前导静音(speech onset 偏移)。realtime 下，
+              文件偏移 onset_ms 处的音频在 t_first_send+onset_ms 才上线，等价于
+              用户在那一刻开口，故首字延迟应从该刻起算，剔除前导静音的干扰。
+  ttft_text   首个非空文本（partial 与 final 取较早者）相对"第一帧发送"
   ttft_part   首个非空 partial（msgtype=Progressive，口语形式）相对第一帧发送
   ttft_final  首个 final（msgtype=sentence，已 ITN）相对第一帧发送
   resp_last   首个非空文本相对"末帧（status=2）发送完成"；realtime 下若首字
@@ -67,6 +71,29 @@ from audio_common import chunk_bytes, make_ssl_context, read_audio_as_pcm  # noq
 SAMPLE_RATE = 16000
 
 
+def _speech_onset_ms(pcm: bytes, *, frame_ms: int = 10, ratio: float = 0.10) -> float:
+    """用短时能量估计起音点（用户开始说话的文件偏移，ms）。
+
+    把 PCM 切成 frame_ms 帧算每帧 RMS，取首个 RMS >= max_rms*ratio 的帧位置。
+    用于把"相对第一帧发送"的首字延迟换算成"相对用户开始说话"，剔除前导静音。
+    这是参考点定位，不是 VAD 复刻：服务端切段用的是 ten-vad，此处只为统计口径。
+    """
+    import numpy as _np
+
+    frame = SAMPLE_RATE * frame_ms // 1000
+    x = _np.frombuffer(pcm, dtype=_np.int16).astype(_np.float32) / 32768.0
+    n = (len(x) // frame) * frame
+    if n == 0:
+        return 0.0
+    fr = x[:n].reshape(-1, frame)
+    rms = _np.sqrt((fr ** 2).mean(axis=1) + 1e-12)
+    peak = float(rms.max())
+    if peak <= 0:
+        return 0.0
+    idx = int(_np.argmax(rms >= peak * ratio))
+    return float(idx * frame_ms)
+
+
 # ---------------------------------------------------------------------------
 # 数据集加载（真实 WAV -> 16 kHz mono s16le PCM，和线上同款解码）
 # ---------------------------------------------------------------------------
@@ -78,6 +105,7 @@ class Sample:
     pcm: bytes  # 16 kHz mono s16le，可直接分帧 base64 后塞进 payload
     duration_s: float
     ref_text: str = ""
+    onset_ms: float = 0.0  # 起音点偏移（前导静音时长），用于 ttft_onset
 
 
 def load_samples(
@@ -152,6 +180,7 @@ def load_samples(
                 pcm=pcm,
                 duration_s=dur,
                 ref_text=str(r.get("text") or ""),
+                onset_ms=_speech_onset_ms(pcm),
             )
         )
 
@@ -222,6 +251,8 @@ class SampleResult:
     utt_id: str
     duration_s: float
     status: str  # ok / miss / err
+    ttft_onset_ms: float = math.nan  # 首字相对起音点（realtime 主指标）
+    onset_ms: float = math.nan       # 该条前导静音时长
     ttft_text_ms: float = math.nan
     ttft_partial_ms: float = math.nan
     ttft_final_ms: float = math.nan
@@ -308,14 +339,15 @@ async def measure_one(
     except Exception as exc:  # noqa: BLE001
         marks.err = f"{type(exc).__name__}: {exc}"[:200]
 
-    return _build_result(sample, marks)
+    return _build_result(sample, marks, send_mode)
 
 
-def _build_result(sample: Sample, m: Marks) -> SampleResult:
+def _build_result(sample: Sample, m: Marks, send_mode: str = "realtime") -> SampleResult:
     res = SampleResult(
         utt_id=sample.utt_id,
         duration_s=sample.duration_s,
         status="err" if m.err else "ok",
+        onset_ms=sample.onset_ms,
         ref_text=sample.ref_text,
         err=m.err,
     )
@@ -333,6 +365,10 @@ def _build_result(sample: Sample, m: Marks) -> SampleResult:
     t_first_text = min(cands)
     base = m.t_first_send
     res.ttft_text_ms = (t_first_text - base) * 1000
+    # realtime 下：起音点音频在 base+onset_ms 才上线，等价用户此刻开口，
+    # 故"用户开始说话->首字"= ttft_text - onset。fast 模式无实时节奏，不适用。
+    if send_mode == "realtime":
+        res.ttft_onset_ms = max(0.0, res.ttft_text_ms - sample.onset_ms)
     if not math.isnan(m.t_first_partial):
         res.ttft_partial_ms = (m.t_first_partial - base) * 1000
     if not math.isnan(m.t_first_final):
@@ -387,6 +423,7 @@ def summarize(results: list[SampleResult]) -> str:
     err = [r for r in results if r.status == "err"]
 
     metrics = [
+        Metric("ttft_onset", [r.ttft_onset_ms for r in ok if not math.isnan(r.ttft_onset_ms)]),
         Metric("ttft_text", [r.ttft_text_ms for r in ok if not math.isnan(r.ttft_text_ms)]),
         Metric("ttft_part", [r.ttft_partial_ms for r in ok if not math.isnan(r.ttft_partial_ms)]),
         Metric("ttft_final", [r.ttft_final_ms for r in ok if not math.isnan(r.ttft_final_ms)]),
@@ -520,7 +557,8 @@ async def main_async(args: argparse.Namespace) -> int:
     print(summarize(results))
     print(f"\nwall={wall:.1f}s")
     print(
-        "Legend: ttft_text=首字延迟(主); ttft_part/final=首个partial/final;\n"
+        "Legend: ttft_onset=用户开始说话->首字(realtime 主指标,已剔除前导静音);\n"
+        "        ttft_text=首字相对第一帧发送; ttft_part/final=首个partial/final;\n"
         "        resp_last=末帧发完到首字(realtime下可能为0); full=整段完成时延。"
     )
 
