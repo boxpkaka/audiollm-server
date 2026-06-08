@@ -1,44 +1,62 @@
 from __future__ import annotations
 
-import json
 import logging
 import os
-from dataclasses import dataclass, fields, replace
+import re
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 logger = logging.getLogger(__name__)
 
-_CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+# 配置真源: 项目根 config.yaml; CONFIG_PATH 环境变量可覆盖(测试 / 多部署)。
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_DEFAULT_CONFIG_PATH = _PROJECT_ROOT / "config.yaml"
 
 HOP_SIZE = 160  # 10ms at 16kHz, TEN VAD recommended
 SAMPLE_RATE = 16000
 
+# ${VAR} 环境变量插值; 未设置 -> 空串(import 期不因缺密钥而崩, 调用时才暴露)。
+_ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
-def _load_json(path: Path) -> dict[str, Any]:
+
+def _interpolate_env(node: Any) -> Any:
+    """Recursively replace ``${VAR}`` references inside parsed YAML strings."""
+    if isinstance(node, str):
+        return _ENV_REF.sub(lambda m: os.getenv(m.group(1), ""), node)
+    if isinstance(node, dict):
+        return {k: _interpolate_env(v) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_interpolate_env(v) for v in node]
+    return node
+
+
+def _load_yaml(path: Path) -> dict[str, Any]:
     if not path.is_file():
         logger.warning("Config file not found: %s, using built-in defaults", path)
         return {}
     with open(path, encoding="utf-8") as f:
-        return json.load(f)
+        raw = yaml.safe_load(f) or {}
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"Config root must be a mapping, got {type(raw).__name__}: {path}"
+        )
+    return _interpolate_env(raw)
 
 
-def _flatten(raw: dict[str, Any]) -> dict[str, Any]:
-    """Collect leaf entries from a (possibly grouped) config mapping.
+def _flatten_leaves(node: dict[str, Any]) -> dict[str, Any]:
+    """Collect non-dict leaves from the feature-grouped ``defaults`` block.
 
-    Nested dicts are treated purely as visual grouping containers: only their
-    non-dict leaves become config fields, so a flat (un-nested) file still
-    loads unchanged. This keeps the on-disk file groupable by feature while
-    `Config` stays a flat dataclass and `override` keeps its flat key contract.
-
-    Constraint: config values must not be objects (the dataclass has no
-    dict-typed field). A leaf key colliding across groups is a config error;
-    we keep the last value seen and warn so it is not silent.
+    Nested groups (vad / asr / fusion / ...) are visual grouping only; their
+    leaves become flat ``Config`` field candidates. A leaf key colliding across
+    groups is a config error: warn and keep the last value (never silent).
     """
     flat: dict[str, Any] = {}
 
-    def walk(node: dict[str, Any]) -> None:
-        for key, value in node.items():
+    def walk(n: dict[str, Any]) -> None:
+        for key, value in n.items():
             if isinstance(value, dict):
                 walk(value)
                 continue
@@ -46,8 +64,26 @@ def _flatten(raw: dict[str, Any]) -> dict[str, Any]:
                 logger.warning("Duplicate config key across groups: %s", key)
             flat[key] = value
 
-    walk(raw)
+    walk(node)
     return flat
+
+
+@dataclass(frozen=True)
+class Upstream:
+    """A named downstream service instance (vLLM or external OpenAI-compatible API).
+
+    ``base_url`` is the service root WITHOUT ``/v1``; the unified call layer
+    appends ``/v1/chat/completions``. ``api_key`` is already env-interpolated
+    plaintext (empty -> no auth header). ``timeout`` is the per-request HTTP
+    timeout in seconds. ``max_tokens`` is an optional per-backend response cap.
+    """
+
+    name: str
+    base_url: str
+    model_name: str
+    api_key: str = ""
+    timeout: float = 120.0
+    max_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -319,26 +355,287 @@ if _unknown_overridable:
     )
 
 
-def load_config(path: Path | None = None) -> Config:
-    raw = _flatten(_load_json(path or _CONFIG_PATH))
-    valid_names = {f.name for f in fields(Config)}
-    filtered = {k: v for k, v in raw.items() if k in valid_names}
-    # Surface a loud WARNING when the on-disk config file specifies an
-    # impossible combination, so operators notice — silent downgrade by
-    # `__post_init__` still happens, this is just the log line.
-    if raw.get("enable_dual_asr_fusion", True) and not raw.get(
+# 合法的 (protocol, task) 组合白名单。其余组合(如 astv3 × browser_demo)在解析期
+# fail-fast, 避免注册出无意义的端点。browser_demo 复用 native wire, 不是独立协议。
+VALID_ENDPOINT_COMBINATIONS: frozenset[tuple[str, str]] = frozenset({
+    ("native", "asr"),
+    ("astv3", "asr"),
+    ("native", "emotion"),
+    ("native", "browser_demo"),
+})
+
+# upstream 角色: 决定一个 upstream 投影到哪些扁平 Config 字段。
+_UPSTREAM_ROLES: frozenset[str] = frozenset(
+    {"primary", "secondary", "emotion", "emotion_spec"}
+)
+
+
+@dataclass(frozen=True)
+class EndpointSpec:
+    """A declarative WebSocket endpoint parsed from config.yaml ``endpoints``."""
+
+    path: str
+    protocol: str
+    task: str
+    # role -> upstream name (primary / secondary / emotion / emotion_spec)
+    upstream_roles: dict[str, str] = field(default_factory=dict)
+    policy: dict[str, Any] = field(default_factory=dict)  # 软默认(客户端白名单可覆盖)
+    lock: dict[str, Any] = field(default_factory=dict)    # 硬锁定(客户端覆盖后重施)
+    client_overridable: bool = False
+    input_sample_rate: int = SAMPLE_RATE
+
+
+@dataclass(frozen=True)
+class ParsedConfig:
+    """Fully parsed config.yaml: registries + the global (REST-bound) Config."""
+
+    upstreams: dict[str, Upstream]
+    defaults: dict[str, Any]          # flattened tuning leaves
+    services: dict[str, str]          # service role -> upstream name
+    rest_roles: dict[str, str]        # REST role -> upstream name
+    endpoints: tuple[EndpointSpec, ...]
+    http_pool: dict[str, int]
+    default_config: Config
+
+
+def _parse_upstream(name: str, raw: dict[str, Any]) -> Upstream:
+    if not isinstance(raw, dict):
+        raise ValueError(f"upstreams.{name} must be a mapping")
+    max_tokens = raw.get("max_tokens")
+    return Upstream(
+        name=name,
+        base_url=str(raw.get("base_url", "")).rstrip("/"),
+        model_name=str(raw.get("model_name", "")),
+        api_key=str(raw.get("api_key", "")),
+        timeout=float(raw.get("timeout", 120.0)),
+        max_tokens=int(max_tokens) if max_tokens is not None else None,
+    )
+
+
+def _role_fields(role: str, up: Upstream) -> dict[str, Any]:
+    """Project an upstream bound to a role onto the flat Config fields it feeds."""
+    if role == "primary":
+        return {
+            "vllm_base_url": up.base_url,
+            "vllm_model_name": up.model_name,
+            "asr_request_timeout": up.timeout,
+        }
+    if role == "secondary":
+        # Secondary reuses the single asr_request_timeout (primary's) by design.
+        return {
+            "secondary_vllm_base_url": up.base_url,
+            "secondary_vllm_model_name": up.model_name,
+        }
+    if role == "emotion":
+        return {
+            "emotion_vllm_base_url": up.base_url,
+            "emotion_vllm_model_name": up.model_name,
+            "emotion_request_timeout": up.timeout,
+        }
+    if role == "emotion_spec":
+        return {
+            "emotion_spec_vllm_base_url": up.base_url,
+            "emotion_spec_vllm_model_name": up.model_name,
+            "emotion_spec_request_timeout": up.timeout,
+        }
+    logger.warning("Unknown upstream role ignored: %s", role)
+    return {}
+
+
+def _text_cleanup_fields(up: Upstream) -> dict[str, Any]:
+    """Project the text-cleanup service upstream onto the legacy text_cleanup_* fields.
+
+    BRIDGE: ``text_cleanup/client.py`` currently builds ``{base}/chat/completions``
+    expecting ``base`` to already contain ``/v1``, while ``Upstream.base_url`` is
+    normalized to the service root (no ``/v1``). We re-append ``/v1`` here so the
+    un-migrated client keeps working. Phase 4 routes cleanup through the unified
+    ``query_chat_completion`` and removes both this bridge and the text_cleanup_*
+    fields.
+    """
+    return {
+        "text_cleanup_base_url": up.base_url + "/v1",
+        "text_cleanup_model_name": up.model_name,
+        "text_cleanup_api_key": up.api_key,
+        "text_cleanup_api_key_env": "",  # already interpolated to plaintext on load
+        "text_cleanup_timeout": up.timeout,
+        "text_cleanup_max_tokens": up.max_tokens if up.max_tokens is not None else 1024,
+    }
+
+
+def _project_base(
+    *,
+    upstreams: dict[str, Upstream],
+    rest_roles: dict[str, str],
+    defaults: dict[str, Any],
+    services: dict[str, str],
+    http_pool: dict[str, int],
+) -> Config:
+    """Project the global (REST-bound) Config view: defaults + http_pool +
+    text_cleanup service + REST role bindings. This is what ``load_config()`` and
+    ``default_config`` expose; per-endpoint configs override on top of it.
+    """
+    values: dict[str, Any] = dict(defaults)
+    values["http_max_connections"] = int(http_pool.get("max_connections", 32))
+    values["http_max_keepalive_connections"] = int(
+        http_pool.get("max_keepalive_connections", 16)
+    )
+    cleanup_name = services.get("text_cleanup")
+    if cleanup_name and cleanup_name in upstreams:
+        values.update(_text_cleanup_fields(upstreams[cleanup_name]))
+    for role, up_name in rest_roles.items():
+        if up_name in upstreams:
+            values.update(_role_fields(role, upstreams[up_name]))
+    valid = {f.name for f in fields(Config)}
+    unknown = set(defaults) - valid
+    if unknown:
+        logger.warning("Unknown defaults keys ignored: %s", sorted(unknown))
+    filtered = {k: v for k, v in values.items() if k in valid}
+    return Config(**filtered)
+
+
+def _parse_endpoint(raw: dict[str, Any], upstreams: dict[str, Upstream]) -> EndpointSpec:
+    path = str(raw.get("path", "")).strip()
+    protocol = str(raw.get("protocol", "")).strip()
+    task = str(raw.get("task", "")).strip()
+    if not path:
+        raise ValueError("endpoint entry missing 'path'")
+    if (protocol, task) not in VALID_ENDPOINT_COMBINATIONS:
+        raise ValueError(
+            f"endpoint {path}: invalid (protocol, task)=({protocol!r}, {task!r}); "
+            f"allowed: {sorted(VALID_ENDPOINT_COMBINATIONS)}"
+        )
+    roles = dict(raw.get("upstreams", {}) or {})
+    for role, up_name in roles.items():
+        if role not in _UPSTREAM_ROLES:
+            raise ValueError(f"endpoint {path}: unknown upstream role {role!r}")
+        if up_name not in upstreams:
+            raise ValueError(
+                f"endpoint {path}: unknown upstream {up_name!r} for role {role!r}"
+            )
+    return EndpointSpec(
+        path=path,
+        protocol=protocol,
+        task=task,
+        upstream_roles=roles,
+        policy=dict(raw.get("policy", {}) or {}),
+        lock=dict(raw.get("lock", {}) or {}),
+        client_overridable=bool(raw.get("client_overridable", False)),
+        input_sample_rate=int(raw.get("input_sample_rate", SAMPLE_RATE)),
+    )
+
+
+def _parse(raw: dict[str, Any]) -> ParsedConfig:
+    upstreams = {
+        name: _parse_upstream(name, spec)
+        for name, spec in (raw.get("upstreams", {}) or {}).items()
+    }
+    defaults = _flatten_leaves(raw.get("defaults", {}) or {})
+
+    services = dict(raw.get("services", {}) or {})
+    for svc, up_name in services.items():
+        if up_name not in upstreams:
+            raise ValueError(f"services.{svc}: unknown upstream {up_name!r}")
+
+    rest_roles = dict((raw.get("rest", {}) or {}).get("upstreams", {}) or {})
+    for role, up_name in rest_roles.items():
+        if role not in _UPSTREAM_ROLES:
+            raise ValueError(f"rest.upstreams: unknown role {role!r}")
+        if up_name not in upstreams:
+            raise ValueError(f"rest.upstreams.{role}: unknown upstream {up_name!r}")
+
+    http_pool = dict(raw.get("http_pool", {}) or {})
+    endpoints = tuple(
+        _parse_endpoint(ep, upstreams) for ep in (raw.get("endpoints", []) or [])
+    )
+
+    # Loud WARN on an impossible global combo (silent downgrade still happens in
+    # __post_init__; this is just the operator-facing log line).
+    if defaults.get("enable_dual_asr_fusion") and not defaults.get(
         "enable_secondary_asr", True
     ):
         logger.warning(
             "enable_dual_asr_fusion=true requires enable_secondary_asr=true; "
             "downgrading fusion to false"
         )
-    return Config(**filtered) if filtered else Config()
+
+    base = _project_base(
+        upstreams=upstreams,
+        rest_roles=rest_roles,
+        defaults=defaults,
+        services=services,
+        http_pool=http_pool,
+    )
+    return ParsedConfig(
+        upstreams=upstreams,
+        defaults=defaults,
+        services=services,
+        rest_roles=rest_roles,
+        endpoints=endpoints,
+        http_pool=http_pool,
+        default_config=base,
+    )
 
 
-# Process-wide default Config singleton. Modules that don't carry a
-# per-session Config (module-level helpers, ``value or <default>`` fallbacks)
-# read fields off this instead of re-reading the file. ``load_config()``
-# stays the single entry point; this is just its cached default instance, so
-# every reader reaches config exactly one way: a Config object.
-default_config = load_config()
+def load_parsed(path: Path | None = None) -> ParsedConfig:
+    """Parse the full config.yaml (registries + global Config).
+
+    ``CONFIG_PATH`` env overrides the default path when no explicit path is given.
+    """
+    if path is None:
+        env_path = os.getenv("CONFIG_PATH", "").strip()
+        path = Path(env_path) if env_path else _DEFAULT_CONFIG_PATH
+    return _parse(_load_yaml(path))
+
+
+def load_config(path: Path | None = None) -> Config:
+    """Backward-compatible entry point: the global (REST-bound) default Config.
+
+    Per-endpoint runtime configs come from :func:`resolve_endpoint`.
+    """
+    return load_parsed(path).default_config
+
+
+def resolve_endpoint(
+    spec: EndpointSpec, parsed: ParsedConfig | None = None
+) -> Config:
+    """Project an endpoint's runtime Config.
+
+    global default (REST-bound) + this endpoint's explicit upstream bindings +
+    ``policy`` (soft) + ``lock`` (hard). The route layer re-applies ``spec.lock``
+    after any client override so locks can't be undone by ``start.config``.
+    """
+    parsed = parsed or _PARSED
+    overrides: dict[str, Any] = {}
+    for role, up_name in spec.upstream_roles.items():
+        if up_name in parsed.upstreams:
+            overrides.update(_role_fields(role, parsed.upstreams[up_name]))
+    overrides.update(spec.policy)
+    overrides.update(spec.lock)
+    # 端点未绑 secondary 上游 => 物理上没有副模型, 强制关闭(放在最后, 不可被
+    # policy/lock 误开成一个并不存在的副模型)。
+    if spec.task == "asr" and "secondary" not in spec.upstream_roles:
+        overrides["enable_secondary_asr"] = False
+    return parsed.default_config.override(**overrides)
+
+
+def get_service_upstream(
+    service: str, parsed: ParsedConfig | None = None
+) -> Upstream | None:
+    """Resolve a global auxiliary service (hotword / text_cleanup) to its Upstream."""
+    parsed = parsed or _PARSED
+    name = parsed.services.get(service)
+    return parsed.upstreams.get(name) if name else None
+
+
+# 进程级解析结果(基于默认路径)。下面的注册表都从此派生, 全进程一份。
+_PARSED: ParsedConfig = load_parsed()
+UPSTREAMS: dict[str, Upstream] = _PARSED.upstreams
+ENDPOINTS: tuple[EndpointSpec, ...] = _PARSED.endpoints
+SERVICES: dict[str, str] = _PARSED.services
+REST_ROLES: dict[str, str] = _PARSED.rest_roles
+
+# Process-wide default Config singleton (REST-bound projection). Modules without a
+# per-session Config (module-level helpers, ``value or <default>`` fallbacks) read
+# fields off this. Single entry point preserved: every reader reaches config via a
+# Config object.
+default_config: Config = _PARSED.default_config

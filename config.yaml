@@ -1,0 +1,136 @@
+# =============================================================================
+# AudioLLM Server 配置(声明式单一真源)
+#
+# 本文件是运行参数的唯一入口, 取代旧的 backend/config.json 与 backend/api.json。
+# 密钥不写明文: 用 ${ENV_VAR} 引用环境变量(见 .env.example), 未设置则插值为空串。
+# 可用 CONFIG_PATH 环境变量指向其他配置文件。
+# =============================================================================
+
+# 共享 httpx 连接池上限(所有 vLLM / 上游 HTTP 调用复用同一个连接池)。
+http_pool:
+  max_connections: 32
+  max_keepalive_connections: 16
+
+# 下游服务实例池。
+#   base_url 一律为"服务根"(不含 /v1), 调用层统一拼 /v1/chat/completions。
+#   timeout  = 该后端单次 HTTP 请求超时(秒)。
+#   api_key  非空即以 Authorization: Bearer 发送; 留空则不加鉴权头。
+upstreams:
+  amphion_asr:
+    base_url: http://localhost:8009
+    model_name: AmphionASR-4.3B
+    timeout: 120
+  qwen_asr:
+    base_url: http://localhost:8001
+    model_name: Qwen/Qwen3-ASR-1.7B
+    timeout: 120
+  amphion_emotion:
+    base_url: http://localhost:8222
+    model_name: AmphionSE
+    timeout: 30
+  amphion_spec:
+    base_url: http://localhost:9001
+    model_name: AmphionSPEC
+    timeout: 30
+  dashscope_cleanup:
+    base_url: https://dashscope.aliyuncs.com/compatible-mode
+    model_name: qwen2.5-32b-instruct
+    api_key: ${DASHSCOPE_API_KEY}
+    timeout: 30
+    max_tokens: 1024
+  hotword_llm:                 # 取代旧 backend/api.json(热词抽取 LLM)
+    base_url: ${HOTWORD_BASE_URL}
+    model_name: ${HOTWORD_MODEL}
+    api_key: ${HOTWORD_API_KEY}
+    timeout: 30
+
+# 全局默认 tuning; 端点的 policy 可逐项软覆盖, lock 可硬锁定。
+# 注: base_url/model/timeout 属 upstreams, 不在此; 这里只放纯调参。
+defaults:
+  vad:
+    vad_threshold: 0.65
+    silence_duration_ms: 350
+    vad_smoothing_alpha: 0.3
+    vad_start_frames: 20
+    vad_pre_speech_ms: 500
+    vad_keep_tail_ms: 40
+    min_segment_duration_ms: 350
+  pseudo_stream:
+    enable_pseudo_stream: true
+    pseudo_stream_interval_ms: 500
+    pseudo_stream_first_partial_ms: 200   # 不变量: <= min_segment_duration_ms
+  asr:
+    enable_primary_asr: true
+    enable_secondary_asr: true            # 端点未绑 secondary 上游时, 投影强制 false
+    enable_dual_asr_fusion: false         # final 是否双模型融合(需 secondary 在线)
+    primary_asr_timeout: 4.0              # primary 软降级上限(非 HTTP 超时)
+    debug_show_dual_asr: false            # 出站附带双 ASR 调试视图(主要给 /ws/audio)
+  fusion:
+    fusion_similarity_threshold: 0.85
+    fusion_min_primary_score: 0.55
+    fusion_max_repetition_ratio: 0.35
+    fusion_disagreement_threshold: 0.55
+    fusion_hotword_boost: 0.12
+    fusion_primary_score_margin: 0.08
+  itn:
+    enable_asr_itn: true
+    asr_itn_enable_0_to_9: false
+    enable_asr_plate_normalize: true
+  enrollment:
+    asr_enrollment_min_sec: 1.0
+    asr_enrollment_max_sec: 8.0
+    asr_enrollment_ttl_sec: 3600
+    asr_enrollment_max_entries: 256       # 进程级 store 容量(非 per-endpoint)
+  emotion:
+    emotion_task_mode: ser
+    emotion_max_audio_seconds: 20.0
+    emotion_max_concurrent_jobs: 8        # 进程级 job 背压
+    emotion_job_queue_max: 64
+    emotion_job_ttl_sec: 3600
+  emotion_spec:
+    emotion_spec_task_mode: sepc
+    emotion_spec_max_audio_seconds: 20.0
+    emotion_spec_max_concurrent_jobs: 8
+    emotion_spec_job_queue_max: 64
+    emotion_spec_job_ttl_sec: 3600
+
+# 全局单例辅助服务: 不随端点变化, 所有端点/REST 共享(工具型外部服务)。
+services:
+  hotword: hotword_llm
+  text_cleanup: dashscope_cleanup
+
+# REST/HTTP 路由的上游绑定(这些接口固定一套, 不做多实例)。
+rest:
+  upstreams:
+    primary: amphion_asr
+    secondary: qwen_asr
+    emotion: amphion_emotion
+    emotion_spec: amphion_spec
+
+# WS 端点: 每个端点自主声明 协议/任务/上游绑定/策略(不从全局隐式继承)。
+#   protocol: native | astv3   (browser_demo 复用 native wire, 故归在 task)
+#   task:     asr | emotion | browser_demo
+#   upstreams: 角色 -> upstream 名 (primary/secondary/emotion/emotion_spec)
+#   policy:   软默认(client_overridable 端点的白名单字段可再覆盖)
+#   lock:     硬锁定(客户端覆盖后强制重施)
+# 注: 阶段三才接入动态注册; 当前 backend/main.py 仍静态注册这些路由。
+endpoints:
+  - path: /transcribe-streaming
+    protocol: native
+    task: asr
+    upstreams: { primary: amphion_asr, secondary: qwen_asr }
+    client_overridable: true
+  - path: /tuling/ast/v3
+    protocol: astv3
+    task: asr
+    upstreams: { primary: amphion_asr }     # 只声明 primary => primary-only
+    lock: { enable_secondary_asr: false }   # 硬锁定: 客户端不可撤销
+  - path: /emotion-segmented-streaming
+    protocol: native
+    task: emotion
+    upstreams: { emotion: amphion_emotion }
+  - path: /ws/audio
+    protocol: native
+    task: browser_demo
+    upstreams: { primary: amphion_asr, secondary: qwen_asr, emotion_spec: amphion_spec }
+    input_sample_rate: 48000

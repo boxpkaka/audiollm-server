@@ -17,6 +17,7 @@ dependencies = [
     "httpx",
     "numpy",
     "python-multipart",
+    "pyyaml",
     "ten-vad",
     "uvicorn[standard]",
     "websockets",
