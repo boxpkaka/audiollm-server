@@ -103,10 +103,27 @@ def _resample_linear(pcm: np.ndarray, src_sr: int, dst_sr: int = 16000) -> np.nd
 def wav_base64_to_pcm_16k_mono(b64: str) -> np.ndarray:
     """Decode a base64-encoded WAV string to float32 mono PCM at 16 kHz.
 
+    Thin wrapper over :func:`wav_bytes_to_pcm_16k_mono`; see that function
+    for format support. Kept for callers that already hold base64 payloads
+    (WS protocol frames, enrollment cache).
+    """
+    try:
+        wav_bytes = base64.b64decode(b64, validate=False)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"Invalid base64 payload: {exc}") from exc
+    return wav_bytes_to_pcm_16k_mono(wav_bytes)
+
+
+def wav_bytes_to_pcm_16k_mono(wav_bytes: bytes) -> np.ndarray:
+    """Decode raw WAV bytes to float32 mono PCM at 16 kHz.
+
     Accepts PCM WAVs with 8/16/24/32-bit integer or 32-bit float samples, any
     channel count, and any sample rate. Multi-channel input is averaged to
     mono; non-16 kHz rates are resampled (48 kHz uses the FIR resampler, all
     other rates use a linear fallback).
+
+    Operating on bytes directly (no base64 round-trip) matters for the
+    long-audio transcription path where uploads run to hundreds of MB.
 
     Returns a 1-D ``np.ndarray[np.float32]`` in the range ``[-1, 1]``.
 
@@ -114,10 +131,6 @@ def wav_base64_to_pcm_16k_mono(b64: str) -> np.ndarray:
         ValueError: when the input is not a parseable PCM WAV (e.g. empty
             payload, non-PCM compressed WAV).
     """
-    try:
-        wav_bytes = base64.b64decode(b64, validate=False)
-    except (ValueError, TypeError) as exc:
-        raise ValueError(f"Invalid base64 payload: {exc}") from exc
     if not wav_bytes:
         raise ValueError("Empty WAV payload")
 

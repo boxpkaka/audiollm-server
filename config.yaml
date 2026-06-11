@@ -81,6 +81,14 @@ defaults:
     asr_enrollment_max_sec: 8.0
     asr_enrollment_ttl_sec: 3600
     asr_enrollment_max_entries: 256       # 进程级 store 容量(非 per-endpoint)
+  transcribe:                             # 离线长音频转写 job (POST /api/asr/transcriptions)
+    transcribe_max_concurrent_jobs: 2     # 同时 running 的 job 数
+    transcribe_segment_concurrency: 4     # 单 job 内并行推理的段数(总 vLLM 压力 = 两者乘积)
+    transcribe_job_queue_max: 8           # 排队上限(含 running)
+    transcribe_job_ttl_sec: 3600          # 终态 job 结果保留时长
+    transcribe_max_segment_sec: 30.0      # 连续语音强切上限(VAD 只在静音处切)
+    transcribe_max_upload_bytes: 536870912  # 512MB; 2h 16k mono WAV ≈ 220MB
+    transcribe_max_audio_sec: 10800       # 超长直接 400 拒绝(不尾截, 不静默丢内容)
   emotion:
     emotion_task_mode: ser
     emotion_max_audio_seconds: 20.0

@@ -36,7 +36,9 @@
 
 | 方法 | 路径 | 任务 | 表单字段 |
 |---|---|---|---|
-| POST | `/api/asr/upload` | 上传整段音频做 ASR | `audio`、`language`、`hotwords`、`enrollment_id` |
+| POST | `/api/asr/upload` | 上传整段音频做 ASR（短音频，尾截 60 秒） | `audio`、`language`、`hotwords`、`enrollment_id` |
+| POST | `/api/asr/transcriptions` | 异步长音频离线转写（202 + 轮询，会议纪要场景） | `audio`、`language`、`hotwords` |
+| GET | `/api/asr/transcriptions/{job_id}` | 查询转写任务状态、进度与分段结果 | — |
 | POST | `/api/asr/enrollment` | 上传目标说话人音频（1-8 秒）注册 | `audio` |
 | DELETE | `/api/asr/enrollment/{enrollment_id}` | 删除注册音频 | — |
 | POST | `/api/emotion/jobs` | 异步整段情感识别（202 + 轮询） | `audio`、`mode`、`language` |
@@ -199,6 +201,85 @@ python docs/examples/rest_upload.py asr sample.wav \
 
 如需让模型只转写指定说话人的话，先用 `POST /api/asr/enrollment` 上传 1-8 秒目标人语音、拿到 `enrollment_id`，再把它作为表单字段附加到 `/api/asr/upload`，响应里的 `enrollment_used` 会变为 `true`。详细字段、错误码与 Python 代码示例见 [通用流式 ASR WebSocket](transcribe-streaming-protocol.md)。
 
+### 长音频离线转写（会议纪要）
+
+`POST /api/asr/transcriptions` 面向整段会议录音等长音频（默认上限 3 小时 / 512 MB，超时长直接 400 拒绝而非截断）。服务端先按与流式端点相同的 VAD 参数把录音切成语音段（连续无停顿语音超过 `transcribe_max_segment_sec`（默认 30 秒）会强制切分），再对每段并行执行与 `/api/asr/upload` 相同的双模型转写（含 ITN / 车牌规范化），最后按时间序拼出全文。
+
+请求（`multipart/form-data`）：
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `audio` | 是 | WAV 文件（PCM 8/16/24/32-bit，任意采样率与声道数，服务端重采样到 16 kHz mono；压缩格式如 mp3/m4a 需客户端先转 WAV） |
+| `language` | 否 | 语言提示，空为自动检测 |
+| `hotwords` | 否 | 逗号分隔热词，透传给每段 ASR（适合人名、术语） |
+
+不支持 `enrollment_id`：目标说话人过滤只保留单一说话人，与多人会议转写语义相反。
+
+```bash
+curl -X POST http://172.16.0.3:8080/api/asr/transcriptions \
+  -F "audio=@meeting.wav" \
+  -F "language=zh" \
+  -F "hotwords=挚音科技,张硕"
+```
+
+受理响应（202）：
+
+```json
+{
+  "job_id": "tr_6f0c2a8e9b3d41a7c5e21f08",
+  "status": "queued",
+  "poll_url": "/api/asr/transcriptions/tr_6f0c2a8e9b3d41a7c5e21f08",
+  "duration_sec": 3625.4
+}
+```
+
+轮询 `GET /api/asr/transcriptions/{job_id}`，运行中响应带进度（`segments_total` 在切分完成前为 `null`）：
+
+```json
+{
+  "job_id": "tr_6f0c2a8e9b3d41a7c5e21f08",
+  "status": "running",
+  "created_at": 1765432100.5,
+  "updated_at": 1765432130.2,
+  "progress": {
+    "segments_total": 412,
+    "segments_done": 80
+  }
+}
+```
+
+成功后 `result` 携带分段转写稿。`segments[*].start_ms` / `end_ms` 为该段在录音内的近似时间位置（段级精度，非词级对齐）；模型转写为空的噪声段不出现在列表中。个别段推理失败（已含一次重试）不会使任务失败：失败段以 `error` 字段保留在列表中占位，`failed_segments` 给出计数；只有全部段都失败任务才记为 `failed`：
+
+```json
+{
+  "job_id": "tr_6f0c2a8e9b3d41a7c5e21f08",
+  "status": "succeeded",
+  "progress": { "segments_total": 412, "segments_done": 412 },
+  "result": {
+    "type": "transcription",
+    "language": "zh",
+    "duration_sec": 3625.4,
+    "failed_segments": 0,
+    "full_text": "大家好，现在开始本周例会。\n首先同步一下上周的进展……",
+    "segments": [
+      { "id": 0, "start_ms": 1200, "end_ms": 5840, "text": "大家好，现在开始本周例会。", "language": "zh" },
+      { "id": 1, "start_ms": 6300, "end_ms": 14020, "text": "首先同步一下上周的进展……", "language": "zh" }
+    ]
+  }
+}
+```
+
+任务结果在内存中保留 `transcribe_job_ttl_sec`（默认 1 小时），过期或服务重启后 404，客户端应在成功后及时取走结果。队列满返回 503（带 `Retry-After`）。服务端 `config.yaml` 的 `defaults.transcribe` 分组提供并发与上限调参（`transcribe_max_concurrent_jobs`、`transcribe_segment_concurrency`、`transcribe_job_queue_max`、`transcribe_job_ttl_sec`、`transcribe_max_segment_sec`、`transcribe_max_upload_bytes`、`transcribe_max_audio_sec`），均为进程级配置，客户端不可临时覆写。
+
+命令行示例脚本：
+
+```bash
+python docs/examples/http_transcribe_job.py meeting.wav \
+  --base-url http://172.16.0.3:8080 \
+  --language zh \
+  --hotwords "挚音科技,张硕"
+```
+
 ### 目标说话人注册
 
 ```bash
@@ -305,15 +386,15 @@ REST 接口使用标准 HTTP 状态码：
 
 | 状态码 | 含义 |
 |---|---|
-| 400 | 请求字段缺失、音频为空、音频无法解码、注册音频校验失败 |
-| 413 | 上传文件超过服务端大小限制 |
+| 400 | 请求字段缺失、音频为空、音频无法解码、注册音频校验失败、转写音频超过 `transcribe_max_audio_sec` 时长上限 |
+| 413 | 上传文件超过服务端大小限制（转写接口为 `transcribe_max_upload_bytes`，默认 512 MB） |
 | 422 | multipart 字段类型或必填字段不符合 FastAPI 校验 |
 | 502 | 后端模型服务推理失败 |
 | 502 | `/api/audio/analyze` 的 ASR、情感或文本清洗模型调用失败 |
 | 204 | `DELETE /api/asr/enrollment/{id}` 删除成功（未知 id 也返回 204） |
-| 202 | `POST /api/emotion/jobs` 已受理（需轮询 GET） |
-| 503 | 情感任务队列已满（`Retry-After`） |
-| 404 | `GET /api/emotion/jobs/{id}` 任务不存在或已过期 |
+| 202 | `POST /api/emotion/jobs` / `POST /api/asr/transcriptions` 已受理（需轮询 GET） |
+| 503 | 情感 / 转写任务队列已满（`Retry-After`） |
+| 404 | `GET /api/emotion/jobs/{id}` / `GET /api/asr/transcriptions/{id}` 任务不存在或已过期 |
 
 普通错误体示例：
 

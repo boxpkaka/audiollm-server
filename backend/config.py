@@ -184,6 +184,37 @@ class Config:
     # 最优。不变量 first_partial<=min_segment 见 __post_init__。
     pseudo_stream_first_partial_ms: int = 350
 
+    # ---- ASR: offline long-audio transcription jobs ------------------------
+    # POST /api/asr/transcriptions decodes the upload, replays it through the
+    # same VAD segmentation as the streaming endpoints, and transcribes the
+    # segments via the shared one-shot dual-ASR path. Knobs:
+    #   transcribe_max_concurrent_jobs   -> jobs running at once; total vLLM
+    #   transcribe_segment_concurrency      pressure is the product of the two
+    #                                       (defaults 2 x 4 = 8 in-flight
+    #                                       segment requests, matching the
+    #                                       emotion stores' ceiling).
+    #   transcribe_max_segment_sec       -> force-cut ceiling for uninterrupted
+    #                                       speech (VAD only cuts on silence);
+    #                                       sized well under the 60 s one-shot
+    #                                       REST cap to stay in the range the
+    #                                       segment models see in streaming.
+    #   transcribe_max_upload_bytes      -> multipart cap; 2 h of 16 kHz mono
+    #                                       s16 WAV is ~220 MB, so 512 MB
+    #                                       leaves headroom for higher-rate
+    #                                       client WAVs.
+    #   transcribe_max_audio_sec         -> decoded-duration cap. Unlike the
+    #                                       60 s upload tail-trim, exceeding it
+    #                                       REJECTS the request (400): silently
+    #                                       dropping the head of a meeting
+    #                                       recording is never acceptable.
+    transcribe_max_concurrent_jobs: int = 2
+    transcribe_segment_concurrency: int = 4
+    transcribe_job_queue_max: int = 8
+    transcribe_job_ttl_sec: float = 3600.0
+    transcribe_max_segment_sec: float = 30.0
+    transcribe_max_upload_bytes: int = 512 * 1024 * 1024
+    transcribe_max_audio_sec: float = 10800.0
+
     # ---- Emotion recognition: vLLM endpoint ------------------------------
     # The Amphion multi-task model is trained to handle SER/SEC alongside ASR
     # via different text prompts, so by default we point the emotion endpoint

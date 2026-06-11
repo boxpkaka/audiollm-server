@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import backend.asr.oneshot as oneshot_mod  # noqa: E402
 import backend.main as main_mod  # noqa: E402
 from backend.config import Config  # noqa: E402
 from backend.text_cleanup.client import (  # noqa: E402
@@ -75,7 +76,9 @@ async def test_audio_analyze_returns_asr_cleanup_and_emotion(monkeypatch):
             "model": "qwen2.5-32b-instruct",
         }
 
-    monkeypatch.setattr(main_mod, "query_audio_model", fake_asr)
+    # The one-shot dual-ASR orchestration lives in backend.asr.oneshot
+    # (shared by upload / analyze / transcription jobs); patch it there.
+    monkeypatch.setattr(oneshot_mod, "query_audio_model", fake_asr)
     monkeypatch.setattr(main_mod, "query_emotion_model", fake_emotion)
     monkeypatch.setattr(main_mod, "clean_asr_text", fake_cleanup)
 

@@ -10,15 +10,15 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.types import Receive, Scope, Send
 
-from .asr.client import query_audio_model, query_audio_model_secondary
 from .asr.enrollment import (
     EnrollmentError,
     decode_and_validate,
     get_enrollment_store,
 )
-from .asr.fusion import choose_fused_result
-from .asr.itn import normalize_final_text
-from .audio.utils import wav_base64_to_pcm_16k_mono
+from .asr.jobs import get_transcription_job_store
+from .asr.oneshot import OneshotAsrError, run_oneshot_asr
+from .asr.transcribe import float_pcm_to_i16_bytes
+from .audio.utils import wav_base64_to_pcm_16k_mono, wav_bytes_to_pcm_16k_mono
 from .config import SAMPLE_RATE, load_config
 from .emotion.client import query_emotion_model
 from .emotion.jobs import JobQueueFullError, get_emotion_job_store
@@ -249,20 +249,23 @@ def _parse_csv(raw: str | None) -> list[str]:
     return [tok.strip() for tok in raw.split(",") if tok.strip()]
 
 
-async def _read_audio_bytes(audio: UploadFile) -> bytes:
-    """Read a multipart audio upload, enforcing the global byte cap.
+async def _read_audio_bytes(
+    audio: UploadFile, max_bytes: int = _MAX_UPLOAD_BYTES
+) -> bytes:
+    """Read a multipart audio upload, enforcing the byte cap.
 
     UploadFile.read with no argument loads into memory; the size check is
     primarily a guard against accidental huge uploads, not a streaming
-    safeguard (we need the full payload for vLLM anyway).
+    safeguard (we need the full payload for vLLM anyway). Long-audio
+    transcription passes its own (much larger) cap.
     """
     raw = await audio.read()
     if not raw:
         raise HTTPException(status_code=400, detail="audio file is empty")
-    if len(raw) > _MAX_UPLOAD_BYTES:
+    if len(raw) > max_bytes:
         raise HTTPException(
             status_code=413,
-            detail=f"audio file exceeds {_MAX_UPLOAD_BYTES} bytes",
+            detail=f"audio file exceeds {max_bytes} bytes",
         )
     return raw
 
@@ -303,19 +306,6 @@ def _wav_to_pcm_capped(raw: bytes, max_seconds: float) -> tuple[bytes, float]:
     with wave.open(io.BytesIO(new_bytes), "rb") as wf:
         assert wf.getframerate() == SAMPLE_RATE
     return new_bytes, duration
-
-
-def _model_result_payload(result: object | None) -> dict | None:
-    if result is None:
-        return None
-    if isinstance(result, Exception):
-        return {
-            "error": str(result),
-            "error_type": result.__class__.__name__,
-        }
-    if isinstance(result, dict):
-        return dict(result)
-    return {"raw": str(result)}
 
 
 def _emotion_result_payload(
@@ -374,113 +364,21 @@ async def _run_dual_asr_upload(
     language: str,
     enrollment_b64: str | None = None,
 ) -> dict:
-    primary_task = None
-    secondary_task = None
-    if cfg.enable_primary_asr:
-        primary_task = asyncio.create_task(
-            asyncio.wait_for(
-                query_audio_model(
-                    wav_b64,
-                    hotwords=hotwords,
-                    src_lang=language or "N/A",
-                    enrollment_wav_base64=enrollment_b64,
-                    base_url=cfg.vllm_base_url,
-                    model_name=cfg.vllm_model_name,
-                    timeout=cfg.asr_request_timeout,
-                ),
-                timeout=cfg.primary_asr_timeout,
-            )
-        )
-    # Secondary (Qwen3) keeps single-audio prompting regardless of enrollment;
-    # it is trained as a plain ASR model with no target-speaker channel, so
-    # forcing enrollment audio in front of the mixed clip would push the model
-    # out of distribution. The fusion stage still benefits from Qwen's
-    # parallel transcription as a sanity check on the primary's output.
-    #
-    # REST uploads have no partial channel, so the secondary only earns its
-    # keep when fusion is on. Gating on `enable_dual_asr_fusion` here (rather
-    # than `enable_secondary_asr`) lets operators keep the secondary online
-    # for streaming partials while skipping it on one-shot uploads.
-    if cfg.enable_dual_asr_fusion:
-        secondary_task = asyncio.create_task(
-            query_audio_model_secondary(
-                wav_b64,
-                hotwords=hotwords,
-                base_url=cfg.secondary_vllm_base_url,
-                model_name=cfg.secondary_vllm_model_name,
-                timeout=cfg.asr_request_timeout,
-            )
-        )
+    """Route-facing wrapper over :func:`run_oneshot_asr`.
 
-    primary_res: object | None = None
-    secondary_res: object | None = None
-    if primary_task is not None:
-        try:
-            primary_res = await primary_task
-        except Exception as err:  # noqa: BLE001 - preserve failure details
-            primary_res = err
-            logger.warning("Primary ASR failed: %s", err)
-    if secondary_task is not None:
-        try:
-            secondary_res = await secondary_task
-        except Exception as err:  # noqa: BLE001
-            secondary_res = err
-            logger.warning("Secondary ASR failed: %s", err)
-
-    primary_result = None if isinstance(primary_res, Exception) else primary_res
-    secondary_result = None if isinstance(secondary_res, Exception) else secondary_res
-    if primary_result is None and secondary_result is None:
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "message": "all configured ASR models failed",
-                "primary": _model_result_payload(primary_res),
-                "secondary": _model_result_payload(secondary_res),
-            },
-        )
-
-    detected_lang = language or ""
-    fusion_payload: dict | None = None
-    if primary_result and not secondary_result:
-        text = str(primary_result.get("transcription") or "").strip()
-        detected_lang = primary_result.get("detected_language") or detected_lang
-    elif secondary_result and not primary_result:
-        text = str(secondary_result.get("transcription") or "").strip()
-    else:
-        fusion_payload = choose_fused_result(
-            primary_result,
-            secondary_result,
+    Translates the framework-free :class:`OneshotAsrError` into the 502 the
+    REST contract documents for "every configured model failed".
+    """
+    try:
+        return await run_oneshot_asr(
+            wav_b64,
+            cfg=cfg,
             hotwords=hotwords,
-            similarity_threshold=cfg.fusion_similarity_threshold,
-            min_primary_score=cfg.fusion_min_primary_score,
-            max_repetition_ratio=cfg.fusion_max_repetition_ratio,
-            disagreement_threshold=cfg.fusion_disagreement_threshold,
-            hotword_boost=cfg.fusion_hotword_boost,
-            primary_score_margin=cfg.fusion_primary_score_margin,
+            language=language,
+            enrollment_b64=enrollment_b64,
         )
-        text = str(fusion_payload.get("text") or "").strip()
-        if primary_result and primary_result.get("detected_language"):
-            detected_lang = primary_result["detected_language"]
-
-    # Final-only display transform (ITN + plate normalization), matching the
-    # streaming engines so REST and WS clients see the same written form.
-    if text:
-        text = normalize_final_text(text, detected_lang, cfg)
-
-    raw_text = ""
-    if primary_result:
-        raw_text = str(primary_result.get("raw_text") or "")
-    elif secondary_result:
-        raw_text = str(secondary_result.get("raw_text") or "")
-
-    return {
-        "text": text,
-        "language": detected_lang,
-        "raw_text": raw_text,
-        "primary": _model_result_payload(primary_res),
-        "secondary": _model_result_payload(secondary_res),
-        "fusion": fusion_payload,
-    }
+    except OneshotAsrError as exc:
+        raise HTTPException(status_code=502, detail=exc.to_detail()) from exc
 
 
 @app.post("/api/asr/enrollment")
@@ -571,6 +469,93 @@ async def asr_upload(
         "duration_sec": round(duration_sec, 3),
         "enrollment_used": enrollment_b64 is not None,
     }
+
+
+@app.post("/api/asr/transcriptions", status_code=202)
+async def asr_transcription_create(
+    audio: UploadFile = File(...),
+    language: str = Form(""),
+    hotwords: str = Form(""),
+):
+    """Enqueue offline transcription of a long recording (meeting minutes).
+
+    Unlike ``/api/asr/upload`` (single clip, 60 s tail-trim, synchronous),
+    this accepts whole recordings up to ``transcribe_max_audio_sec``: the
+    audio is VAD-segmented server-side with the same parameters as the
+    streaming endpoints and each segment is transcribed via the shared
+    one-shot dual-ASR path. Recordings longer than the cap are REJECTED
+    (400) rather than trimmed — silently losing meeting content is worse
+    than asking the client to split the file.
+
+    Poll ``GET /api/asr/transcriptions/{job_id}`` for progress and the final
+    segment list (``start_ms``/``end_ms`` per segment + ``full_text``).
+
+    No ``enrollment_id`` here on purpose: target-speaker filtering keeps a
+    single speaker and drops everyone else, which is the opposite of what a
+    multi-speaker meeting transcript needs.
+    """
+    cfg = load_config()
+    raw = await _read_audio_bytes(audio, max_bytes=cfg.transcribe_max_upload_bytes)
+    try:
+        pcm = wav_bytes_to_pcm_16k_mono(raw)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"could not decode audio: {exc}"
+        ) from exc
+    del raw
+    if pcm.size == 0:
+        raise HTTPException(status_code=400, detail="audio decoded to empty PCM")
+
+    duration_sec = pcm.size / SAMPLE_RATE
+    max_sec = float(cfg.transcribe_max_audio_sec)
+    if max_sec > 0 and duration_sec > max_sec:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"audio duration {duration_sec:.1f}s exceeds the "
+                f"{max_sec:.0f}s transcription cap; split the recording"
+            ),
+        )
+
+    pcm_i16 = float_pcm_to_i16_bytes(pcm)
+    del pcm
+
+    store = get_transcription_job_store()
+    store.configure(cfg)
+    try:
+        job = await store.submit(
+            pcm_i16,
+            duration_sec=duration_sec,
+            language=language,
+            hotwords=_parse_csv(hotwords),
+            cfg=cfg,
+        )
+    except JobQueueFullError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=str(exc),
+            headers={"Retry-After": "5"},
+        ) from exc
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "job_id": job.job_id,
+            "status": job.status,
+            "poll_url": f"/api/asr/transcriptions/{job.job_id}",
+            "duration_sec": round(duration_sec, 3),
+        },
+    )
+
+
+@app.get("/api/asr/transcriptions/{job_id}")
+async def asr_transcription_get(job_id: str):
+    """Poll offline transcription job status, progress, and result."""
+    store = get_transcription_job_store()
+    job = await store.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return job.to_poll_dict()
 
 
 @app.post("/api/emotion/jobs", status_code=202)
