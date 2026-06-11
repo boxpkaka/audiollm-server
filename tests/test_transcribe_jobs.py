@@ -78,6 +78,14 @@ def _wav_b64_samples(wav_b64: str) -> int:
         return wf.getnframes()
 
 
+def _cfg(**overrides):
+    """Config pinned to the GLOBAL cut pause (350 ms) regardless of the
+    deployment's transcribe_silence_duration_ms, so segmentation expectations
+    don't drift with config.yaml tuning."""
+    merged = {"transcribe_silence_duration_ms": 0, **overrides}
+    return load_config().override(**merged)
+
+
 # ---------------------------------------------------------------------------
 # Offline segmentation
 # ---------------------------------------------------------------------------
@@ -87,7 +95,7 @@ def test_segment_offline_cuts_on_silence_with_timing(fake_vad):
     pcm = _pcm_i16(
         _silence(0.5), _tone(2.0), _silence(1.0), _tone(3.0), _silence(0.5)
     )
-    segs = segment_pcm_offline(pcm, load_config(), max_segment_sec=30.0)
+    segs = segment_pcm_offline(pcm, _cfg(), max_segment_sec=30.0)
 
     assert len(segs) == 2
     first, second = segs
@@ -107,7 +115,7 @@ def test_segment_offline_cuts_on_silence_with_timing(fake_vad):
 
 def test_segment_offline_force_cuts_continuous_speech(fake_vad):
     pcm = _pcm_i16(_silence(0.3), _tone(65.0), _silence(0.3))
-    segs = segment_pcm_offline(pcm, load_config(), max_segment_sec=30.0)
+    segs = segment_pcm_offline(pcm, _cfg(), max_segment_sec=30.0)
 
     # 65 s of uninterrupted speech with a 30 s cap -> two force cuts plus the
     # flushed tail.
@@ -124,9 +132,40 @@ def test_segment_offline_force_cuts_continuous_speech(fake_vad):
 
 def test_segment_offline_silence_only_yields_nothing(fake_vad):
     segs = segment_pcm_offline(
-        _pcm_i16(_silence(3.0)), load_config(), max_segment_sec=30.0
+        _pcm_i16(_silence(3.0)), _cfg(), max_segment_sec=30.0
     )
     assert segs == []
+
+
+def test_transcribe_silence_override_merges_segments(fake_vad):
+    # A 0.5 s pause splits speech under the global 350 ms cut pause but is
+    # bridged by the offline-only 800 ms override; live endpoints keep 350 ms.
+    pcm = _pcm_i16(
+        _silence(0.5), _tone(2.0), _silence(0.5), _tone(2.0), _silence(1.5)
+    )
+
+    follow_global = segment_pcm_offline(pcm, _cfg(), max_segment_sec=30.0)
+    assert len(follow_global) == 2
+
+    overridden = segment_pcm_offline(
+        pcm,
+        _cfg(transcribe_silence_duration_ms=800),
+        max_segment_sec=30.0,
+    )
+    assert len(overridden) == 1
+    # The merged segment spans both tones (plus the bridged pause).
+    assert overridden[0].pcm.size / SAMPLE_RATE >= 4.0
+
+
+def test_transcribe_silence_override_does_not_leak_to_caller_cfg(fake_vad):
+    cfg = _cfg(transcribe_silence_duration_ms=800)
+    segment_pcm_offline(
+        _pcm_i16(_silence(0.5), _tone(1.0), _silence(1.5)),
+        cfg,
+        max_segment_sec=30.0,
+    )
+    # Config is frozen; the override happens on a copy inside the pipeline.
+    assert cfg.silence_duration_ms == 350
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +193,7 @@ async def test_transcribe_partial_failure_keeps_job_alive(fake_vad, monkeypatch)
     done: list[int] = []
     result = await transcribe_pcm_i16(
         pcm,
-        cfg=load_config(),
+        cfg=_cfg(),
         language="",
         on_segments_planned=planned.append,
         on_segment_done=done.append,
@@ -183,7 +222,7 @@ async def test_transcribe_all_segments_failed_fails_job(fake_vad, monkeypatch):
 
     pcm = _pcm_i16(_silence(0.5), _tone(2.0), _silence(0.5))
     with pytest.raises(JobExecutionError):
-        await transcribe_pcm_i16(pcm, cfg=load_config())
+        await transcribe_pcm_i16(pcm, cfg=_cfg())
 
 
 @pytest.mark.asyncio
@@ -194,7 +233,7 @@ async def test_transcribe_empty_text_segments_dropped(fake_vad, monkeypatch):
     monkeypatch.setattr(transcribe_mod, "run_oneshot_asr", fake_asr)
 
     pcm = _pcm_i16(_silence(0.5), _tone(2.0), _silence(0.5))
-    result = await transcribe_pcm_i16(pcm, cfg=load_config())
+    result = await transcribe_pcm_i16(pcm, cfg=_cfg())
     # Noise that VAD passed but the model transcribed as empty: dropped, not
     # an error.
     assert result["segments"] == []
@@ -205,7 +244,7 @@ async def test_transcribe_empty_text_segments_dropped(fake_vad, monkeypatch):
 @pytest.mark.asyncio
 async def test_transcribe_no_speech_returns_empty_result(fake_vad):
     result = await transcribe_pcm_i16(
-        _pcm_i16(_silence(2.0)), cfg=load_config()
+        _pcm_i16(_silence(2.0)), cfg=_cfg()
     )
     assert result["segments"] == []
     assert result["full_text"] == ""

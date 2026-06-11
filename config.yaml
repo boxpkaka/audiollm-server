@@ -89,6 +89,10 @@ defaults:
     transcribe_max_segment_sec: 30.0      # 连续语音强切上限(VAD 只在静音处切)
     transcribe_max_upload_bytes: 536870912  # 512MB; 2h 16k mono WAV ≈ 220MB
     transcribe_max_audio_sec: 10800       # 超长直接 400 拒绝(不尾截, 不静默丢内容)
+    transcribe_silence_duration_ms: 800   # 仅离线转写的切段停顿; 0 = 跟随全局
+                                          # silence_duration_ms(350, 为实时调的低延迟值)。
+                                          # 离线无延迟代价, 拉长可让纪要段落更完整
+                                          # (实测 350ms 下会议录音 p50 段长仅 1.5s)
   emotion:
     emotion_task_mode: ser
     emotion_max_audio_seconds: 20.0

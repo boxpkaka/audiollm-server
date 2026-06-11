@@ -207,6 +207,20 @@ class Config:
     #                                       REJECTS the request (400): silently
     #                                       dropping the head of a meeting
     #                                       recording is never acceptable.
+    #   transcribe_silence_duration_ms   -> offline-only override of the VAD
+    #                                       cut pause. 0 = follow the global
+    #                                       silence_duration_ms. The global one
+    #                                       is tuned for live latency (350 ms);
+    #                                       minutes-style transcripts read
+    #                                       better with longer pauses (~800 ms)
+    #                                       and offline has no latency cost,
+    #                                       but raising the GLOBAL knob would
+    #                                       also delay every live endpoint's
+    #                                       finals — hence the scoped override
+    #                                       (same fallback pattern as
+    #                                       astv3_vllm_base_url). All other VAD
+    #                                       knobs stay shared: there is no
+    #                                       offline reason for them to differ.
     transcribe_max_concurrent_jobs: int = 2
     transcribe_segment_concurrency: int = 4
     transcribe_job_queue_max: int = 8
@@ -214,6 +228,7 @@ class Config:
     transcribe_max_segment_sec: float = 30.0
     transcribe_max_upload_bytes: int = 512 * 1024 * 1024
     transcribe_max_audio_sec: float = 10800.0
+    transcribe_silence_duration_ms: int = 0
 
     # ---- Emotion recognition: vLLM endpoint ------------------------------
     # The Amphion multi-task model is trained to handle SER/SEC alongside ASR

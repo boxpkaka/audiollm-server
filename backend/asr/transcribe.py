@@ -77,7 +77,15 @@ def segment_pcm_offline(
     The restart costs the next segment its pre-speech backfill and start-
     confirmation frames land in the new pre-speech buffer, so no audio is
     lost at the seam.
+
+    ``transcribe_silence_duration_ms > 0`` swaps in an offline-only cut
+    pause: live endpoints keep the latency-tuned global value while minutes
+    transcripts get longer, more readable segments.
     """
+    if cfg.transcribe_silence_duration_ms > 0:
+        cfg = cfg.override(
+            silence_duration_ms=cfg.transcribe_silence_duration_ms
+        )
     stream = VadSegmentedStream(enable_partial=False)
     stream.configure(cfg)
 
