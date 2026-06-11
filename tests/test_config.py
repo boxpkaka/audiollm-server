@@ -1,29 +1,30 @@
-"""Unit tests for the grouped-config loader and single-entry refactor.
+"""Unit tests for the declarative YAML config loader and endpoint projection.
 
 Covers
 ------
-1. Nested (feature-grouped) config.json flattens to exactly the same Config
-   as the equivalent flat file -> the on-disk regrouping is behavior-neutral.
-2. A legacy flat file still loads unchanged (backward compatibility).
-3. The shipped backend/config.json decodes to the expected values and keeps
-   each value's JSON type (Config does no coercion, e.g. ttl stays ``int``).
-4. ``override`` still uses flat field keys; nested-style dotted keys are
-   ignored, so the client contract is unchanged.
-5. A leaf key colliding across groups warns (config error is not silent).
-6. The fusion/secondary invariant still fires (and warns) when expressed
-   through nested groups -> the load-time WARN reads the flattened values.
-7. ``default_config`` is exactly ``load_config()`` -> one entry point.
+1. config.yaml loads with ${ENV} interpolation (unset -> empty string).
+2. upstreams parse: base_url stripped to service root, max_tokens optional.
+3. endpoints parse + (protocol, task) whitelist fail-fast; unknown upstream
+   references (endpoint / service / rest) fail-fast at parse time.
+4. resolve_endpoint projects: global default + per-endpoint upstream bindings +
+   policy (soft) + lock (hard); an asr endpoint with no secondary upstream is
+   forced secondary-off even if policy tries to enable it.
+5. The text_cleanup bridge re-appends /v1 (un-migrated client expects it).
+6. __post_init__ invariants (fusion<-secondary, first_partial clamp) still fire
+   on every construction path, and the override / override_client whitelist
+   contract is unchanged.
+7. default_config is exactly load_config() -> single entry point.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import json
 import logging
 import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -31,128 +32,369 @@ if str(ROOT) not in sys.path:
 
 from backend.config import (  # noqa: E402
     CLIENT_OVERRIDABLE_FIELDS,
+    ENDPOINTS,
+    VALID_ENDPOINT_COMBINATIONS,
     Config,
-    _flatten,
+    Upstream,
     default_config,
+    get_service_upstream,
     load_config,
+    load_parsed,
+    resolve_endpoint,
 )
 
 
-def _write_and_load(tmp_path: Path, data: dict) -> Config:
+def _write_yaml(tmp_path: Path, data: dict) -> Path:
     tmp_path.mkdir(parents=True, exist_ok=True)
-    path = tmp_path / "config.json"
-    path.write_text(json.dumps(data), encoding="utf-8")
-    return load_config(path)
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
+    return path
 
 
-def test_nested_equals_equivalent_flat(tmp_path: Path) -> None:
-    nested = {
-        "asr": {
-            "primary": {"vllm_base_url": "http://x:1", "primary_asr_timeout": 2.0},
-            "secondary": {"enable_secondary_asr": True},
-            "vad": {"vad_threshold": 0.7, "vad_start_frames": 5},
+def _minimal() -> dict:
+    """A small but fully valid config used as a base for targeted mutations."""
+    return {
+        "http_pool": {"max_connections": 8, "max_keepalive_connections": 4},
+        "upstreams": {
+            "p": {"base_url": "http://p:1", "model_name": "P", "timeout": 11},
+            "s": {"base_url": "http://s:2", "model_name": "S", "timeout": 12},
+            "e": {"base_url": "http://e:3", "model_name": "E", "timeout": 13},
+            "clean": {
+                "base_url": "http://c:4",
+                "model_name": "C",
+                "api_key": "k",
+                "timeout": 14,
+                "max_tokens": 99,
+            },
         },
-        "emotion": {"emotion_task_mode": "sec"},
-        "http": {"http_max_connections": 9},
+        "defaults": {
+            "asr": {"enable_secondary_asr": True, "enable_dual_asr_fusion": False},
+            "vad": {"vad_threshold": 0.6, "min_segment_duration_ms": 350},
+            "pseudo_stream": {"pseudo_stream_first_partial_ms": 200},
+        },
+        "services": {"text_cleanup": "clean"},
+        "rest": {"upstreams": {"primary": "p", "secondary": "s", "emotion": "e"}},
+        "endpoints": [
+            {
+                "path": "/x",
+                "protocol": "native",
+                "task": "asr",
+                "upstreams": {"primary": "p", "secondary": "s"},
+            }
+        ],
     }
-    flat = {
-        "vllm_base_url": "http://x:1",
-        "primary_asr_timeout": 2.0,
-        "enable_secondary_asr": True,
-        "vad_threshold": 0.7,
-        "vad_start_frames": 5,
-        "emotion_task_mode": "sec",
-        "http_max_connections": 9,
-    }
-    cfg_nested = _write_and_load(tmp_path / "a", nested)
-    cfg_flat = _write_and_load(tmp_path / "b", flat)
-    assert dataclasses.asdict(cfg_nested) == dataclasses.asdict(cfg_flat)
 
 
-def test_flat_file_backward_compatible(tmp_path: Path) -> None:
-    cfg = _write_and_load(tmp_path, {"vllm_base_url": "http://legacy:9", "vad_start_frames": 11})
-    assert cfg.vllm_base_url == "http://legacy:9"
-    assert cfg.vad_start_frames == 11
+# --------------------------------------------------------------------------- #
+# Loading + ${ENV} interpolation
+# --------------------------------------------------------------------------- #
 
 
-def test_shipped_config_values_and_types() -> None:
-    cfg = load_config()  # reads backend/config.json
+def test_env_interpolation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("T_URL", "http://up:9")
+    monkeypatch.setenv("T_KEY", "secret")
+    data = _minimal()
+    data["upstreams"]["p"]["base_url"] = "${T_URL}"
+    data["upstreams"]["clean"]["api_key"] = "${T_KEY}"
+    parsed = load_parsed(_write_yaml(tmp_path, data))
+    assert parsed.upstreams["p"].base_url == "http://up:9"
+    assert parsed.upstreams["clean"].api_key == "secret"
+
+
+def test_env_unset_interpolates_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("T_MISSING", raising=False)
+    data = _minimal()
+    data["upstreams"]["clean"]["api_key"] = "${T_MISSING}"
+    parsed = load_parsed(_write_yaml(tmp_path, data))
+    assert parsed.upstreams["clean"].api_key == ""
+
+
+def test_config_path_env_overrides_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write_yaml(tmp_path, _minimal())
+    monkeypatch.setenv("CONFIG_PATH", str(path))
+    cfg = load_config()  # no explicit path -> reads CONFIG_PATH
+    assert cfg.vllm_base_url == "http://p:1"
+
+
+# --------------------------------------------------------------------------- #
+# upstream parsing
+# --------------------------------------------------------------------------- #
+
+
+def test_upstream_base_url_stripped_and_max_tokens(tmp_path: Path) -> None:
+    data = _minimal()
+    data["upstreams"]["p"]["base_url"] = "http://p:1/"  # trailing slash
+    parsed = load_parsed(_write_yaml(tmp_path, data))
+    assert parsed.upstreams["p"].base_url == "http://p:1"
+    assert parsed.upstreams["clean"].max_tokens == 99
+    assert parsed.upstreams["p"].max_tokens is None
+    assert isinstance(parsed.upstreams["p"], Upstream)
+
+
+# --------------------------------------------------------------------------- #
+# global (REST-bound) projection
+# --------------------------------------------------------------------------- #
+
+
+def test_rest_projection_maps_roles_to_fields(tmp_path: Path) -> None:
+    parsed = load_parsed(_write_yaml(tmp_path, _minimal()))
+    cfg = parsed.default_config
+    assert cfg.vllm_base_url == "http://p:1"
+    assert cfg.vllm_model_name == "P"
+    assert cfg.asr_request_timeout == 11  # primary upstream timeout
+    assert cfg.secondary_vllm_base_url == "http://s:2"
+    assert cfg.emotion_vllm_base_url == "http://e:3"
+    assert cfg.emotion_request_timeout == 13
+    assert cfg.http_max_connections == 8
+    assert cfg.http_max_keepalive_connections == 4
+
+
+def test_text_cleanup_bridge_appends_v1(tmp_path: Path) -> None:
+    """The un-migrated text_cleanup client expects base to contain /v1; the
+    projection re-appends it onto the service-root upstream base_url."""
+    parsed = load_parsed(_write_yaml(tmp_path, _minimal()))
+    cfg = parsed.default_config
+    assert cfg.text_cleanup_base_url == "http://c:4/v1"
+    assert cfg.text_cleanup_model_name == "C"
+    assert cfg.text_cleanup_api_key == "k"
+    assert cfg.text_cleanup_api_key_env == ""
+    assert cfg.text_cleanup_timeout == 14
+    assert cfg.text_cleanup_max_tokens == 99
+
+
+def test_shipped_config_projects_rest_bindings() -> None:
+    cfg = load_config()  # reads the shipped config.yaml
     assert cfg.vllm_base_url == "http://localhost:8009"
     assert cfg.vllm_model_name == "AmphionASR-4.3B"
-    # /tuling/ast/v3 leaves its per-endpoint primary empty -> falls back to
-    # the global primary (vllm_base_url / vllm_model_name above).
-    assert cfg.astv3_vllm_base_url == ""
-    assert cfg.astv3_vllm_model_name == ""
+    assert cfg.secondary_vllm_base_url == "http://localhost:8001"
+    assert cfg.emotion_vllm_base_url == "http://localhost:8222"
+    assert cfg.emotion_spec_vllm_base_url == "http://localhost:9001"
+    assert cfg.asr_request_timeout == 120
+    assert cfg.emotion_request_timeout == 30
     assert cfg.vad_threshold == 0.65
-    # config.json 显式给 pseudo_stream_first_partial_ms=200(< min_segment 350):默认
-    # 部署选择全局低延迟首字(对所有产 partial 的端点生效)。dataclass 兜底是中性 350,
-    # 见 test_pseudo_stream_first_partial_dataclass_default_is_neutral。
     assert cfg.min_segment_duration_ms == 350
     assert cfg.pseudo_stream_first_partial_ms == 200
     assert cfg.enable_dual_asr_fusion is False
     assert cfg.enable_secondary_asr is True
     assert cfg.emotion_task_mode == "ser"
     assert cfg.emotion_spec_task_mode == "sepc"
-    # Config does no type coercion: an integer literal stays an int.
-    assert isinstance(cfg.asr_enrollment_ttl_sec, int)
-    assert cfg.asr_enrollment_ttl_sec == 3600
+    assert (
+        cfg.text_cleanup_base_url
+        == "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    )
+    assert cfg.http_max_connections == 32
 
 
-def test_vad_end_frames_field_removed() -> None:
-    """vad_end_frames was merged into silence_duration_ms; it must stay gone
-    from both the dataclass and the client override whitelist so it can't
-    silently reappear and reintroduce the max() config-spoofing bug."""
-    names = {f.name for f in dataclasses.fields(Config)}
-    assert "vad_end_frames" not in names
-    assert "vad_end_frames" not in CLIENT_OVERRIDABLE_FIELDS
+# --------------------------------------------------------------------------- #
+# endpoint parsing + validation
+# --------------------------------------------------------------------------- #
+
+
+def test_real_endpoints_parsed() -> None:
+    paths = {e.path for e in ENDPOINTS}
+    assert {
+        "/transcribe-streaming",
+        "/tuling/ast/v3",
+        "/emotion-segmented-streaming",
+        "/ws/audio",
+    } <= paths
+    tuling = next(e for e in ENDPOINTS if e.path == "/tuling/ast/v3")
+    assert tuling.protocol == "astv3" and tuling.task == "asr"
+    assert tuling.lock == {"enable_secondary_asr": False}
+    ws = next(e for e in ENDPOINTS if e.path == "/ws/audio")
+    assert ws.task == "browser_demo" and ws.input_sample_rate == 48000
+    ts = next(e for e in ENDPOINTS if e.path == "/transcribe-streaming")
+    assert ts.client_overridable is True
+
+
+def test_valid_combinations_constant() -> None:
+    assert ("native", "asr") in VALID_ENDPOINT_COMBINATIONS
+    assert ("astv3", "asr") in VALID_ENDPOINT_COMBINATIONS
+    assert ("native", "browser_demo") in VALID_ENDPOINT_COMBINATIONS
+    assert ("astv3", "browser_demo") not in VALID_ENDPOINT_COMBINATIONS
+
+
+def test_invalid_protocol_task_combo_fails(tmp_path: Path) -> None:
+    data = _minimal()
+    data["endpoints"] = [
+        {
+            "path": "/bad",
+            "protocol": "astv3",
+            "task": "browser_demo",
+            "upstreams": {"primary": "p"},
+        }
+    ]
+    with pytest.raises(ValueError, match="invalid"):
+        load_parsed(_write_yaml(tmp_path, data))
+
+
+def test_unknown_endpoint_upstream_fails(tmp_path: Path) -> None:
+    data = _minimal()
+    data["endpoints"] = [
+        {
+            "path": "/x",
+            "protocol": "native",
+            "task": "asr",
+            "upstreams": {"primary": "ghost"},
+        }
+    ]
+    with pytest.raises(ValueError, match="unknown upstream"):
+        load_parsed(_write_yaml(tmp_path, data))
+
+
+def test_unknown_endpoint_role_fails(tmp_path: Path) -> None:
+    data = _minimal()
+    data["endpoints"] = [
+        {
+            "path": "/x",
+            "protocol": "native",
+            "task": "asr",
+            "upstreams": {"tertiary": "p"},
+        }
+    ]
+    with pytest.raises(ValueError, match="unknown upstream role"):
+        load_parsed(_write_yaml(tmp_path, data))
+
+
+def test_unknown_service_upstream_fails(tmp_path: Path) -> None:
+    data = _minimal()
+    data["services"] = {"text_cleanup": "ghost"}
+    with pytest.raises(ValueError, match="unknown upstream"):
+        load_parsed(_write_yaml(tmp_path, data))
+
+
+def test_unknown_rest_upstream_fails(tmp_path: Path) -> None:
+    data = _minimal()
+    data["rest"]["upstreams"]["primary"] = "ghost"
+    with pytest.raises(ValueError, match="unknown upstream"):
+        load_parsed(_write_yaml(tmp_path, data))
+
+
+# --------------------------------------------------------------------------- #
+# resolve_endpoint projection
+# --------------------------------------------------------------------------- #
+
+
+def test_resolve_binds_per_endpoint_primary(tmp_path: Path) -> None:
+    data = _minimal()
+    data["upstreams"]["other"] = {
+        "base_url": "http://other:9",
+        "model_name": "OTHER",
+        "timeout": 7,
+    }
+    data["endpoints"] = [
+        {
+            "path": "/b",
+            "protocol": "native",
+            "task": "asr",
+            "upstreams": {"primary": "other", "secondary": "s"},
+        }
+    ]
+    parsed = load_parsed(_write_yaml(tmp_path, data))
+    cfg = resolve_endpoint(parsed.endpoints[0], parsed)
+    assert cfg.vllm_base_url == "http://other:9"
+    assert cfg.vllm_model_name == "OTHER"
+    assert cfg.asr_request_timeout == 7
+    # secondary still bound from this endpoint's own upstreams
+    assert cfg.secondary_vllm_base_url == "http://s:2"
+
+
+def test_resolve_no_secondary_forces_off_even_if_policy_enables(
+    tmp_path: Path,
+) -> None:
+    data = _minimal()
+    data["endpoints"] = [
+        {
+            "path": "/p",
+            "protocol": "native",
+            "task": "asr",
+            "upstreams": {"primary": "p"},
+            "policy": {"enable_secondary_asr": True},
+        }
+    ]
+    parsed = load_parsed(_write_yaml(tmp_path, data))
+    cfg = resolve_endpoint(parsed.endpoints[0], parsed)
+    assert cfg.enable_secondary_asr is False
+    assert cfg.enable_dual_asr_fusion is False  # invariant downgrade
+
+
+def test_resolve_policy_soft_applies(tmp_path: Path) -> None:
+    data = _minimal()
+    data["endpoints"] = [
+        {
+            "path": "/p",
+            "protocol": "native",
+            "task": "asr",
+            "upstreams": {"primary": "p", "secondary": "s"},
+            "policy": {"vad_threshold": 0.91},
+        }
+    ]
+    parsed = load_parsed(_write_yaml(tmp_path, data))
+    cfg = resolve_endpoint(parsed.endpoints[0], parsed)
+    assert cfg.vad_threshold == 0.91
+
+
+def test_resolve_real_tuling_primary_only() -> None:
+    spec = next(e for e in ENDPOINTS if e.path == "/tuling/ast/v3")
+    cfg = resolve_endpoint(spec)
+    assert cfg.vllm_base_url == "http://localhost:8009"  # amphion_asr (primary)
+    assert cfg.enable_secondary_asr is False  # lock + no secondary binding
+    assert cfg.enable_dual_asr_fusion is False
+
+
+def test_resolve_real_ws_audio_binds_emotion_spec() -> None:
+    spec = next(e for e in ENDPOINTS if e.path == "/ws/audio")
+    cfg = resolve_endpoint(spec)
+    assert cfg.emotion_spec_vllm_base_url == "http://localhost:9001"
+    assert cfg.enable_secondary_asr is True  # secondary bound
+
+
+def test_get_service_upstream() -> None:
+    assert get_service_upstream("text_cleanup").name == "dashscope_cleanup"
+    assert get_service_upstream("hotword").name == "hotword_llm"
+    assert get_service_upstream("nonexistent") is None
+
+
+# --------------------------------------------------------------------------- #
+# __post_init__ invariants (every construction path)
+# --------------------------------------------------------------------------- #
+
+
+def test_fusion_requires_secondary_invariant() -> None:
+    cfg = Config(enable_secondary_asr=False, enable_dual_asr_fusion=True)
+    assert cfg.enable_dual_asr_fusion is False
 
 
 def test_pseudo_stream_first_partial_dataclass_default_is_neutral() -> None:
-    """dataclass 兜底默认(无 config.json、直接 Config())== min_segment_duration_ms,即
-    文件缺字段时首个 partial 门槛中性。随附 config.json 显式设 200(低延迟),shipped 值见
-    test_shipped_config_values_and_types;两者分层:代码兜底中性、部署选择激进。"""
     cfg = Config()
     assert cfg.pseudo_stream_first_partial_ms == cfg.min_segment_duration_ms == 350
 
 
 def test_pseudo_stream_first_partial_clamped_to_min_segment() -> None:
-    """不变量:首字门槛不得严于 final 段最小时长。任何构造路径(含测试里直接
-    Config(...))都被 __post_init__ 夹到 <= min_segment_duration_ms。"""
     clamped = Config(pseudo_stream_first_partial_ms=500, min_segment_duration_ms=350)
     assert clamped.pseudo_stream_first_partial_ms == 350
-    # 合法的更低值保持不变。
     lower = Config(pseudo_stream_first_partial_ms=200, min_segment_duration_ms=350)
     assert lower.pseudo_stream_first_partial_ms == 200
 
 
-def test_pseudo_stream_first_partial_client_overridable() -> None:
-    """tuling 低延迟靠 per-connection 覆写 pseudo_stream_first_partial_ms 激活。"""
-    assert "pseudo_stream_first_partial_ms" in CLIENT_OVERRIDABLE_FIELDS
-    out = load_config().override_client(pseudo_stream_first_partial_ms=200)
-    assert out.pseudo_stream_first_partial_ms == 200
-
-
-def test_pseudo_stream_first_partial_clamp_applies_on_override() -> None:
-    """覆写路径(override -> replace -> __post_init__)同样执行 clamp:首字门槛被设得
-    比当前 min_segment 还大时夹到 min_segment。"""
-    cfg = load_config().override(min_segment_duration_ms=300)
-    out = cfg.override_client(pseudo_stream_first_partial_ms=400)
-    assert out.pseudo_stream_first_partial_ms == 300
+# --------------------------------------------------------------------------- #
+# override / override_client whitelist contract
+# --------------------------------------------------------------------------- #
 
 
 def test_override_uses_flat_keys_only() -> None:
     cfg = load_config()
     overridden = cfg.override(vad_threshold=0.45)
     assert overridden.vad_threshold == 0.45
-    # A nested/dotted key is not a dataclass field -> silently ignored,
-    # so the legacy flat override contract is preserved.
     untouched = cfg.override(**{"asr.vad.vad_threshold": 0.1})
     assert untouched.vad_threshold == cfg.vad_threshold
 
 
 def test_override_primary_does_not_touch_secondary() -> None:
-    """Endpoint-level primary rebinding (used by /tuling/ast/v3) changes only
-    the primary upstream; the secondary fields stay independent."""
     cfg = load_config()
     out = cfg.override(vllm_base_url="http://pub:8000", vllm_model_name="Amphion-4B")
     assert out.vllm_base_url == "http://pub:8000"
@@ -162,11 +404,22 @@ def test_override_primary_does_not_touch_secondary() -> None:
 
 
 def test_override_secondary_off_downgrades_fusion() -> None:
-    """Forcing the AST v3 endpoint to primary-only also kills fusion."""
     cfg = load_config().override(enable_secondary_asr=True, enable_dual_asr_fusion=True)
     out = cfg.override(enable_secondary_asr=False)
     assert out.enable_secondary_asr is False
     assert out.enable_dual_asr_fusion is False
+
+
+def test_pseudo_stream_first_partial_client_overridable() -> None:
+    assert "pseudo_stream_first_partial_ms" in CLIENT_OVERRIDABLE_FIELDS
+    out = load_config().override_client(pseudo_stream_first_partial_ms=200)
+    assert out.pseudo_stream_first_partial_ms == 200
+
+
+def test_pseudo_stream_first_partial_clamp_applies_on_override() -> None:
+    cfg = load_config().override(min_segment_duration_ms=300)
+    out = cfg.override_client(pseudo_stream_first_partial_ms=400)
+    assert out.pseudo_stream_first_partial_ms == 300
 
 
 def test_override_client_allows_whitelisted_fields() -> None:
@@ -179,7 +432,6 @@ def test_override_client_allows_whitelisted_fields() -> None:
 def test_override_client_drops_non_whitelisted_fields(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Infra/secret fields (model URL, API key) are not client-overridable."""
     cfg = load_config()
     with caplog.at_level(logging.WARNING, logger="backend.config"):
         out = cfg.override_client(
@@ -187,21 +439,19 @@ def test_override_client_drops_non_whitelisted_fields(
             text_cleanup_api_key="leaked",
             vad_threshold=0.42,
         )
-    assert out.vad_threshold == 0.42  # whitelisted -> applied
-    assert out.vllm_base_url == cfg.vllm_base_url  # restricted -> untouched
+    assert out.vad_threshold == 0.42
+    assert out.vllm_base_url == cfg.vllm_base_url
     assert out.text_cleanup_api_key == cfg.text_cleanup_api_key
     assert any("non-overridable config field" in r.message for r in caplog.records)
 
 
 def test_override_client_ignores_invalid_value() -> None:
-    """A whitelisted field with an uncoercible value keeps the server default."""
     cfg = load_config()
     out = cfg.override_client(vad_threshold="not-a-number")
     assert out.vad_threshold == cfg.vad_threshold
 
 
 def test_override_client_enforces_fusion_invariant() -> None:
-    """fusion=True + secondary=False downgrades fusion via __post_init__."""
     cfg = load_config().override(enable_secondary_asr=True, enable_dual_asr_fusion=True)
     out = cfg.override_client(enable_secondary_asr=False, enable_dual_asr_fusion=True)
     assert out.enable_secondary_asr is False
@@ -209,7 +459,6 @@ def test_override_client_enforces_fusion_invariant() -> None:
 
 
 def test_client_overridable_fields_are_real_and_safe() -> None:
-    """Whitelist references only real Config fields and excludes infra/secrets."""
     names = {f.name for f in dataclasses.fields(Config)}
     assert CLIENT_OVERRIDABLE_FIELDS <= names
     forbidden = {
@@ -228,29 +477,10 @@ def test_client_overridable_fields_are_real_and_safe() -> None:
     assert CLIENT_OVERRIDABLE_FIELDS.isdisjoint(forbidden)
 
 
-def test_duplicate_leaf_across_groups_warns(caplog: pytest.LogCaptureFixture) -> None:
-    with caplog.at_level(logging.WARNING, logger="backend.config"):
-        flat = _flatten({"groupA": {"vad_threshold": 0.5}, "groupB": {"vad_threshold": 0.9}})
-    assert flat["vad_threshold"] == 0.9  # last value wins
-    assert any("Duplicate config key across groups" in r.message for r in caplog.records)
-
-
-def test_nested_fusion_downgrade_warns(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    with caplog.at_level(logging.WARNING, logger="backend.config"):
-        cfg = _write_and_load(
-            tmp_path,
-            {
-                "asr": {
-                    "secondary": {"enable_secondary_asr": False},
-                    "fusion": {"enable_dual_asr_fusion": True},
-                }
-            },
-        )
-    assert cfg.enable_secondary_asr is False
-    assert cfg.enable_dual_asr_fusion is False  # auto-downgraded
-    assert any("downgrading fusion" in r.message for r in caplog.records)
+def test_vad_end_frames_field_removed() -> None:
+    names = {f.name for f in dataclasses.fields(Config)}
+    assert "vad_end_frames" not in names
+    assert "vad_end_frames" not in CLIENT_OVERRIDABLE_FIELDS
 
 
 def test_default_config_is_load_config_snapshot() -> None:
