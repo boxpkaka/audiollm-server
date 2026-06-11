@@ -156,9 +156,37 @@ curl -X POST http://172.16.0.3:8080/api/asr/transcriptions \
 3. 每段并行（`transcribe_segment_concurrency`）执行与 `/api/asr/upload` 相同的一次性双模型推理（融合开关同全局 `enable_dual_asr_fusion`），失败重试一次。
 4. 按时间序组装 `segments` 与 `full_text`。
 
-## 服务端配置（config.yaml `defaults.transcribe`）
+## 服务端配置
 
-均为进程级配置，客户端不可经任何接口覆写，修改后重启生效。默认值经过实测扫参验证（并发、时延、吞吐与容量上界数据见[性能报告](transcription-jobs-benchmark.md)）：
+均为进程级配置，客户端不可经任何接口覆写，修改后重启生效。
+
+### 推理模型绑定（config.yaml `rest.transcribe`）
+
+本接口的推理模型独立于其他 REST 接口配置。`rest.upstreams` 是 `/api/asr/upload`、`/api/audio/analyze` 等共用的绑定；`rest.transcribe` 块单独声明长音频转写用哪个模型、是否双模型融合，整块或单项省略时回退共用绑定与全局开关：
+
+```yaml
+rest:
+  upstreams:                       # 通用 REST 绑定
+    primary: amphion_asr
+    secondary: qwen_asr
+  transcribe:                      # 长音频转写专属（省略 = 跟随上面）
+    upstreams:
+      primary: amphion_asr         # 转写主模型，换模型只影响本接口
+      secondary: qwen_asr          # 仅融合开启时参与
+    enable_dual_asr_fusion: false  # 转写是否双模型融合（独立于全局开关）
+```
+
+| 键 | 说明 |
+|---|---|
+| `upstreams.primary` | 转写主模型（`upstreams` 池中的名字）；省略则跟随 `rest.upstreams.primary` |
+| `upstreams.secondary` | 融合副模型；仅 `enable_dual_asr_fusion: true` 时被调用 |
+| `enable_dual_asr_fusion` | 本接口专属融合开关。离线无延迟压力，质量优先可开 `true`；代价是每段 2 个 vLLM 请求，吞吐约减半。需全局 `enable_secondary_asr: true`，否则自动降级 `false` 并打 WARN |
+
+未知键、未知角色、未知 upstream 名在启动时直接报错（拼写错误静默回退会复现"看不出用了哪个模型"的问题）。
+
+### 调参（config.yaml `defaults.transcribe`）
+
+默认值经过实测扫参验证（并发、时延、吞吐与容量上界数据见[性能报告](transcription-jobs-benchmark.md)）：
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|

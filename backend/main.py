@@ -19,7 +19,7 @@ from .asr.jobs import get_transcription_job_store
 from .asr.oneshot import OneshotAsrError, run_oneshot_asr
 from .asr.transcribe import float_pcm_to_i16_bytes
 from .audio.utils import wav_base64_to_pcm_16k_mono, wav_bytes_to_pcm_16k_mono
-from .config import SAMPLE_RATE, load_config
+from .config import SAMPLE_RATE, load_config, load_transcribe_config
 from .emotion.client import query_emotion_model
 from .emotion.jobs import JobQueueFullError, get_emotion_job_store
 from .emotion.service import EmotionDecodeError, decode_wav_capped
@@ -494,7 +494,9 @@ async def asr_transcription_create(
     single speaker and drops everyone else, which is the opposite of what a
     multi-speaker meeting transcript needs.
     """
-    cfg = load_config()
+    # Transcription-specific view: rest.transcribe bindings (model choice,
+    # fusion switch) layered over the shared REST defaults.
+    cfg = load_transcribe_config()
     raw = await _read_audio_bytes(audio, max_bytes=cfg.transcribe_max_upload_bytes)
     try:
         pcm = wav_bytes_to_pcm_16k_mono(raw)

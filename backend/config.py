@@ -442,6 +442,10 @@ class ParsedConfig:
     endpoints: tuple[EndpointSpec, ...]
     http_pool: dict[str, int]
     default_config: Config
+    # POST /api/asr/transcriptions runtime view: default_config plus the
+    # optional `rest.transcribe` block (own model bindings + fusion switch);
+    # equal to default_config when the block is absent.
+    transcribe_config: Config
 
 
 def _parse_upstream(name: str, raw: dict[str, Any]) -> Upstream:
@@ -570,6 +574,57 @@ def _parse_endpoint(raw: dict[str, Any], upstreams: dict[str, Upstream]) -> Endp
     )
 
 
+def _project_transcribe(
+    base: Config,
+    raw_transcribe: dict[str, Any],
+    upstreams: dict[str, Upstream],
+) -> Config:
+    """Project the `rest.transcribe` block onto the transcription Config.
+
+    The block exists so operators can see and change, in one place, which
+    model(s) the long-audio endpoint runs on — independently of the shared
+    `rest.upstreams` bindings used by /api/asr/upload etc. Recognized keys:
+
+    - ``upstreams``: role -> upstream name, roles limited to primary /
+      secondary (an emotion model makes no sense for transcription);
+    - ``enable_dual_asr_fusion``: per-endpoint override of the global switch.
+
+    Unknown keys raise: a typo silently falling back to the shared bindings
+    is exactly the "can't see what this endpoint uses" problem again.
+    """
+    allowed = {"upstreams", "enable_dual_asr_fusion"}
+    unknown = set(raw_transcribe) - allowed
+    if unknown:
+        raise ValueError(
+            f"rest.transcribe: unknown keys {sorted(unknown)}; allowed: {sorted(allowed)}"
+        )
+
+    overrides: dict[str, Any] = {}
+    roles = dict(raw_transcribe.get("upstreams", {}) or {})
+    for role, up_name in roles.items():
+        if role not in ("primary", "secondary"):
+            raise ValueError(
+                f"rest.transcribe.upstreams: unknown role {role!r}; "
+                "allowed: ['primary', 'secondary']"
+            )
+        if up_name not in upstreams:
+            raise ValueError(
+                f"rest.transcribe.upstreams.{role}: unknown upstream {up_name!r}"
+            )
+        overrides.update(_role_fields(role, upstreams[up_name]))
+
+    if "enable_dual_asr_fusion" in raw_transcribe:
+        fusion = bool(raw_transcribe["enable_dual_asr_fusion"])
+        overrides["enable_dual_asr_fusion"] = fusion
+        if fusion and not base.enable_secondary_asr:
+            logger.warning(
+                "rest.transcribe.enable_dual_asr_fusion=true requires "
+                "enable_secondary_asr=true (defaults.asr); downgrading to false"
+            )
+
+    return base.override(**overrides) if overrides else base
+
+
 def _parse(raw: dict[str, Any]) -> ParsedConfig:
     upstreams = {
         name: _parse_upstream(name, spec)
@@ -611,6 +666,9 @@ def _parse(raw: dict[str, Any]) -> ParsedConfig:
         services=services,
         http_pool=http_pool,
     )
+    transcribe_cfg = _project_transcribe(
+        base, dict((raw.get("rest", {}) or {}).get("transcribe", {}) or {}), upstreams
+    )
     return ParsedConfig(
         upstreams=upstreams,
         defaults=defaults,
@@ -619,6 +677,7 @@ def _parse(raw: dict[str, Any]) -> ParsedConfig:
         endpoints=endpoints,
         http_pool=http_pool,
         default_config=base,
+        transcribe_config=transcribe_cfg,
     )
 
 
@@ -639,6 +698,15 @@ def load_config(path: Path | None = None) -> Config:
     Per-endpoint runtime configs come from :func:`resolve_endpoint`.
     """
     return load_parsed(path).default_config
+
+
+def load_transcribe_config(path: Path | None = None) -> Config:
+    """Runtime Config for POST /api/asr/transcriptions.
+
+    Equals :func:`load_config` unless config.yaml declares a `rest.transcribe`
+    block (own primary/secondary bindings and/or fusion switch).
+    """
+    return load_parsed(path).transcribe_config
 
 
 def resolve_endpoint(

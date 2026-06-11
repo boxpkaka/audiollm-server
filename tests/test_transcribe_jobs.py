@@ -26,6 +26,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import backend.asr.transcribe as transcribe_mod  # noqa: E402
+import backend.config as config_mod  # noqa: E402
 import backend.main as main_mod  # noqa: E402
 from backend.asr.jobs import (  # noqa: E402
     JOB_STATUS_FAILED,
@@ -354,7 +355,7 @@ def test_transcription_http_create_poll_succeeds(fake_vad, monkeypatch):
 
 def test_transcription_http_rejects_overlong_audio(monkeypatch):
     cfg = load_config().override(transcribe_max_audio_sec=1.0)
-    monkeypatch.setattr(main_mod, "load_config", lambda: cfg)
+    monkeypatch.setattr(main_mod, "load_transcribe_config", lambda: cfg)
 
     client = TestClient(app)
     wav = _wav_upload_bytes(_silence(2.0))
@@ -394,3 +395,71 @@ def test_transcribe_config_defaults():
     assert cfg.transcribe_max_segment_sec > 0
     assert cfg.transcribe_max_upload_bytes > 25 * 1024 * 1024
     assert cfg.transcribe_max_audio_sec > 3600
+
+
+# ---------------------------------------------------------------------------
+# rest.transcribe: per-endpoint model bindings + fusion switch
+# ---------------------------------------------------------------------------
+
+
+def _raw_cfg(rest_transcribe: dict | None = None, **defaults_extra) -> dict:
+    raw = {
+        "upstreams": {
+            "amphion_asr": {
+                "base_url": "http://amphion:8009",
+                "model_name": "AmphionASR-4.3B",
+                "timeout": 120,
+            },
+            "qwen_asr": {
+                "base_url": "http://qwen:8001",
+                "model_name": "Qwen3-ASR",
+                "timeout": 60,
+            },
+        },
+        "defaults": {"asr": {"enable_secondary_asr": True,
+                             "enable_dual_asr_fusion": False, **defaults_extra}},
+        "rest": {"upstreams": {"primary": "amphion_asr", "secondary": "qwen_asr"}},
+    }
+    if rest_transcribe is not None:
+        raw["rest"]["transcribe"] = rest_transcribe
+    return raw
+
+
+def test_rest_transcribe_absent_follows_global_bindings():
+    parsed = config_mod._parse(_raw_cfg())
+    assert parsed.transcribe_config == parsed.default_config
+    assert parsed.transcribe_config.vllm_base_url == "http://amphion:8009"
+
+
+def test_rest_transcribe_overrides_primary_model_only_for_transcription():
+    parsed = config_mod._parse(
+        _raw_cfg({"upstreams": {"primary": "qwen_asr"}})
+    )
+    assert parsed.transcribe_config.vllm_base_url == "http://qwen:8001"
+    assert parsed.transcribe_config.vllm_model_name == "Qwen3-ASR"
+    assert parsed.transcribe_config.asr_request_timeout == 60
+    # The shared REST view is untouched.
+    assert parsed.default_config.vllm_base_url == "http://amphion:8009"
+
+
+def test_rest_transcribe_fusion_switch_is_endpoint_scoped():
+    parsed = config_mod._parse(_raw_cfg({"enable_dual_asr_fusion": True}))
+    assert parsed.transcribe_config.enable_dual_asr_fusion is True
+    assert parsed.default_config.enable_dual_asr_fusion is False
+
+
+def test_rest_transcribe_fusion_downgrades_without_secondary():
+    parsed = config_mod._parse(
+        _raw_cfg({"enable_dual_asr_fusion": True}, enable_secondary_asr=False)
+    )
+    # Config.__post_init__ invariant: fusion requires a secondary decoder.
+    assert parsed.transcribe_config.enable_dual_asr_fusion is False
+
+
+def test_rest_transcribe_rejects_unknown_keys_roles_and_upstreams():
+    with pytest.raises(ValueError, match="unknown keys"):
+        config_mod._parse(_raw_cfg({"polcy": {}}))
+    with pytest.raises(ValueError, match="unknown role"):
+        config_mod._parse(_raw_cfg({"upstreams": {"emotion": "amphion_asr"}}))
+    with pytest.raises(ValueError, match="unknown upstream"):
+        config_mod._parse(_raw_cfg({"upstreams": {"primary": "nope"}}))

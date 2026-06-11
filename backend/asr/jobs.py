@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..config import Config, load_config
+from ..config import Config, load_transcribe_config
 from ..jobstore import (
     JOB_STATUS_FAILED,
     JOB_STATUS_QUEUED,
@@ -74,7 +74,9 @@ class TranscriptionJobStore(JobStore[TranscriptionJob]):
 
     def __init__(self) -> None:
         super().__init__()
-        self._cfg: Config = load_config()
+        # Transcription view of the config: rest.transcribe model bindings
+        # and fusion switch applied on top of the global REST defaults.
+        self._cfg: Config = load_transcribe_config()
 
     def configure(self, cfg: Config | None = None) -> None:
         if cfg is not None:
