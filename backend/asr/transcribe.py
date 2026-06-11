@@ -148,8 +148,14 @@ async def transcribe_pcm_i16(
     hotwords = hotwords or []
     duration_sec = len(pcm_i16) / _BYTES_PER_SAMPLE / SAMPLE_RATE
 
-    segments = segment_pcm_offline(
-        pcm_i16, cfg, max_segment_sec=cfg.transcribe_max_segment_sec
+    # CPU-bound segmentation takes ~13 s per half-hour of audio; run it in a
+    # worker thread so it doesn't freeze the event loop (and with it every
+    # live WS endpoint and concurrent job poll) for that long.
+    segments = await asyncio.to_thread(
+        segment_pcm_offline,
+        pcm_i16,
+        cfg,
+        max_segment_sec=cfg.transcribe_max_segment_sec,
     )
     # Drop our local binding too, otherwise the caller's release_input()
     # can't actually free the full-recording buffer (segments own copies).

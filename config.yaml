@@ -82,17 +82,21 @@ defaults:
     asr_enrollment_ttl_sec: 3600
     asr_enrollment_max_entries: 256       # 进程级 store 容量(非 per-endpoint)
   transcribe:                             # 离线长音频转写 job (POST /api/asr/transcriptions)
-    transcribe_max_concurrent_jobs: 2     # 同时 running 的 job 数
-    transcribe_segment_concurrency: 4     # 单 job 内并行推理的段数(总 vLLM 压力 = 两者乘积)
-    transcribe_job_queue_max: 8           # 排队上限(含 running)
+                                          # 调参依据: docs/transcription-jobs-benchmark.md(H20 实测扫参)
+    transcribe_max_concurrent_jobs: 2     # 同时 running 的 job 数; 提到 4 吞吐不变(瓶颈在段级
+                                          # 并发), 只多占内存且拖慢先到任务
+    transcribe_segment_concurrency: 4     # 单 job 内并行推理的段数(总 vLLM 压力 = 两者乘积);
+                                          # 提到 8 单 job 仅 -3.6s, 但峰值压力翻倍挤压实时流量
+    transcribe_job_queue_max: 8           # 排队上限(含 running); 8 个 32min 会议实测 41.5s 清空
     transcribe_job_ttl_sec: 3600          # 终态 job 结果保留时长
-    transcribe_max_segment_sec: 30.0      # 连续语音强切上限(VAD 只在静音处切)
+    transcribe_max_segment_sec: 30.0      # 连续语音强切上限(VAD 只在静音处切); 15/30 性能无差异
     transcribe_max_upload_bytes: 536870912  # 512MB; 2h 16k mono WAV ≈ 220MB
     transcribe_max_audio_sec: 10800       # 超长直接 400 拒绝(不尾截, 不静默丢内容)
     transcribe_silence_duration_ms: 800   # 仅离线转写的切段停顿; 0 = 跟随全局
                                           # silence_duration_ms(350, 为实时调的低延迟值)。
-                                          # 离线无延迟代价, 拉长可让纪要段落更完整
-                                          # (实测 350ms 下会议录音 p50 段长仅 1.5s)
+                                          # 离线无延迟代价, 拉长可让纪要段落更完整且更快
+                                          # (实测 350ms: 636 段 p50 1.5s; 800ms: 303 段
+                                          #  p50 3.2s, e2e 还快 11%)
   emotion:
     emotion_task_mode: ser
     emotion_max_audio_seconds: 20.0

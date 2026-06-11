@@ -313,39 +313,43 @@ def test_transcription_http_create_poll_succeeds(fake_vad, monkeypatch):
 
     monkeypatch.setattr(transcribe_mod, "run_oneshot_asr", fake_asr)
 
-    client = TestClient(app)
-    wav = _wav_upload_bytes(_silence(0.5), _tone(2.0), _silence(0.5))
+    # `with` keeps the TestClient's event loop alive between requests, like a
+    # real server. Without it each request runs a throwaway loop, and the job
+    # task — now suspended in asyncio.to_thread during segmentation — would
+    # never be resumed once the POST's loop is gone.
+    with TestClient(app) as client:
+        wav = _wav_upload_bytes(_silence(0.5), _tone(2.0), _silence(0.5))
 
-    create = client.post(
-        "/api/asr/transcriptions",
-        files={"audio": ("meeting.wav", wav, "audio/wav")},
-        data={"language": "zh", "hotwords": "挚音科技"},
-    )
-    assert create.status_code == 202
-    body = create.json()
-    assert body["status"] == JOB_STATUS_QUEUED
-    assert body["poll_url"].endswith(body["job_id"])
-    assert body["duration_sec"] == pytest.approx(3.0, abs=0.01)
-    job_id = body["job_id"]
+        create = client.post(
+            "/api/asr/transcriptions",
+            files={"audio": ("meeting.wav", wav, "audio/wav")},
+            data={"language": "zh", "hotwords": "挚音科技"},
+        )
+        assert create.status_code == 202
+        body = create.json()
+        assert body["status"] == JOB_STATUS_QUEUED
+        assert body["poll_url"].endswith(body["job_id"])
+        assert body["duration_sec"] == pytest.approx(3.0, abs=0.01)
+        job_id = body["job_id"]
 
-    for _ in range(100):
-        poll = client.get(f"/api/asr/transcriptions/{job_id}")
-        assert poll.status_code == 200
-        data = poll.json()
-        assert "progress" in data
-        if data["status"] == JOB_STATUS_SUCCEEDED:
-            result = data["result"]
-            assert result["type"] == "transcription"
-            assert result["full_text"] == "会议第一句"
-            assert result["failed_segments"] == 0
-            seg = result["segments"][0]
-            assert seg["text"] == "会议第一句"
-            assert 0 <= seg["start_ms"] < seg["end_ms"] <= 3100
-            return
-        if data["status"] == JOB_STATUS_FAILED:
-            pytest.fail(str(data.get("error")))
-        time.sleep(0.03)
-    pytest.fail("poll timed out")
+        for _ in range(100):
+            poll = client.get(f"/api/asr/transcriptions/{job_id}")
+            assert poll.status_code == 200
+            data = poll.json()
+            assert "progress" in data
+            if data["status"] == JOB_STATUS_SUCCEEDED:
+                result = data["result"]
+                assert result["type"] == "transcription"
+                assert result["full_text"] == "会议第一句"
+                assert result["failed_segments"] == 0
+                seg = result["segments"][0]
+                assert seg["text"] == "会议第一句"
+                assert 0 <= seg["start_ms"] < seg["end_ms"] <= 3100
+                return
+            if data["status"] == JOB_STATUS_FAILED:
+                pytest.fail(str(data.get("error")))
+            time.sleep(0.03)
+        pytest.fail("poll timed out")
 
 
 def test_transcription_http_rejects_overlong_audio(monkeypatch):
