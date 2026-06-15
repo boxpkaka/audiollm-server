@@ -494,8 +494,8 @@ async def asr_transcription_create(
     single speaker and drops everyone else, which is the opposite of what a
     multi-speaker meeting transcript needs.
     """
-    # Transcription-specific view: rest.transcribe bindings (model choice,
-    # fusion switch) layered over the shared REST defaults.
+    # Transcription-specific view: rest.routes.transcribe bindings (model
+    # choice, fusion switch) layered over the shared REST defaults.
     cfg = load_transcribe_config()
     raw = await _read_audio_bytes(audio, max_bytes=cfg.transcribe_max_upload_bytes)
     try:

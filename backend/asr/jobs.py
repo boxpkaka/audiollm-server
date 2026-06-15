@@ -74,8 +74,8 @@ class TranscriptionJobStore(JobStore[TranscriptionJob]):
 
     def __init__(self) -> None:
         super().__init__()
-        # Transcription view of the config: rest.transcribe model bindings
-        # and fusion switch applied on top of the global REST defaults.
+        # Transcription view of the config: rest.routes.transcribe model
+        # bindings and fusion switch applied on top of the global REST defaults.
         self._cfg: Config = load_transcribe_config()
 
     def configure(self, cfg: Config | None = None) -> None:

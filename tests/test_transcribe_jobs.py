@@ -80,10 +80,19 @@ def _wav_b64_samples(wav_b64: str) -> int:
 
 
 def _cfg(**overrides):
-    """Config pinned to the GLOBAL cut pause (350 ms) regardless of the
-    deployment's transcribe_silence_duration_ms, so segmentation expectations
-    don't drift with config.yaml tuning."""
-    merged = {"transcribe_silence_duration_ms": 0, **overrides}
+    """Config with deterministic cut pauses for segmentation tests.
+
+    Both the GLOBAL ``silence_duration_ms`` and the offline override are
+    pinned to fixed test values, so the expected segment counts don't drift
+    when the deployment's config.yaml is retuned (it has, e.g. global went
+    350 -> 1000 ms between releases). 350 ms global + offline override off is
+    the baseline these tests were written against; pass either knob in
+    ``overrides`` to exercise the override path."""
+    merged = {
+        "silence_duration_ms": 350,
+        "transcribe_silence_duration_ms": 0,
+        **overrides,
+    }
     return load_config().override(**merged)
 
 
@@ -398,11 +407,11 @@ def test_transcribe_config_defaults():
 
 
 # ---------------------------------------------------------------------------
-# rest.transcribe: per-endpoint model bindings + fusion switch
+# rest.routes.transcribe: per-route model bindings + fusion switch
 # ---------------------------------------------------------------------------
 
 
-def _raw_cfg(rest_transcribe: dict | None = None, **defaults_extra) -> dict:
+def _raw_cfg(transcribe_route: dict | None = None, **defaults_extra) -> dict:
     raw = {
         "upstreams": {
             "amphion_asr": {
@@ -420,8 +429,8 @@ def _raw_cfg(rest_transcribe: dict | None = None, **defaults_extra) -> dict:
                              "enable_dual_asr_fusion": False, **defaults_extra}},
         "rest": {"upstreams": {"primary": "amphion_asr", "secondary": "qwen_asr"}},
     }
-    if rest_transcribe is not None:
-        raw["rest"]["transcribe"] = rest_transcribe
+    if transcribe_route is not None:
+        raw["rest"]["routes"] = {"transcribe": transcribe_route}
     return raw
 
 
@@ -442,7 +451,7 @@ def test_rest_transcribe_overrides_primary_model_only_for_transcription():
     assert parsed.default_config.vllm_base_url == "http://amphion:8009"
 
 
-def test_rest_transcribe_fusion_switch_is_endpoint_scoped():
+def test_rest_transcribe_fusion_switch_is_route_scoped():
     parsed = config_mod._parse(_raw_cfg({"enable_dual_asr_fusion": True}))
     assert parsed.transcribe_config.enable_dual_asr_fusion is True
     assert parsed.default_config.enable_dual_asr_fusion is False
@@ -463,3 +472,18 @@ def test_rest_transcribe_rejects_unknown_keys_roles_and_upstreams():
         config_mod._parse(_raw_cfg({"upstreams": {"emotion": "amphion_asr"}}))
     with pytest.raises(ValueError, match="unknown upstream"):
         config_mod._parse(_raw_cfg({"upstreams": {"primary": "nope"}}))
+
+
+def test_rest_rejects_unknown_route_and_legacy_flat_key():
+    # An unknown route name fails loudly...
+    raw = _raw_cfg()
+    raw["rest"]["routes"] = {"transcrbe": {"upstreams": {"primary": "qwen_asr"}}}
+    with pytest.raises(ValueError, match="unknown routes"):
+        config_mod._parse(raw)
+
+    # ...as does the pre-restructure flat `rest.transcribe` key, so a stale
+    # config can't silently fall back to the shared bindings.
+    raw = _raw_cfg()
+    raw["rest"]["transcribe"] = {"upstreams": {"primary": "qwen_asr"}}
+    with pytest.raises(ValueError, match="rest: unknown keys"):
+        config_mod._parse(raw)

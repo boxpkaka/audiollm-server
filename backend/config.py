@@ -443,8 +443,8 @@ class ParsedConfig:
     http_pool: dict[str, int]
     default_config: Config
     # POST /api/asr/transcriptions runtime view: default_config plus the
-    # optional `rest.transcribe` block (own model bindings + fusion switch);
-    # equal to default_config when the block is absent.
+    # optional `rest.routes.transcribe` block (own model bindings + fusion
+    # switch); equal to default_config when the block is absent.
     transcribe_config: Config
 
 
@@ -579,15 +579,16 @@ def _project_transcribe(
     raw_transcribe: dict[str, Any],
     upstreams: dict[str, Upstream],
 ) -> Config:
-    """Project the `rest.transcribe` block onto the transcription Config.
+    """Project the `rest.routes.transcribe` block onto the transcription Config.
 
-    The block exists so operators can see and change, in one place, which
-    model(s) the long-audio endpoint runs on — independently of the shared
-    `rest.upstreams` bindings used by /api/asr/upload etc. Recognized keys:
+    `rest.upstreams` is the shared role->upstream binding table for every
+    REST route; `rest.routes.<name>` holds per-route overrides so operators
+    can see and change, in one place, which model(s) one endpoint runs on.
+    Recognized keys for the transcribe route:
 
     - ``upstreams``: role -> upstream name, roles limited to primary /
       secondary (an emotion model makes no sense for transcription);
-    - ``enable_dual_asr_fusion``: per-endpoint override of the global switch.
+    - ``enable_dual_asr_fusion``: route-scoped override of the global switch.
 
     Unknown keys raise: a typo silently falling back to the shared bindings
     is exactly the "can't see what this endpoint uses" problem again.
@@ -596,7 +597,8 @@ def _project_transcribe(
     unknown = set(raw_transcribe) - allowed
     if unknown:
         raise ValueError(
-            f"rest.transcribe: unknown keys {sorted(unknown)}; allowed: {sorted(allowed)}"
+            f"rest.routes.transcribe: unknown keys {sorted(unknown)}; "
+            f"allowed: {sorted(allowed)}"
         )
 
     overrides: dict[str, Any] = {}
@@ -604,12 +606,12 @@ def _project_transcribe(
     for role, up_name in roles.items():
         if role not in ("primary", "secondary"):
             raise ValueError(
-                f"rest.transcribe.upstreams: unknown role {role!r}; "
+                f"rest.routes.transcribe.upstreams: unknown role {role!r}; "
                 "allowed: ['primary', 'secondary']"
             )
         if up_name not in upstreams:
             raise ValueError(
-                f"rest.transcribe.upstreams.{role}: unknown upstream {up_name!r}"
+                f"rest.routes.transcribe.upstreams.{role}: unknown upstream {up_name!r}"
             )
         overrides.update(_role_fields(role, upstreams[up_name]))
 
@@ -618,7 +620,7 @@ def _project_transcribe(
         overrides["enable_dual_asr_fusion"] = fusion
         if fusion and not base.enable_secondary_asr:
             logger.warning(
-                "rest.transcribe.enable_dual_asr_fusion=true requires "
+                "rest.routes.transcribe.enable_dual_asr_fusion=true requires "
                 "enable_secondary_asr=true (defaults.asr); downgrading to false"
             )
 
@@ -637,7 +639,14 @@ def _parse(raw: dict[str, Any]) -> ParsedConfig:
         if up_name not in upstreams:
             raise ValueError(f"services.{svc}: unknown upstream {up_name!r}")
 
-    rest_roles = dict((raw.get("rest", {}) or {}).get("upstreams", {}) or {})
+    rest_raw = dict(raw.get("rest", {}) or {})
+    unknown_rest = set(rest_raw) - {"upstreams", "routes"}
+    if unknown_rest:
+        raise ValueError(
+            f"rest: unknown keys {sorted(unknown_rest)}; allowed: ['upstreams', "
+            "'routes'] (per-route overrides moved under rest.routes.<name>)"
+        )
+    rest_roles = dict(rest_raw.get("upstreams", {}) or {})
     for role, up_name in rest_roles.items():
         if role not in _UPSTREAM_ROLES:
             raise ValueError(f"rest.upstreams: unknown role {role!r}")
@@ -648,6 +657,13 @@ def _parse(raw: dict[str, Any]) -> ParsedConfig:
     endpoints = tuple(
         _parse_endpoint(ep, upstreams) for ep in (raw.get("endpoints", []) or [])
     )
+    rest_routes = dict(rest_raw.get("routes", {}) or {})
+    unknown_routes = set(rest_routes) - {"transcribe"}
+    if unknown_routes:
+        raise ValueError(
+            f"rest.routes: unknown routes {sorted(unknown_routes)}; "
+            "known: ['transcribe']"
+        )
 
     # Loud WARN on an impossible global combo (silent downgrade still happens in
     # __post_init__; this is just the operator-facing log line).
@@ -667,7 +683,7 @@ def _parse(raw: dict[str, Any]) -> ParsedConfig:
         http_pool=http_pool,
     )
     transcribe_cfg = _project_transcribe(
-        base, dict((raw.get("rest", {}) or {}).get("transcribe", {}) or {}), upstreams
+        base, dict(rest_routes.get("transcribe", {}) or {}), upstreams
     )
     return ParsedConfig(
         upstreams=upstreams,
@@ -703,8 +719,9 @@ def load_config(path: Path | None = None) -> Config:
 def load_transcribe_config(path: Path | None = None) -> Config:
     """Runtime Config for POST /api/asr/transcriptions.
 
-    Equals :func:`load_config` unless config.yaml declares a `rest.transcribe`
-    block (own primary/secondary bindings and/or fusion switch).
+    Equals :func:`load_config` unless config.yaml declares a
+    `rest.routes.transcribe` block (own primary/secondary bindings and/or
+    fusion switch).
     """
     return load_parsed(path).transcribe_config
 
