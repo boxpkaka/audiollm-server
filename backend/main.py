@@ -101,6 +101,8 @@ async def tuling_ast_v3_ws(websocket: WebSocket):
         astv3_overrides["vllm_base_url"] = cfg.astv3_vllm_base_url
     if cfg.astv3_vllm_model_name:
         astv3_overrides["vllm_model_name"] = cfg.astv3_vllm_model_name
+    if cfg.astv3_vllm_prompt_template:
+        astv3_overrides["vllm_prompt_template"] = cfg.astv3_vllm_prompt_template
     session = StreamingSession(
         websocket,
         stream=VadSegmentedStream(),

@@ -17,6 +17,9 @@ _DEFAULT_CONFIG_PATH = _PROJECT_ROOT / "config.yaml"
 
 HOP_SIZE = 160  # 10ms at 16kHz, TEN VAD recommended
 SAMPLE_RATE = 16000
+VALID_PRIMARY_PROMPT_TEMPLATES: frozenset[str] = frozenset(
+    {"amphion_asr", "amphion_asr_1.7b"}
+)
 
 # ${VAR} 环境变量插值; 未设置 -> 空串(import 期不因缺密钥而崩, 调用时才暴露)。
 _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -76,6 +79,8 @@ class Upstream:
     appends ``/v1/chat/completions``. ``api_key`` is already env-interpolated
     plaintext (empty -> no auth header). ``timeout`` is the per-request HTTP
     timeout in seconds. ``max_tokens`` is an optional per-backend response cap.
+    ``prompt_template`` is a model-level ASR prompt format and is only projected
+    for the primary ASR role.
     """
 
     name: str
@@ -84,6 +89,7 @@ class Upstream:
     api_key: str = ""
     timeout: float = 120.0
     max_tokens: int | None = None
+    prompt_template: str = "amphion_asr"
 
 
 @dataclass(frozen=True)
@@ -91,6 +97,7 @@ class Config:
     # ---- ASR: primary / secondary vLLM endpoints --------------------------
     vllm_base_url: str = "http://localhost:8000"
     vllm_model_name: str = "Amphion/AmphionASR-4.3B"
+    vllm_prompt_template: str = "amphion_asr"
     secondary_vllm_base_url: str = "http://localhost:8001"
     secondary_vllm_model_name: str = "Qwen/Qwen3-ASR-1.7B"
     enable_secondary_asr: bool = True
@@ -118,6 +125,7 @@ class Config:
     # route, so the local Qwen is never queried there.
     astv3_vllm_base_url: str = ""
     astv3_vllm_model_name: str = ""
+    astv3_vllm_prompt_template: str = ""
 
     # ---- ASR: dual-model fusion knobs ------------------------------------
     fusion_similarity_threshold: float = 0.85
@@ -140,6 +148,7 @@ class Config:
     enable_asr_itn: bool = True
     asr_itn_enable_0_to_9: bool = False
     enable_asr_plate_normalize: bool = True
+    enable_asr_repetition_fix: bool = True
 
     # ---- Common: HTTP / pseudo-streaming ---------------------------------
     asr_request_timeout: float = 120
@@ -148,22 +157,24 @@ class Config:
 
     # ---- ASR: target speaker enrollment ----------------------------------
     # When a target-speaker enrollment is uploaded the primary ASR prompt
-    # switches to the dual-audio "Given the speaker's voice:<enroll>\n
-    # Transcribe what this speaker says in the following audio.<target>"
-    # template. The clip is cached server-side for the duration of a
-    # session so the WS stream does not have to retransmit it on every
-    # VAD segment. v4 SFT data trained 1–8 s enrollment clips; anything
-    # outside that window is silently OOD even when the API accepts it.
+    # switches to a two-audio shape (enrollment first, target second). The
+    # actual text placement is model-template specific: Amphion 4B interleaves
+    # text and audio in the user turn; Amphion 1.7B puts the instruction in
+    # the system turn and keeps the user turn audio-only. The clip is cached
+    # server-side for the duration of a session so the WS stream does not have
+    # to retransmit it on every VAD segment. Trained distributions use 1–8 s
+    # enrollment clips; anything outside that window is silently OOD even when
+    # the API accepts it.
     asr_enrollment_min_sec: float = 1.0
     asr_enrollment_max_sec: float = 8.0
     asr_enrollment_ttl_sec: float = 3600.0
     asr_enrollment_max_entries: int = 256
 
     # ---- ASR: VAD segmentation -------------------------------------------
-    # These VAD defaults mirror backend/config.json's vad block. They are pure
+    # These VAD defaults mirror config.yaml's vad block. They are pure
     # tuning thresholds (no per-deployment meaning), so keeping the in-code
     # fallback equal to the shipped values avoids a confusing third number;
-    # config.json still overrides them at load time.
+    # config.yaml still overrides them at load time.
     vad_threshold: float = 0.65
     silence_duration_ms: int = 350
     vad_smoothing_alpha: float = 0.3
@@ -178,7 +189,7 @@ class Config:
     # docs/tuling-ast-v3-protocol.md "首字延迟优化")。从 min_segment_duration_ms 解耦
     # 的原因:后者一参多职(还管 final 段过滤、flush 残余过滤),直接调它会放松短噪声
     # 段过滤。这里的 dataclass 默认 350(= min_segment_duration_ms)是"文件缺字段时的
-    # 中性兜底";随附的 backend/config.json 显式设 200,即默认部署选择全局低延迟首字
+    # 中性兜底";随附的 config.yaml 显式设 200,即默认部署选择全局低延迟首字
     # (对所有产 partial 的端点生效,不止 tuling)。注意只把它降到 200 而 vad_start_frames
     # 仍 20 时,首字 max 仍由起音确认(约 320ms)主导,需同时调小 vad_start_frames 才到
     # 最优。不变量 first_partial<=min_segment 见 __post_init__。
@@ -452,6 +463,12 @@ def _parse_upstream(name: str, raw: dict[str, Any]) -> Upstream:
     if not isinstance(raw, dict):
         raise ValueError(f"upstreams.{name} must be a mapping")
     max_tokens = raw.get("max_tokens")
+    prompt_template = str(raw.get("prompt_template", "amphion_asr"))
+    if prompt_template not in VALID_PRIMARY_PROMPT_TEMPLATES:
+        raise ValueError(
+            f"upstreams.{name}.prompt_template={prompt_template!r} is invalid; "
+            f"allowed: {sorted(VALID_PRIMARY_PROMPT_TEMPLATES)}"
+        )
     return Upstream(
         name=name,
         base_url=str(raw.get("base_url", "")).rstrip("/"),
@@ -459,6 +476,7 @@ def _parse_upstream(name: str, raw: dict[str, Any]) -> Upstream:
         api_key=str(raw.get("api_key", "")),
         timeout=float(raw.get("timeout", 120.0)),
         max_tokens=int(max_tokens) if max_tokens is not None else None,
+        prompt_template=prompt_template,
     )
 
 
@@ -468,6 +486,7 @@ def _role_fields(role: str, up: Upstream) -> dict[str, Any]:
         return {
             "vllm_base_url": up.base_url,
             "vllm_model_name": up.model_name,
+            "vllm_prompt_template": up.prompt_template,
             "asr_request_timeout": up.timeout,
         }
     if role == "secondary":

@@ -98,11 +98,11 @@ Client                                      Server
 
 `parameter.asr_config` 是本服务在 AST v3 信封上的扩展槽位，用于按连接临时调参，与讯飞 `parameter.engine`（仅记录日志、不映射行为）并列、互不影响。仅在首帧（status=0）读取，仅对当前连接生效、不落盘；新连接或服务重启都回到服务端默认。
 
-取值优先级（后者覆盖前者）：`backend/config.py` 内置默认 → `backend/config.json` 服务端默认 → `parameter.asr_config` 客户端临时覆写。
+取值优先级（后者覆盖前者）：`backend/config.py` 内置默认 → `config.yaml` 服务端默认 → `parameter.asr_config` 客户端临时覆写。
 
 只接受白名单内的扁平字段名；未知字段、受限字段（模型地址、密钥、连接池/队列等基础设施项）以及非法值会被忽略并保持服务端默认，不会中断连接。`language` 是特例：它不是配置字段，会被用作本次会话语言（等价于 `/transcribe-streaming` 的 `start.language`）。
 
-可覆写字段与 `/transcribe-streaming` 的 `start.config` 共用同一白名单（`backend/config.py` 的 `CLIENT_OVERRIDABLE_FIELDS`）。下面按类别逐字段说明语义：默认列为服务端 `config.json` 当前生效值，本端点列标注该字段在 AST v3 是否产生可观察效果（本端点恒为 primary-only，副模型与融合相关字段即使传入也不生效）。
+可覆写字段与 `/transcribe-streaming` 的 `start.config` 共用同一白名单（`backend/config.py` 的 `CLIENT_OVERRIDABLE_FIELDS`）。下面按类别逐字段说明语义：默认列为服务端 `config.yaml` 当前生效值，本端点列标注该字段在 AST v3 是否产生可观察效果（本端点恒为 primary-only，副模型与融合相关字段即使传入也不生效）。
 
 VAD / 分段（凡按帧计的字段，其帧时长由 VAD 后端 hop 决定：ten-vad 约 16 ms/帧，能量兜底约 10 ms/帧）：
 
@@ -124,7 +124,7 @@ VAD / 分段（凡按帧计的字段，其帧时长由 VAD 后端 hop 决定：t
 |---|---|---|---|---|
 | enable_pseudo_stream | bool | true | 是否输出伪流式中间结果（msgtype=Progressive）；关闭后每段只在结束时发一条 sentence | 生效 |
 | pseudo_stream_interval_ms | int | 500 | 相邻中间结果之间的最小间隔（仅节流首个之后的刷新，不影响首字） | 生效 |
-| pseudo_stream_first_partial_ms | int | 200 | 每段语音首个 partial 的触发门槛，从 min_segment_duration_ms 解耦（dataclass 兜底 350，config.json 默认设 200 走低延迟）；与 vad_start_frames 按 max 决定首字，min_segment_duration_ms 仍独立控制 final 段短噪声过滤 | 生效 |
+| pseudo_stream_first_partial_ms | int | 200 | 每段语音首个 partial 的触发门槛，从 min_segment_duration_ms 解耦（dataclass 兜底 350，config.yaml 默认设 200 走低延迟）；与 vad_start_frames 按 max 决定首字，min_segment_duration_ms 仍独立控制 final 段短噪声过滤 | 生效 |
 
 ASR 模型组合 / 超时：
 
@@ -233,7 +233,7 @@ TS-ASR 注册参数（约束注册接口的时长校验与缓存 TTL）：
 说明：
 
 - enrollment_id 仅在首帧读取，整段会话沿用同一目标说话人。
-- 若 resIdList[0] 未注册或已过期，服务端静默回退为普通 ASR（仅记 WARN，不返回 error），避免长连接因陈旧 id 中断。
+- 若 resIdList[0] 未注册或已过期，服务端静默回退为普通 ASR（仅记 WARN，不返回 error），避免长连接因陈旧 id 中断。enrollment_id 有 TTL（默认 3600 秒、每次使用续期）且服务重启即失效，完整生命周期（存储/有效期/容量/删除）见 [API 总览](api-reference.md) 注册接口的“生命周期”。
 - resIdList 含多个 id 时只用第一个，不做多说话人分离。
 - 未携带 resIdList 时为普通 ASR。
 
@@ -335,7 +335,7 @@ result 示例（最终结果）：
 - 通用 ITN（enable_asr_itn，仅中文）：口语数字转阿拉伯，如 六五四三八→65438、二零二四年→2024年。
 - 车牌规范化（enable_asr_plate_normalize）：字母大写、去车牌内分隔符、口语数字按位转阿拉伯，并按 GB 车牌形态校验后才改写，如 辽b二四五零七→辽B24507。
 - 已知边界：省份简称被声学误识别成字母（冀→J）属识别错误，后处理只修数字与字母（车牌号为JR六五四三八→车牌号为JR65438），不还原省份字。
-- 两个开关均为服务端配置（backend/config.json 的 asr.itn 分组），不在 parameter.asr_config 可覆写白名单内；任一处理异常都回退原文。
+- 两个开关均为服务端配置（config.yaml 的 defaults.itn 分组），不在 parameter.asr_config 可覆写白名单内；任一处理异常都回退原文。
 
 ## 降级说明（重要）
 

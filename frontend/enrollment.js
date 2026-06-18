@@ -34,7 +34,7 @@
   const MIN_DURATION_SEC = 1.0;
   const MAX_DURATION_SEC = 8.0;
   // 3 s record default is a comfortable utterance length and well
-  // within the v4 SFT enrollment distribution.
+  // within the target-speaker enrollment distribution.
   const DEFAULT_RECORD_SEC = 3.0;
 
   /**

@@ -18,7 +18,11 @@ http_pool:
 upstreams:
   amphion_asr:
     base_url: http://localhost:8009
-    model_name: AmphionASR-4.3B
+    model_name: AmphionASR-1.7B
+    # Prompt template follows the served checkpoint:
+    #   AmphionASR-4.3B -> amphion_asr
+    #   AmphionASR-1.7B -> amphion_asr_1.7b
+    prompt_template: amphion_asr_1.7b
     timeout: 120
   qwen_asr:
     base_url: http://localhost:8001
@@ -76,6 +80,7 @@ defaults:
     enable_asr_itn: true
     asr_itn_enable_0_to_9: false
     enable_asr_plate_normalize: true
+    enable_asr_repetition_fix: true
   enrollment:
     asr_enrollment_min_sec: 1.0
     asr_enrollment_max_sec: 8.0

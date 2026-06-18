@@ -83,6 +83,7 @@ async def run_oneshot_asr(
                     enrollment_wav_base64=enrollment_b64,
                     base_url=cfg.vllm_base_url,
                     model_name=cfg.vllm_model_name,
+                    prompt_template=cfg.vllm_prompt_template,
                     timeout=cfg.asr_request_timeout,
                 ),
                 timeout=cfg.primary_asr_timeout,
