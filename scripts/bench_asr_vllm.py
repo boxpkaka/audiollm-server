@@ -58,7 +58,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from backend.asr.client import build_primary_messages  # noqa: E402
+from backend.asr.client import build_primary_messages, parse_model_output  # noqa: E402
 from backend.asr.itn import normalize_final  # noqa: E402
 from backend.audio.utils import (  # noqa: E402
     pcm_to_wav_base64,
@@ -419,11 +419,12 @@ async def run_level(
     audio_total = sum(r.audio_s for r in ok)
     out_tokens = sum(r.completion_tokens for r in ok)
 
-    # When apply_itn is on we score the *normalized* prediction (ITN + plate),
-    # so CER reflects what the client actually sees. Refs in this dataset are
-    # already written-form, so this isolates the formatting gap ITN closes.
+    # Score the same text the backend would expose: provider wrappers are
+    # stripped first (for example Qwen3-ASR's language <Lang><asr_text> prefix),
+    # then optional ITN mirrors final-display normalization.
     def _scored(pred: str) -> str:
-        return normalize_final(pred, "zh") if apply_itn else pred
+        parsed = parse_model_output(pred)["transcription"]
+        return normalize_final(parsed, "zh") if apply_itn else parsed
 
     cer = float("nan")
     if measure_cer and ok:

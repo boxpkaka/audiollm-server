@@ -371,6 +371,7 @@ class AudioSession:
                         hotwords=list(self.hotwords),
                         src_lang=self.src_lang,
                         enrollment_wav_base64=self.enrollment_b64,
+                        prompt_template=default_config.vllm_prompt_template,
                     )
                 )
             if default_config.enable_secondary_asr:
@@ -499,6 +500,7 @@ class AudioSession:
                         hotwords=hw_snapshot,
                         src_lang=lang_snapshot,
                         enrollment_wav_base64=self.enrollment_b64,
+                        prompt_template=default_config.vllm_prompt_template,
                     ),
                     timeout=default_config.primary_asr_timeout,
                 )
@@ -683,6 +685,7 @@ class AudioSession:
                         hotwords=hw_snapshot,
                         src_lang=lang_snapshot,
                         enrollment_wav_base64=self.enrollment_b64,
+                        prompt_template=default_config.vllm_prompt_template,
                     ),
                     timeout=default_config.primary_asr_timeout,
                 )

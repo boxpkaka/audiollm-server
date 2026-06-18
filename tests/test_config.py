@@ -144,6 +144,15 @@ def test_unknown_primary_prompt_template_fails(tmp_path: Path) -> None:
         load_parsed(_write_yaml(tmp_path, data))
 
 
+def test_prompt_template_validation_applies_to_config_construction() -> None:
+    with pytest.raises(ValueError, match="vllm_prompt_template"):
+        Config(vllm_prompt_template="unknown_template")
+    with pytest.raises(ValueError, match="astv3_vllm_prompt_template"):
+        Config(astv3_vllm_prompt_template="unknown_template")
+    with pytest.raises(ValueError, match="astv3_vllm_prompt_template"):
+        load_config().override(astv3_vllm_prompt_template="unknown_template")
+
+
 # --------------------------------------------------------------------------- #
 # global (REST-bound) projection
 # --------------------------------------------------------------------------- #

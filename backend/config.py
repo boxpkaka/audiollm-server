@@ -291,6 +291,20 @@ class Config:
     text_cleanup_max_tokens: int = 1024
 
     def __post_init__(self) -> None:
+        if self.vllm_prompt_template not in VALID_PRIMARY_PROMPT_TEMPLATES:
+            raise ValueError(
+                f"vllm_prompt_template={self.vllm_prompt_template!r} is invalid; "
+                f"allowed: {sorted(VALID_PRIMARY_PROMPT_TEMPLATES)}"
+            )
+        if (
+            self.astv3_vllm_prompt_template
+            and self.astv3_vllm_prompt_template not in VALID_PRIMARY_PROMPT_TEMPLATES
+        ):
+            raise ValueError(
+                "astv3_vllm_prompt_template="
+                f"{self.astv3_vllm_prompt_template!r} is invalid; "
+                f"allowed: {sorted(VALID_PRIMARY_PROMPT_TEMPLATES)}"
+            )
         # Silently enforce the invariant that fusion requires a secondary
         # decoder. Dataclass-level so any construction path (load, override,
         # direct ctor in tests) yields a consistent Config — downstream
