@@ -17,6 +17,9 @@ _DEFAULT_CONFIG_PATH = _PROJECT_ROOT / "config.yaml"
 
 HOP_SIZE = 160  # 10ms at 16kHz, TEN VAD recommended
 SAMPLE_RATE = 16000
+VALID_PRIMARY_PROMPT_TEMPLATES: frozenset[str] = frozenset(
+    {"amphion_asr", "amphion_asr_1.7b"}
+)
 
 # ${VAR} 环境变量插值; 未设置 -> 空串(import 期不因缺密钥而崩, 调用时才暴露)。
 _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -76,6 +79,8 @@ class Upstream:
     appends ``/v1/chat/completions``. ``api_key`` is already env-interpolated
     plaintext (empty -> no auth header). ``timeout`` is the per-request HTTP
     timeout in seconds. ``max_tokens`` is an optional per-backend response cap.
+    ``prompt_template`` is a model-level ASR prompt format and is only projected
+    for the primary ASR role.
     """
 
     name: str
@@ -84,6 +89,7 @@ class Upstream:
     api_key: str = ""
     timeout: float = 120.0
     max_tokens: int | None = None
+    prompt_template: str = "amphion_asr"
 
 
 @dataclass(frozen=True)
@@ -91,6 +97,7 @@ class Config:
     # ---- ASR: primary / secondary vLLM endpoints --------------------------
     vllm_base_url: str = "http://localhost:8000"
     vllm_model_name: str = "Amphion/AmphionASR-4.3B"
+    vllm_prompt_template: str = "amphion_asr"
     secondary_vllm_base_url: str = "http://localhost:8001"
     secondary_vllm_model_name: str = "Qwen/Qwen3-ASR-1.7B"
     enable_secondary_asr: bool = True
@@ -118,6 +125,7 @@ class Config:
     # route, so the local Qwen is never queried there.
     astv3_vllm_base_url: str = ""
     astv3_vllm_model_name: str = ""
+    astv3_vllm_prompt_template: str = ""
 
     # ---- ASR: dual-model fusion knobs ------------------------------------
     fusion_similarity_threshold: float = 0.85
@@ -140,6 +148,7 @@ class Config:
     enable_asr_itn: bool = True
     asr_itn_enable_0_to_9: bool = False
     enable_asr_plate_normalize: bool = True
+    enable_asr_repetition_fix: bool = True
 
     # ---- Common: HTTP / pseudo-streaming ---------------------------------
     asr_request_timeout: float = 120
@@ -148,22 +157,24 @@ class Config:
 
     # ---- ASR: target speaker enrollment ----------------------------------
     # When a target-speaker enrollment is uploaded the primary ASR prompt
-    # switches to the dual-audio "Given the speaker's voice:<enroll>\n
-    # Transcribe what this speaker says in the following audio.<target>"
-    # template. The clip is cached server-side for the duration of a
-    # session so the WS stream does not have to retransmit it on every
-    # VAD segment. v4 SFT data trained 1–8 s enrollment clips; anything
-    # outside that window is silently OOD even when the API accepts it.
+    # switches to a two-audio shape (enrollment first, target second). The
+    # actual text placement is model-template specific: Amphion 4B interleaves
+    # text and audio in the user turn; Amphion 1.7B puts the instruction in
+    # the system turn and keeps the user turn audio-only. The clip is cached
+    # server-side for the duration of a session so the WS stream does not have
+    # to retransmit it on every VAD segment. Trained distributions use 1–8 s
+    # enrollment clips; anything outside that window is silently OOD even when
+    # the API accepts it.
     asr_enrollment_min_sec: float = 1.0
     asr_enrollment_max_sec: float = 8.0
     asr_enrollment_ttl_sec: float = 3600.0
     asr_enrollment_max_entries: int = 256
 
     # ---- ASR: VAD segmentation -------------------------------------------
-    # These VAD defaults mirror backend/config.json's vad block. They are pure
+    # These VAD defaults mirror config.yaml's vad block. They are pure
     # tuning thresholds (no per-deployment meaning), so keeping the in-code
     # fallback equal to the shipped values avoids a confusing third number;
-    # config.json still overrides them at load time.
+    # config.yaml still overrides them at load time.
     vad_threshold: float = 0.65
     silence_duration_ms: int = 350
     vad_smoothing_alpha: float = 0.3
@@ -178,11 +189,57 @@ class Config:
     # docs/tuling-ast-v3-protocol.md "首字延迟优化")。从 min_segment_duration_ms 解耦
     # 的原因:后者一参多职(还管 final 段过滤、flush 残余过滤),直接调它会放松短噪声
     # 段过滤。这里的 dataclass 默认 350(= min_segment_duration_ms)是"文件缺字段时的
-    # 中性兜底";随附的 backend/config.json 显式设 200,即默认部署选择全局低延迟首字
+    # 中性兜底";随附的 config.yaml 显式设 200,即默认部署选择全局低延迟首字
     # (对所有产 partial 的端点生效,不止 tuling)。注意只把它降到 200 而 vad_start_frames
     # 仍 20 时,首字 max 仍由起音确认(约 320ms)主导,需同时调小 vad_start_frames 才到
     # 最优。不变量 first_partial<=min_segment 见 __post_init__。
     pseudo_stream_first_partial_ms: int = 350
+
+    # ---- ASR: offline long-audio transcription jobs ------------------------
+    # POST /api/asr/transcriptions decodes the upload, replays it through the
+    # same VAD segmentation as the streaming endpoints, and transcribes the
+    # segments via the shared one-shot dual-ASR path. Knobs:
+    #   transcribe_max_concurrent_jobs   -> jobs running at once; total vLLM
+    #   transcribe_segment_concurrency      pressure is the product of the two
+    #                                       (defaults 2 x 4 = 8 in-flight
+    #                                       segment requests, matching the
+    #                                       emotion stores' ceiling).
+    #   transcribe_max_segment_sec       -> force-cut ceiling for uninterrupted
+    #                                       speech (VAD only cuts on silence);
+    #                                       sized well under the 60 s one-shot
+    #                                       REST cap to stay in the range the
+    #                                       segment models see in streaming.
+    #   transcribe_max_upload_bytes      -> multipart cap; 2 h of 16 kHz mono
+    #                                       s16 WAV is ~220 MB, so 512 MB
+    #                                       leaves headroom for higher-rate
+    #                                       client WAVs.
+    #   transcribe_max_audio_sec         -> decoded-duration cap. Unlike the
+    #                                       60 s upload tail-trim, exceeding it
+    #                                       REJECTS the request (400): silently
+    #                                       dropping the head of a meeting
+    #                                       recording is never acceptable.
+    #   transcribe_silence_duration_ms   -> offline-only override of the VAD
+    #                                       cut pause. 0 = follow the global
+    #                                       silence_duration_ms. The global one
+    #                                       is tuned for live latency (350 ms);
+    #                                       minutes-style transcripts read
+    #                                       better with longer pauses (~800 ms)
+    #                                       and offline has no latency cost,
+    #                                       but raising the GLOBAL knob would
+    #                                       also delay every live endpoint's
+    #                                       finals — hence the scoped override
+    #                                       (same fallback pattern as
+    #                                       astv3_vllm_base_url). All other VAD
+    #                                       knobs stay shared: there is no
+    #                                       offline reason for them to differ.
+    transcribe_max_concurrent_jobs: int = 2
+    transcribe_segment_concurrency: int = 4
+    transcribe_job_queue_max: int = 8
+    transcribe_job_ttl_sec: float = 3600.0
+    transcribe_max_segment_sec: float = 30.0
+    transcribe_max_upload_bytes: int = 512 * 1024 * 1024
+    transcribe_max_audio_sec: float = 10800.0
+    transcribe_silence_duration_ms: int = 0
 
     # ---- Emotion recognition: vLLM endpoint ------------------------------
     # The Amphion multi-task model is trained to handle SER/SEC alongside ASR
@@ -234,6 +291,20 @@ class Config:
     text_cleanup_max_tokens: int = 1024
 
     def __post_init__(self) -> None:
+        if self.vllm_prompt_template not in VALID_PRIMARY_PROMPT_TEMPLATES:
+            raise ValueError(
+                f"vllm_prompt_template={self.vllm_prompt_template!r} is invalid; "
+                f"allowed: {sorted(VALID_PRIMARY_PROMPT_TEMPLATES)}"
+            )
+        if (
+            self.astv3_vllm_prompt_template
+            and self.astv3_vllm_prompt_template not in VALID_PRIMARY_PROMPT_TEMPLATES
+        ):
+            raise ValueError(
+                "astv3_vllm_prompt_template="
+                f"{self.astv3_vllm_prompt_template!r} is invalid; "
+                f"allowed: {sorted(VALID_PRIMARY_PROMPT_TEMPLATES)}"
+            )
         # Silently enforce the invariant that fusion requires a secondary
         # decoder. Dataclass-level so any construction path (load, override,
         # direct ctor in tests) yields a consistent Config — downstream
@@ -396,12 +467,22 @@ class ParsedConfig:
     endpoints: tuple[EndpointSpec, ...]
     http_pool: dict[str, int]
     default_config: Config
+    # POST /api/asr/transcriptions runtime view: default_config plus the
+    # optional `rest.routes.transcribe` block (own model bindings + fusion
+    # switch); equal to default_config when the block is absent.
+    transcribe_config: Config
 
 
 def _parse_upstream(name: str, raw: dict[str, Any]) -> Upstream:
     if not isinstance(raw, dict):
         raise ValueError(f"upstreams.{name} must be a mapping")
     max_tokens = raw.get("max_tokens")
+    prompt_template = str(raw.get("prompt_template", "amphion_asr"))
+    if prompt_template not in VALID_PRIMARY_PROMPT_TEMPLATES:
+        raise ValueError(
+            f"upstreams.{name}.prompt_template={prompt_template!r} is invalid; "
+            f"allowed: {sorted(VALID_PRIMARY_PROMPT_TEMPLATES)}"
+        )
     return Upstream(
         name=name,
         base_url=str(raw.get("base_url", "")).rstrip("/"),
@@ -409,6 +490,7 @@ def _parse_upstream(name: str, raw: dict[str, Any]) -> Upstream:
         api_key=str(raw.get("api_key", "")),
         timeout=float(raw.get("timeout", 120.0)),
         max_tokens=int(max_tokens) if max_tokens is not None else None,
+        prompt_template=prompt_template,
     )
 
 
@@ -418,6 +500,7 @@ def _role_fields(role: str, up: Upstream) -> dict[str, Any]:
         return {
             "vllm_base_url": up.base_url,
             "vllm_model_name": up.model_name,
+            "vllm_prompt_template": up.prompt_template,
             "asr_request_timeout": up.timeout,
         }
     if role == "secondary":
@@ -524,6 +607,59 @@ def _parse_endpoint(raw: dict[str, Any], upstreams: dict[str, Upstream]) -> Endp
     )
 
 
+def _project_transcribe(
+    base: Config,
+    raw_transcribe: dict[str, Any],
+    upstreams: dict[str, Upstream],
+) -> Config:
+    """Project the `rest.routes.transcribe` block onto the transcription Config.
+
+    `rest.upstreams` is the shared role->upstream binding table for every
+    REST route; `rest.routes.<name>` holds per-route overrides so operators
+    can see and change, in one place, which model(s) one endpoint runs on.
+    Recognized keys for the transcribe route:
+
+    - ``upstreams``: role -> upstream name, roles limited to primary /
+      secondary (an emotion model makes no sense for transcription);
+    - ``enable_dual_asr_fusion``: route-scoped override of the global switch.
+
+    Unknown keys raise: a typo silently falling back to the shared bindings
+    is exactly the "can't see what this endpoint uses" problem again.
+    """
+    allowed = {"upstreams", "enable_dual_asr_fusion"}
+    unknown = set(raw_transcribe) - allowed
+    if unknown:
+        raise ValueError(
+            f"rest.routes.transcribe: unknown keys {sorted(unknown)}; "
+            f"allowed: {sorted(allowed)}"
+        )
+
+    overrides: dict[str, Any] = {}
+    roles = dict(raw_transcribe.get("upstreams", {}) or {})
+    for role, up_name in roles.items():
+        if role not in ("primary", "secondary"):
+            raise ValueError(
+                f"rest.routes.transcribe.upstreams: unknown role {role!r}; "
+                "allowed: ['primary', 'secondary']"
+            )
+        if up_name not in upstreams:
+            raise ValueError(
+                f"rest.routes.transcribe.upstreams.{role}: unknown upstream {up_name!r}"
+            )
+        overrides.update(_role_fields(role, upstreams[up_name]))
+
+    if "enable_dual_asr_fusion" in raw_transcribe:
+        fusion = bool(raw_transcribe["enable_dual_asr_fusion"])
+        overrides["enable_dual_asr_fusion"] = fusion
+        if fusion and not base.enable_secondary_asr:
+            logger.warning(
+                "rest.routes.transcribe.enable_dual_asr_fusion=true requires "
+                "enable_secondary_asr=true (defaults.asr); downgrading to false"
+            )
+
+    return base.override(**overrides) if overrides else base
+
+
 def _parse(raw: dict[str, Any]) -> ParsedConfig:
     upstreams = {
         name: _parse_upstream(name, spec)
@@ -536,7 +672,14 @@ def _parse(raw: dict[str, Any]) -> ParsedConfig:
         if up_name not in upstreams:
             raise ValueError(f"services.{svc}: unknown upstream {up_name!r}")
 
-    rest_roles = dict((raw.get("rest", {}) or {}).get("upstreams", {}) or {})
+    rest_raw = dict(raw.get("rest", {}) or {})
+    unknown_rest = set(rest_raw) - {"upstreams", "routes"}
+    if unknown_rest:
+        raise ValueError(
+            f"rest: unknown keys {sorted(unknown_rest)}; allowed: ['upstreams', "
+            "'routes'] (per-route overrides moved under rest.routes.<name>)"
+        )
+    rest_roles = dict(rest_raw.get("upstreams", {}) or {})
     for role, up_name in rest_roles.items():
         if role not in _UPSTREAM_ROLES:
             raise ValueError(f"rest.upstreams: unknown role {role!r}")
@@ -547,6 +690,13 @@ def _parse(raw: dict[str, Any]) -> ParsedConfig:
     endpoints = tuple(
         _parse_endpoint(ep, upstreams) for ep in (raw.get("endpoints", []) or [])
     )
+    rest_routes = dict(rest_raw.get("routes", {}) or {})
+    unknown_routes = set(rest_routes) - {"transcribe"}
+    if unknown_routes:
+        raise ValueError(
+            f"rest.routes: unknown routes {sorted(unknown_routes)}; "
+            "known: ['transcribe']"
+        )
 
     # Loud WARN on an impossible global combo (silent downgrade still happens in
     # __post_init__; this is just the operator-facing log line).
@@ -565,6 +715,9 @@ def _parse(raw: dict[str, Any]) -> ParsedConfig:
         services=services,
         http_pool=http_pool,
     )
+    transcribe_cfg = _project_transcribe(
+        base, dict(rest_routes.get("transcribe", {}) or {}), upstreams
+    )
     return ParsedConfig(
         upstreams=upstreams,
         defaults=defaults,
@@ -573,6 +726,7 @@ def _parse(raw: dict[str, Any]) -> ParsedConfig:
         endpoints=endpoints,
         http_pool=http_pool,
         default_config=base,
+        transcribe_config=transcribe_cfg,
     )
 
 
@@ -593,6 +747,16 @@ def load_config(path: Path | None = None) -> Config:
     Per-endpoint runtime configs come from :func:`resolve_endpoint`.
     """
     return load_parsed(path).default_config
+
+
+def load_transcribe_config(path: Path | None = None) -> Config:
+    """Runtime Config for POST /api/asr/transcriptions.
+
+    Equals :func:`load_config` unless config.yaml declares a
+    `rest.routes.transcribe` block (own primary/secondary bindings and/or
+    fusion switch).
+    """
+    return load_parsed(path).transcribe_config
 
 
 def resolve_endpoint(

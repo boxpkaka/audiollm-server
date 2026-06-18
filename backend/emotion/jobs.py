@@ -1,82 +1,74 @@
-"""In-process async job queue for whole-utterance emotion HTTP API."""
+"""In-process async job queue for whole-utterance emotion HTTP API.
+
+Thin shell over the generic :class:`backend.jobstore.JobStore`: this module
+only owns the emotion-specific bits (job fields, config knobs, inference
+call + error translation). Queue/TTL/concurrency mechanics live in the
+shared skeleton.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import secrets
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from ..config import Config, load_config
+from ..jobstore import (
+    JOB_STATUS_FAILED,
+    JOB_STATUS_QUEUED,
+    JOB_STATUS_RUNNING,
+    JOB_STATUS_SUCCEEDED,
+    BaseJob,
+    JobExecutionError,
+    JobQueueFullError,
+    JobStore,
+)
 from .service import EmotionDecodeError, infer_emotion_from_wav
 
 logger = logging.getLogger(__name__)
 
-JOB_STATUS_QUEUED = "queued"
-JOB_STATUS_RUNNING = "running"
-JOB_STATUS_SUCCEEDED = "succeeded"
-JOB_STATUS_FAILED = "failed"
-
-_ACTIVE_STATUSES = frozenset({JOB_STATUS_QUEUED, JOB_STATUS_RUNNING})
-
-
-@dataclass
-class EmotionJob:
-    job_id: str
-    status: str
-    created_at: float
-    updated_at: float
-    mode: str
-    language: str
-    wav_bytes: bytes = field(repr=False)
-    result: dict[str, Any] | None = None
-    error: dict[str, Any] | None = None
-
-    def to_poll_dict(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "job_id": self.job_id,
-            "status": self.status,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-        }
-        if self.status == JOB_STATUS_SUCCEEDED and self.result is not None:
-            payload["result"] = self.result
-        if self.status == JOB_STATUS_FAILED and self.error is not None:
-            payload["error"] = self.error
-        return payload
+__all__ = [
+    "EmotionJob",
+    "EmotionJobStore",
+    "JobQueueFullError",
+    "JOB_STATUS_FAILED",
+    "JOB_STATUS_QUEUED",
+    "JOB_STATUS_RUNNING",
+    "JOB_STATUS_SUCCEEDED",
+    "get_emotion_job_store",
+]
 
 
-class JobQueueFullError(Exception):
-    """Raised when the waiting queue exceeds configured capacity."""
+@dataclass(kw_only=True)
+class EmotionJob(BaseJob):
+    mode: str = ""
+    language: str = ""
+    wav_bytes: bytes = field(default=b"", repr=False)
+
+    def release_payload(self) -> None:
+        self.wav_bytes = b""
 
 
-class EmotionJobStore:
+class EmotionJobStore(JobStore[EmotionJob]):
     """Process-local emotion job store with semaphore-limited vLLM concurrency."""
 
+    id_prefix = "em"
+    label = "Emotion"
+
     def __init__(self) -> None:
-        self._jobs: dict[str, EmotionJob] = {}
-        self._lock = asyncio.Lock()
-        self._semaphore: asyncio.Semaphore | None = None
-        self._max_concurrent = 8
-        self._queue_max = 64
-        self._ttl_sec = 3600.0
+        super().__init__()
         self._cfg: Config = load_config()
 
     def configure(self, cfg: Config | None = None) -> None:
         if cfg is not None:
             self._cfg = cfg
-        self._max_concurrent = max(
-            1, int(getattr(self._cfg, "emotion_max_concurrent_jobs", 8))
+        self.configure_limits(
+            max_concurrent=getattr(self._cfg, "emotion_max_concurrent_jobs", 8),
+            queue_max=getattr(self._cfg, "emotion_job_queue_max", 64),
+            ttl_sec=getattr(self._cfg, "emotion_job_ttl_sec", 3600),
         )
-        self._queue_max = max(
-            1, int(getattr(self._cfg, "emotion_job_queue_max", 64))
-        )
-        self._ttl_sec = max(
-            60.0, float(getattr(self._cfg, "emotion_job_ttl_sec", 3600))
-        )
-        self._semaphore = asyncio.Semaphore(self._max_concurrent)
 
     async def submit(
         self,
@@ -88,13 +80,12 @@ class EmotionJobStore:
     ) -> EmotionJob:
         if cfg is not None:
             self.configure(cfg)
-        elif self._semaphore is None:
+        elif not self.is_configured:
             self.configure()
 
-        job_id = f"em_{secrets.token_hex(12)}"
         now = time.time()
         job = EmotionJob(
-            job_id=job_id,
+            job_id=self.new_job_id(),
             status=JOB_STATUS_QUEUED,
             created_at=now,
             updated_at=now,
@@ -102,124 +93,23 @@ class EmotionJobStore:
             language=language,
             wav_bytes=wav_bytes,
         )
+        return await self.enqueue(job)
 
-        async with self._lock:
-            await self._purge_expired_locked()
-            active = sum(
-                1 for j in self._jobs.values() if j.status in _ACTIVE_STATUSES
-            )
-            if active >= self._queue_max:
-                raise JobQueueFullError(
-                    f"emotion job queue full ({self._queue_max} active jobs)"
-                )
-            self._jobs[job_id] = job
-
-        asyncio.create_task(self._run_job(job_id))
-        logger.info("Emotion job %s queued (active=%s)", job_id, active + 1)
-        return job
-
-    async def get(self, job_id: str) -> EmotionJob | None:
-        async with self._lock:
-            await self._purge_expired_locked()
-            return self._jobs.get(job_id)
-
-    async def _purge_expired_locked(self) -> None:
-        if self._ttl_sec <= 0:
-            return
-        cutoff = time.time() - self._ttl_sec
-        expired = [
-            jid
-            for jid, job in self._jobs.items()
-            if job.updated_at < cutoff
-            and job.status not in _ACTIVE_STATUSES
-        ]
-        for jid in expired:
-            del self._jobs[jid]
-
-    async def _run_job(self, job_id: str) -> None:
-        async with self._lock:
-            job = self._jobs.get(job_id)
-        if job is None:
-            return
-
-        assert self._semaphore is not None
-        try:
-            async with self._semaphore:
-                await self._set_status(job_id, JOB_STATUS_RUNNING)
-                await self._execute(job_id)
-        except Exception:
-            logger.exception("Unexpected error running emotion job %s", job_id)
-            await self._set_failed(
-                job_id,
-                message="internal job runner error",
-                code="internal_error",
-            )
-
-    async def _execute(self, job_id: str) -> None:
-        async with self._lock:
-            job = self._jobs.get(job_id)
-        if job is None:
-            return
-
+    async def run_job_payload(self, job: EmotionJob) -> dict[str, Any]:
         chosen_mode = job.mode or getattr(self._cfg, "emotion_task_mode", "ser")
         try:
-            result = await infer_emotion_from_wav(
+            return await infer_emotion_from_wav(
                 job.wav_bytes,
                 mode=chosen_mode,
                 language=job.language,
                 cfg=self._cfg,
             )
         except EmotionDecodeError as exc:
-            await self._set_failed(
-                job_id,
-                message=str(exc),
-                code="decode_error",
-            )
-            return
-        except asyncio.TimeoutError:
-            await self._set_failed(
-                job_id,
-                message="emotion model request timed out",
-                code="inference_timeout",
-            )
-            return
-        except Exception as exc:
-            logger.exception("Emotion job %s inference failed", job_id)
-            await self._set_failed(
-                job_id,
-                message=str(exc),
-                code="inference_failed",
-            )
-            return
-
-        async with self._lock:
-            job = self._jobs.get(job_id)
-            if job is None:
-                return
-            job.status = JOB_STATUS_SUCCEEDED
-            job.result = result
-            job.updated_at = time.time()
-            job.wav_bytes = b""
-
-    async def _set_status(self, job_id: str, status: str) -> None:
-        async with self._lock:
-            job = self._jobs.get(job_id)
-            if job is None:
-                return
-            job.status = status
-            job.updated_at = time.time()
-
-    async def _set_failed(
-        self, job_id: str, *, message: str, code: str
-    ) -> None:
-        async with self._lock:
-            job = self._jobs.get(job_id)
-            if job is None:
-                return
-            job.status = JOB_STATUS_FAILED
-            job.error = {"message": message, "code": code}
-            job.updated_at = time.time()
-            job.wav_bytes = b""
+            raise JobExecutionError(str(exc), code="decode_error") from exc
+        except asyncio.TimeoutError as exc:
+            raise JobExecutionError(
+                "emotion model request timed out", code="inference_timeout"
+            ) from exc
 
 
 _store: EmotionJobStore | None = None

@@ -21,6 +21,11 @@ def make_ssl_context(url: str, insecure: bool) -> ssl.SSLContext | None:
     return ctx
 
 
+def join_url(base_url: str, path: str) -> str:
+    """Join a base URL and a path without doubling or dropping slashes."""
+    return base_url.rstrip("/") + "/" + path.lstrip("/")
+
+
 def read_audio_as_pcm(path: str) -> bytes:
     suffix = Path(path).suffix.lower()
     if suffix in {".pcm", ".raw"}:

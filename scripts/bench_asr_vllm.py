@@ -6,7 +6,8 @@
 并按并发阶梯逐级加压。
 
 为保证与线上完全一致：
-  - 请求体复用 ``backend.asr.client.build_primary_messages``（plain ASR 模板）。
+  - 请求体复用 ``backend.asr.client.build_primary_messages``，并通过
+    ``--prompt-template`` 显式选择模型对应模板。
   - 音频统一走 ``backend.audio.utils`` 的 ``decode -> 16 kHz mono -> WAV base64``
     管线（测试集是 24 kHz，线上同样会重采样到 16 kHz 再发）。
 RTF 按每条请求单独计算（latency / 该条音频真实时长），再取分位数；
@@ -15,10 +16,11 @@ RTF 按每条请求单独计算（latency / 该条音频真实时长），再取
 用法示例
 --------
 
-本机 primary（config.json 默认 localhost:8009 / AmphionASR-4.3B）::
+本机 primary（config.yaml 默认 localhost:8009 / AmphionASR-1.7B）::
 
     python scripts/bench_asr_vllm.py \
-        --base-url http://localhost:8009 --model AmphionASR-4.3B \
+        --base-url http://localhost:8009 --model AmphionASR-1.7B \
+        --prompt-template amphion_asr_1.7b \
         --data-dir /home/ubuntu/data/testdata/base_v2_kespeech_gpu1 \
         --output bench_results/asr_local.json
 
@@ -56,7 +58,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from backend.asr.client import build_primary_messages  # noqa: E402
+from backend.asr.client import build_primary_messages, parse_model_output  # noqa: E402
 from backend.asr.itn import normalize_final  # noqa: E402
 from backend.audio.utils import (  # noqa: E402
     pcm_to_wav_base64,
@@ -182,12 +184,17 @@ def build_payload(
     sample: Sample,
     *,
     model: str,
+    prompt_template: str,
     max_tokens: int,
     hotwords: list[str] | None = None,
 ) -> dict[str, Any]:
     return {
         "model": model,
-        "messages": build_primary_messages(sample.wav_b64, hotwords=hotwords),
+        "messages": build_primary_messages(
+            sample.wav_b64,
+            hotwords=hotwords,
+            template=prompt_template,
+        ),
         "max_tokens": int(max_tokens),
     }
 
@@ -373,6 +380,7 @@ async def run_level(
     client: httpx.AsyncClient,
     url: str,
     model: str,
+    prompt_template: str,
     max_tokens: int,
     samples: list[Sample],
     concurrency: int,
@@ -391,7 +399,11 @@ async def run_level(
     async def _one(sample: Sample) -> None:
         async with sem:
             payload = build_payload(
-                sample, model=model, max_tokens=max_tokens, hotwords=hotwords
+                sample,
+                model=model,
+                prompt_template=prompt_template,
+                max_tokens=max_tokens,
+                hotwords=hotwords,
             )
             res = await do_request(client, url, sample, payload, request_timeout)
             results.append(res)
@@ -407,11 +419,12 @@ async def run_level(
     audio_total = sum(r.audio_s for r in ok)
     out_tokens = sum(r.completion_tokens for r in ok)
 
-    # When apply_itn is on we score the *normalized* prediction (ITN + plate),
-    # so CER reflects what the client actually sees. Refs in this dataset are
-    # already written-form, so this isolates the formatting gap ITN closes.
+    # Score the same text the backend would expose: provider wrappers are
+    # stripped first (for example Qwen3-ASR's language <Lang><asr_text> prefix),
+    # then optional ITN mirrors final-display normalization.
     def _scored(pred: str) -> str:
-        return normalize_final(pred, "zh") if apply_itn else pred
+        parsed = parse_model_output(pred)["transcription"]
+        return normalize_final(parsed, "zh") if apply_itn else parsed
 
     cer = float("nan")
     if measure_cer and ok:
@@ -454,6 +467,7 @@ async def warmup(
     client: httpx.AsyncClient,
     url: str,
     model: str,
+    prompt_template: str,
     max_tokens: int,
     samples: list[Sample],
     n: int,
@@ -469,7 +483,13 @@ async def warmup(
                 client,
                 url,
                 s,
-                build_payload(s, model=model, max_tokens=max_tokens, hotwords=hotwords),
+                build_payload(
+                    s,
+                    model=model,
+                    prompt_template=prompt_template,
+                    max_tokens=max_tokens,
+                    hotwords=hotwords,
+                ),
                 request_timeout,
             )
             for s in picks
@@ -527,6 +547,7 @@ async def main_async(args: argparse.Namespace) -> int:
 
     print(f"Target:    {url}")
     print(f"Model:     {args.model}")
+    print(f"Prompt:    {args.prompt_template}")
     print(f"Data dir:  {data_dir}")
     print(f"Metadata:  {metadata if metadata.is_file() else '(glob *.wav)'}")
     print("Loading + decoding audio to 16 kHz mono ...")
@@ -583,8 +604,15 @@ async def main_async(args: argparse.Namespace) -> int:
 
     async with httpx.AsyncClient(limits=limits, timeout=timeout, http2=False) as client:
         ok, err = await warmup(
-            client, url, args.model, args.max_tokens, samples, args.warmup,
-            args.request_timeout, hotwords=hotwords,
+            client,
+            url,
+            args.model,
+            args.prompt_template,
+            args.max_tokens,
+            samples,
+            args.warmup,
+            args.request_timeout,
+            hotwords=hotwords,
         )
         print(f"warmup: ok={ok} err={err}")
         if args.warmup > 0 and ok == 0:
@@ -596,6 +624,7 @@ async def main_async(args: argparse.Namespace) -> int:
             # 仍打印一条便于看错误信息。
             probe = await run_level(
                 client=client, url=url, model=args.model, max_tokens=args.max_tokens,
+                prompt_template=args.prompt_template,
                 samples=samples, concurrency=1, n_requests=1,
                 request_timeout=args.request_timeout, measure_cer=False,
                 shuffle=False, rng=rng,
@@ -612,6 +641,7 @@ async def main_async(args: argparse.Namespace) -> int:
                 client=client,
                 url=url,
                 model=args.model,
+                prompt_template=args.prompt_template,
                 max_tokens=args.max_tokens,
                 samples=samples,
                 concurrency=c,
@@ -661,6 +691,7 @@ async def main_async(args: argparse.Namespace) -> int:
             "config": {
                 "base_url": args.base_url,
                 "model": args.model,
+                "prompt_template": args.prompt_template,
                 "data_dir": str(data_dir),
                 "n_samples": len(samples),
                 "ladder": ladder,
@@ -717,7 +748,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="ASR vLLM 推理性能压测（OpenAI 兼容 /v1/chat/completions，真实测试集音频）。"
     )
     p.add_argument("--base-url", default="http://localhost:8009")
-    p.add_argument("--model", default="AmphionASR-4.3B")
+    p.add_argument("--model", default="AmphionASR-1.7B")
+    p.add_argument(
+        "--prompt-template",
+        default="amphion_asr_1.7b",
+        choices=["amphion_asr", "amphion_asr_1.7b"],
+        help="主 ASR prompt 模板；4.3B 用 amphion_asr，1.7B 用 amphion_asr_1.7b。",
+    )
     p.add_argument(
         "--data-dir",
         default="/home/ubuntu/data/testdata/base_v2_kespeech_gpu1",

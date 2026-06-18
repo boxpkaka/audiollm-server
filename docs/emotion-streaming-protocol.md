@@ -127,7 +127,7 @@ Client                                      Server
 
 无有效音频时仍返回 `succeeded`，`result` 中 `label`/`text` 为空、`duration_sec` 为 `0`。
 
-## 可配置参数（服务端 config.json）
+## 可配置参数（服务端 config.yaml）
 
 | 字段 | 默认 | 说明 |
 |---|---|---|

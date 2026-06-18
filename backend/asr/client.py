@@ -3,6 +3,8 @@ from typing import Any, TypedDict
 
 from ..config import default_config
 from ..http_client import get_client
+from .prompt_templates import audio_item
+from .prompt_templates import build_primary_messages as _build_primary_messages
 
 
 class ASRResult(TypedDict):
@@ -10,6 +12,22 @@ class ASRResult(TypedDict):
     reported_hotwords: list[str]
     raw_text: str
     detected_language: str | None
+
+
+def build_primary_messages(
+    target_wav_base64: str,
+    *,
+    hotwords: list[str] | None = None,
+    enrollment_wav_base64: str | None = None,
+    template: str | None = None,
+) -> list[dict]:
+    """Build primary ASR messages for the selected model prompt template."""
+    return _build_primary_messages(
+        target_wav_base64,
+        hotwords=hotwords,
+        enrollment_wav_base64=enrollment_wav_base64,
+        template=template or default_config.vllm_prompt_template,
+    )
 
 
 def _content_to_text(content: Any) -> str:
@@ -26,86 +44,13 @@ def _content_to_text(content: Any) -> str:
     return str(content or "")
 
 
-def _sanitize_hotwords(hotwords: list[str] | None) -> list[str]:
-    """Drop empties, dedup, preserve order. Caller is expected to enforce
-    the count / length limits at the UI layer, but we still defensively
-    strip whitespace here so prompt bytes match training data exactly."""
-    if not hotwords:
-        return []
-    seen: set[str] = set()
-    out: list[str] = []
-    for w in hotwords:
-        s = str(w or "").strip()
-        if not s or s in seen:
-            continue
-        seen.add(s)
-        out.append(s)
-    return out
-
-
-def _audio_item(wav_b64: str) -> dict[str, Any]:
-    return {
-        "type": "input_audio",
-        "input_audio": {"data": wav_b64, "format": "wav"},
-    }
-
-
-def build_primary_messages(
-    target_wav_base64: str,
-    *,
-    hotwords: list[str] | None = None,
-    enrollment_wav_base64: str | None = None,
-) -> list[dict]:
-    """Build OpenAI-style ``messages`` aligned byte-for-byte with v4 SFT.
-
-    Four shapes are emitted based on (has_enrollment, has_hotwords):
-
-    1. plain ASR ......... "Transcribe the following audio." + <audio>
-    2. ASR + hotwords .... "Transcribe the following audio.\\nHotwords: ..." + <audio>
-    3. TS-ASR ............ "Given the speaker's voice:" + <enroll>
-                           + "\\nTranscribe what this speaker says in the following audio."
-                           + <target>
-    4. TS-ASR + hotwords . same as (3) but second text appends "\\nHotwords: ..."
-
-    The ``Language:`` line is intentionally omitted because v4 training data
-    has 0% coverage of that line; including it would push every request OOD.
-
-    The leading ``\\n`` on the second text in TS-ASR shapes is required —
-    the training pipeline assembles text by simple concatenation, so the
-    newline lives at the start of the *second* text block rather than at
-    the end of the first. Reversing this triggers a different token
-    sequence at the model.
-    """
-    hws = _sanitize_hotwords(hotwords)
-    hw_str = ",".join(hws) if hws else ""
-    has_enroll = bool(enrollment_wav_base64)
-
-    content: list[dict[str, Any]] = []
-    if has_enroll:
-        content.append({"type": "text", "text": "Given the speaker's voice:"})
-        content.append(_audio_item(enrollment_wav_base64))  # type: ignore[arg-type]
-        second = "\nTranscribe what this speaker says in the following audio."
-        if hw_str:
-            second += f"\nHotwords: {hw_str}"
-        content.append({"type": "text", "text": second})
-        content.append(_audio_item(target_wav_base64))
-    else:
-        first = "Transcribe the following audio."
-        if hw_str:
-            first += f"\nHotwords: {hw_str}"
-        content.append({"type": "text", "text": first})
-        content.append(_audio_item(target_wav_base64))
-
-    return [{"role": "user", "content": content}]
-
-
 def build_audio_only_messages(audio_wav_base64: str) -> list[dict]:
     """Single-audio prompt without any text — used by the Qwen3 secondary
     path, which is trained as a pure ASR model and ignores text guidance."""
     return [
         {
             "role": "user",
-            "content": [_audio_item(audio_wav_base64)],
+            "content": [audio_item(audio_wav_base64)],
         }
     ]
 
@@ -149,8 +94,46 @@ def _postprocess_asr_text(text: str) -> str:
     return cleaned.strip()
 
 
-def parse_model_output(raw_text: str) -> ASRResult:
-    """Parse model output with ``Language:`` / ``Hotwords:`` / ``Transcription:`` lines."""
+def detect_and_fix_repetitions(text: str, threshold: int = 20) -> str:
+    """Collapse pathological decode loops while leaving normal text untouched."""
+    source = str(text or "")
+    if len(source) <= threshold:
+        return source
+
+    fixed = source
+    max_unit = min(16, max(1, len(fixed) // (threshold + 1)))
+    for unit_len in range(1, max_unit + 1):
+        out: list[str] = []
+        i = 0
+        changed = False
+        while i < len(fixed):
+            unit = fixed[i : i + unit_len]
+            if len(unit) < unit_len:
+                out.append(fixed[i:])
+                break
+            count = 1
+            j = i + unit_len
+            while fixed[j : j + unit_len] == unit:
+                count += 1
+                j += unit_len
+            if count > threshold:
+                out.append(unit)
+                i = j
+                changed = True
+            else:
+                out.append(fixed[i])
+                i += 1
+        if changed:
+            fixed = "".join(out)
+    return fixed
+
+
+def parse_model_output(
+    raw_text: str,
+    *,
+    enable_repetition_fix: bool | None = None,
+) -> ASRResult:
+    """Parse model output wrappers and normalize to plain transcription text."""
     raw = str(raw_text or "").strip()
     if not raw:
         return ASRResult(
@@ -170,6 +153,15 @@ def parse_model_output(raw_text: str) -> ASRResult:
     detected_language = (
         _parse_language_field(lang_m.group(1)) if lang_m else None
     )
+    if detected_language is None:
+        qwen_lang_m = re.search(
+            r"(?:^|\n)\s*language\s+([A-Za-z\u4e00-\u9fff_-]+)\s*<asr_text>",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        detected_language = (
+            _parse_language_field(qwen_lang_m.group(1)) if qwen_lang_m else None
+        )
 
     hw_m = re.search(
         r"(?:^|\n)\s*hotwords\s*:\s*(.+?)(?=\n\s*(?:language|transcription)\s*:|\Z)",
@@ -213,6 +205,10 @@ def parse_model_output(raw_text: str) -> ASRResult:
         transcription = normalized.strip()
 
     transcription = _postprocess_asr_text(transcription)
+    if enable_repetition_fix is None:
+        enable_repetition_fix = default_config.enable_asr_repetition_fix
+    if enable_repetition_fix:
+        transcription = detect_and_fix_repetitions(transcription)
 
     return ASRResult(
         transcription=transcription,
@@ -253,22 +249,22 @@ async def query_audio_model(
     enrollment_wav_base64: str | None = None,
     base_url: str | None = None,
     model_name: str | None = None,
+    prompt_template: str | None = None,
     timeout: float | None = None,
 ) -> ASRResult:
     """Primary ASR call.
 
-    ``src_lang`` is intentionally not forwarded into the prompt — v4 SFT
-    has 0% coverage of ``Language:`` lines, so injecting one would make
-    every request OOD. Callers still pass it for future-proofing and so
-    the upload path can populate ``detected_language`` defaults; the
-    actual language tag is read back from the model's structured
-    output (``Language: ...`` if the model emits it).
+    ``src_lang`` is intentionally not forwarded into the prompt. The
+    primary model's prompt format is selected by ``prompt_template`` (or
+    the configured default) so Amphion 4B and 1.7B can coexist without
+    duplicating call sites.
     """
     _ = src_lang  # noqa: F841 — preserved for compatibility, see docstring
     messages = build_primary_messages(
         audio_wav_base64,
         hotwords=hotwords,
         enrollment_wav_base64=enrollment_wav_base64,
+        template=prompt_template,
     )
     return await _post_chat(
         messages,

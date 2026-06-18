@@ -57,6 +57,7 @@ dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.3", source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "python-multipart" },
+    { name = "pyyaml" },
     { name = "ten-vad" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "websockets" },
@@ -74,6 +75,7 @@ requires-dist = [
     { name = "httpx" },
     { name = "numpy" },
     { name = "python-multipart" },
+    { name = "pyyaml" },
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "ten-vad" },
     { name = "uvicorn", extras = ["standard"] },
@@ -1010,13 +1012,13 @@ wheels = [
 
 [[package]]
 name = "wetext"
-version = "0.1.2"
+version = "0.1.4"
 source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
 dependencies = [
     { name = "contractions" },
     { name = "kaldifst" },
 ]
-sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/e1/5b/06df7203e09cedb5a7c48024e22d3a13d4595d9516735c74fe429f3c5407/wetext-0.1.2.tar.gz", hash = "sha256:a9f751878f4ac85058b194fe4b31f65e49d765f90f557d5c150b933511746b22", size = 1709448, upload-time = "2025-11-28T07:33:48.902Z" }
+sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/66/0d/c34089120586d0727a845d83d9eb45bd8b39fe5f01ee1a3376d54c4413ef/wetext-0.1.4.tar.gz", hash = "sha256:2e5ff3b323b3cb67b207ae196a94c998a21afbfc793b8f145befc56bbd8f2d8f", size = 1823098, upload-time = "2026-06-10T06:07:13.312Z" }
 wheels = [
-    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/a1/58/b778473e32f4afa877f1313b137edac2c9cef40da571078a351507aa362a/wetext-0.1.2-py3-none-any.whl", hash = "sha256:7467ac08a4bb44523780626437b9b0718cd611b1ccb4304bc49b649fe29370ee", size = 1771722, upload-time = "2025-11-28T07:33:47.177Z" },
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/05/3d/c0c8cec32b2d44a7b94e5da3ee5e830ebda6e692db5b98d6048d81b40191/wetext-0.1.4-py3-none-any.whl", hash = "sha256:eb33daea87d69aa366fb541dd5427b90b03346614ba29ea8ed5af54a7a377045", size = 1887743, upload-time = "2026-06-10T06:07:11.619Z" },
 ]

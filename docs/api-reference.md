@@ -26,7 +26,7 @@
 | `/tuling/ast/v3` | 通用流式 ASR（讯飞图灵 AST v3 协议） | 对接讯飞 tuling-ast-sdk 或按 AST v3 信封集成 | `payload.result` 词图（msgtype sentence / Progressive） |
 | `/astv3-test-proxy` | AST v3 同源代理（测试用） | 仅供 HTTPS 前端规避 mixed content，透明转发到写死的远程 AST v3 后端 | 同 `/tuling/ast/v3`（透明转发） |
 
-`/tuling/ast/v3` 与上面两个任务接口的线上协议不同：音频以 base64 放在 JSON 帧，`header.status`（0/1/2）驱动状态机，无 `ready`/`start`/`stop`，结果为词图结构。模型组合上也不同：本端点恒为 primary-only（强制关闭副模型/本地 Qwen/融合，客户端无法经 `parameter.asr_config` 重开），主模型由 `astv3_vllm_*` 指定（当前留空，回退全局 primary `vllm_base_url`），而 `/transcribe-streaming` 仍按 `config.json` 走双模型。它支持热词（`payload.text.text`）、目标说话人（先经 `POST /api/asr/enrollment` 注册，再把 id 放进首帧 `header.resIdList[0]`）与配置覆写（首帧 `parameter.asr_config`，等价于其他端点的 `start.config`）。它不遵循下文“WebSocket 调用流程”，详见 [实时转写 AST v3 WebSocket](tuling-ast-v3-protocol.md)。
+`/tuling/ast/v3` 与上面两个任务接口的线上协议不同：音频以 base64 放在 JSON 帧，`header.status`（0/1/2）驱动状态机，无 `ready`/`start`/`stop`，结果为词图结构。模型组合上也不同：本端点恒为 primary-only（强制关闭副模型/本地 Qwen/融合，客户端无法经 `parameter.asr_config` 重开），主模型由 `astv3_vllm_*` 指定（当前留空，回退全局 primary `vllm_base_url`），而 `/transcribe-streaming` 仍按 `config.yaml` 走双模型。它支持热词（`payload.text.text`）、目标说话人（先经 `POST /api/asr/enrollment` 注册，再把 id 放进首帧 `header.resIdList[0]`）与配置覆写（首帧 `parameter.asr_config`，等价于其他端点的 `start.config`）。它不遵循下文“WebSocket 调用流程”，详见 [实时转写 AST v3 WebSocket](tuling-ast-v3-protocol.md)。
 
 `/astv3-test-proxy` 是为「实时语音识别（测试用）」前端页面临时搭的同源 WebSocket 代理。该页经 HTTPS 提供，浏览器 mixed-content 策略禁止它直接打开明文 `ws://` 的远程 AST v3 后端；由后端在同源 `wss://`（经反向代理）接入后，把每一帧原样双向转发到写死的上游 `ws://159.138.9.106:18082/tuling/ast/v3`。它不解析 AST v3 信封，线上协议与 `/tuling/ast/v3` 完全一致（见 [实时转写 AST v3 WebSocket](tuling-ast-v3-protocol.md)）；上游连接失败时服务端以 close code 1011 关闭连接。临时测试设施：上游地址写死、前端不暴露任何可选项，外部集成请直接使用 `/tuling/ast/v3`。
 
@@ -36,7 +36,9 @@
 
 | 方法 | 路径 | 任务 | 表单字段 |
 |---|---|---|---|
-| POST | `/api/asr/upload` | 上传整段音频做 ASR | `audio`、`language`、`hotwords`、`enrollment_id` |
+| POST | `/api/asr/upload` | 上传整段音频做 ASR（短音频，尾截 60 秒） | `audio`、`language`、`hotwords`、`enrollment_id` |
+| POST | `/api/asr/transcriptions` | 异步长音频离线转写（202 + 轮询，会议纪要场景） | `audio`、`language`、`hotwords` |
+| GET | `/api/asr/transcriptions/{job_id}` | 查询转写任务状态、进度与分段结果 | — |
 | POST | `/api/asr/enrollment` | 上传目标说话人音频（1-8 秒）注册 | `audio` |
 | DELETE | `/api/asr/enrollment/{enrollment_id}` | 删除注册音频 | — |
 | POST | `/api/emotion/jobs` | 异步整段情感识别（202 + 轮询） | `audio`、`mode`、`language` |
@@ -77,11 +79,11 @@ bytes_per_ms = 16000 * 1 * 2 / 1000 = 32
 
 ### 临时配置覆写
 
-参数取值优先级（后者覆盖前者）：`backend/config.py` 内置默认 → `backend/config.json` 服务端默认（实际生效默认值，重启生效）→ 客户端临时覆写（仅当前连接生效、不落盘）。`config.py` 内置默认与 `config.json` 不一致时以 `config.json` 为准，内置默认仅为文件缺字段时的兜底。
+参数取值优先级（后者覆盖前者）：`backend/config.py` 内置默认 → `config.yaml` 服务端默认（实际生效默认值，重启生效）→ 客户端临时覆写（仅当前连接生效、不落盘）。`config.py` 内置默认与 `config.yaml` 不一致时以 `config.yaml` 为准，内置默认仅为文件缺字段时的兜底。
 
-客户端临时覆写对三个 WebSocket 端点统一生效，承载位置不同：`/transcribe-streaming` 与 `/emotion-segmented-streaming` 用 `start.config`，`/tuling/ast/v3` 用首帧 `parameter.asr_config`（见 [实时转写 AST v3 WebSocket](tuling-ast-v3-protocol.md)）。两者都只接受扁平字段名（与 `config.json` 是否分组无关）。
+客户端临时覆写对三个 WebSocket 端点统一生效，承载位置不同：`/transcribe-streaming` 与 `/emotion-segmented-streaming` 用 `start.config`，`/tuling/ast/v3` 用首帧 `parameter.asr_config`（见 [实时转写 AST v3 WebSocket](tuling-ast-v3-protocol.md)）。两者都只接受扁平字段名（与 `config.yaml` 是否分组无关）。
 
-覆写字段受服务端白名单（`backend/config.py` 的 `CLIENT_OVERRIDABLE_FIELDS`）约束：只放调参类字段；模型地址（`*_vllm_base_url`，避免 SSRF）、密钥（`text_cleanup_api_key*`）、连接池与任务队列等进程级基础设施字段不可覆写。白名单外字段、未知字段与非法值都会被忽略并保持服务端默认，不会中断连接。完整白名单按类别如下：
+覆写字段受服务端白名单（`backend/config.py` 的 `CLIENT_OVERRIDABLE_FIELDS`）约束：只放调参类字段；模型地址（`*_vllm_base_url`，避免 SSRF）、模型 prompt 模板（`*_prompt_template`）、密钥（`text_cleanup_api_key*`）、连接池与任务队列等进程级基础设施字段不可覆写。白名单外字段、未知字段与非法值都会被忽略并保持服务端默认，不会中断连接。完整白名单按类别如下：
 
 | 类别 | 字段 |
 |---|---|
@@ -94,7 +96,7 @@ bytes_per_ms = 16000 * 1 * 2 / 1000 = 32
 
 `pseudo_stream_first_partial_ms` 是每段语音首个 partial（伪流式中间结果）的触发门槛，只对会输出 partial 的端点生效：`/transcribe-streaming` 与 `/tuling/ast/v3`。`/emotion-segmented-streaming` 不产 partial（服务端固定关闭），传入无效；`/ws/audio` 是浏览器 Demo 调试接口、走独立的旧实现（`backend/session.py`），不读该字段，其 partial 门槛恒等于 `min_segment_duration_ms`。它与 `vad_start_frames` 一起按 max 决定首字延迟；调低只让首字更早出，不改变 final 段的短噪声过滤（仍由 `min_segment_duration_ms` 控制，不变量 `pseudo_stream_first_partial_ms ≤ min_segment_duration_ms`）。
 
-final 文本规范化开关（enable_asr_itn、asr_itn_enable_0_to_9、enable_asr_plate_normalize）为服务端 config.json 配置，不在上表白名单内，客户端无法临时覆写。语义与示例见各协议文档的“文本规范化”小节与 [README 文本规范化](../README.md)。
+final 文本规范化开关（enable_asr_itn、asr_itn_enable_0_to_9、enable_asr_plate_normalize）与解码退化重复折叠开关（enable_asr_repetition_fix）为服务端配置，不在上表白名单内，客户端无法临时覆写。语义与示例见各协议文档的“文本规范化”小节与 [README 文本规范化](../README.md)。
 
 ASR 模型组合开关的语义矩阵（`enable_dual_asr_fusion=true` 但 `enable_secondary_asr=false` 会在 load 时自动降级为 false）：
 
@@ -195,11 +197,46 @@ python docs/examples/rest_upload.py asr sample.wav \
 }
 ```
 
-`text`（流式 `final` 与上传响应一致）默认已做逆文本规范化（ITN，仅中文）与车牌规范化：`六五四三八`→`65438`、`辽b二四五零七`→`辽B24507`；`partial`/中间结果保持口语形式。省份简称被声学误识别成字母（`冀`→`J`）属识别错误，后处理只修数字/字母、不还原省份字。开关 `enable_asr_itn`、`asr_itn_enable_0_to_9`、`enable_asr_plate_normalize` 为服务端 `config.json` 配置（`asr.itn` 分组），不在客户端覆写白名单内；详见各协议文档的“文本规范化”小节。
+`text`（流式 `final` 与上传响应一致）默认已做逆文本规范化（ITN，仅中文）与车牌规范化：`六五四三八`→`65438`、`辽b二四五零七`→`辽B24507`；`partial`/中间结果保持口语形式。省份简称被声学误识别成字母（`冀`→`J`）属识别错误，后处理只修数字/字母、不还原省份字。开关 `enable_asr_itn`、`asr_itn_enable_0_to_9`、`enable_asr_plate_normalize` 为服务端 `config.yaml` 配置（`defaults.itn` 分组），不在客户端覆写白名单内；详见各协议文档的“文本规范化”小节。
 
-如需让模型只转写指定说话人的话，先用 `POST /api/asr/enrollment` 上传 1-8 秒目标人语音、拿到 `enrollment_id`，再把它作为表单字段附加到 `/api/asr/upload`，响应里的 `enrollment_used` 会变为 `true`。详细字段、错误码与 Python 代码示例见 [通用流式 ASR WebSocket](transcribe-streaming-protocol.md)。
+如需让模型只转写指定说话人的话，先用 `POST /api/asr/enrollment` 上传 1-8 秒目标人语音、拿到 `enrollment_id`，再把它作为表单字段附加到 `/api/asr/upload`，响应里的 `enrollment_used` 会变为 `true`。注册字段、错误码与生命周期见下文“目标说话人注册”。
+
+### 长音频离线转写（会议纪要）
+
+`POST /api/asr/transcriptions` 面向整段会议录音等长音频（默认上限 3 小时 / 512 MB，超时长直接 400 拒绝而非截断）。服务端先按与流式端点相同的 VAD 状态机把录音切成语音段（切段停顿阈值可经 `transcribe_silence_duration_ms` 独立调参、不影响实时端点；连续无停顿语音超过 `transcribe_max_segment_sec` 会强制切分），再对每段并行执行与 `/api/asr/upload` 相同的双模型转写（含 ITN / 车牌规范化），最后按时间序拼出全文。表单字段为 `audio`（WAV）、`language`、`hotwords`；不支持 `enrollment_id`（目标说话人过滤与多人会议语义相反）。
+
+```bash
+curl -X POST http://172.16.0.3:8080/api/asr/transcriptions \
+  -F "audio=@meeting.wav" \
+  -F "language=zh" \
+  -F "hotwords=挚音科技,张硕"
+```
+
+受理后轮询 `GET /api/asr/transcriptions/{job_id}` 取进度与结果：
+
+```json
+{
+  "job_id": "tr_6f0c2a8e9b3d41a7c5e21f08",
+  "status": "succeeded",
+  "progress": { "segments_total": 636, "segments_done": 636 },
+  "result": {
+    "type": "transcription",
+    "language": "zh",
+    "duration_sec": 1949.076,
+    "failed_segments": 0,
+    "full_text": "师傅好啊，师傅好啊！\n009，我是。\n…",
+    "segments": [
+      { "id": 0, "start_ms": 21400, "end_ms": 22300, "text": "师傅好啊，师傅好啊！", "language": "zh" }
+    ]
+  }
+}
+```
+
+`segments[*].start_ms` / `end_ms` 为段级近似时间戳（非词级对齐）。单段失败重试一次后以 `error` 占位、不拖垮整个任务；结果内存保留 `transcribe_job_ttl_sec`（默认 1 小时）。完整的请求/响应字段表、状态机、部分失败语义、错误码、`config.yaml` 调参（`defaults.transcribe` 分组）与切段停顿调参建议见 [长音频离线转写 API](transcription-jobs-api.md)，命令行客户端见 `docs/examples/http_transcribe_job.py`。
 
 ### 目标说话人注册
+
+`POST /api/asr/enrollment` 上传一段目标说话人音频，返回不透明的 `enrollment_id` 供后续请求复用：`/transcribe-streaming` 放进 `start.enrollment_id`、`/tuling/ast/v3` 放进首帧 `header.resIdList[0]`、REST 的 `/api/asr/upload` 与 `/api/audio/analyze` 作为表单字段 `enrollment_id`。
 
 ```bash
 curl -X POST http://172.16.0.3:8080/api/asr/enrollment \
@@ -215,7 +252,25 @@ curl -X POST http://172.16.0.3:8080/api/asr/enrollment \
 }
 ```
 
-校验失败（音频过短、无法解码等）返回 400 且 `detail.code` 为结构化错误码（`empty` / `too_short` / `decode_failed`）。删除使用 `DELETE /api/asr/enrollment/{enrollment_id}`。完整协议见 [通用流式 ASR WebSocket](transcribe-streaming-protocol.md)。
+#### 请求约束
+
+音频为 WAV，服务端解码为 16 kHz mono。短于 `asr_enrollment_min_sec`（默认 1.0 秒）返回 400 且 `detail.code=too_short`；长于 `asr_enrollment_max_sec`（默认 8.0 秒）不拒绝，服务端尾截到上限。上传体为空或解码后无音频返回 `detail.code=empty`，WAV 损坏或解码失败返回 `detail.code=decode_failed`。
+
+#### 生命周期
+
+生命周期决定何时需要重新注册，集成方必读：
+
+| 项目 | 行为 |
+|---|---|
+| 存储 | 进程内内存缓存，服务重启全部失效，不跨实例共享 |
+| 有效期 | TTL 由 `asr_enrollment_ttl_sec`（默认 3600 秒）控制；每次被成功使用都会续期，持续使用不会过期 |
+| 断连 | WebSocket 断开不删除，重连后仍可复用（受 TTL 约束） |
+| 容量 | 上限 `asr_enrollment_max_entries`（默认 256），超出按最近最少使用（LRU）淘汰最旧条目 |
+| 删除 | `DELETE /api/asr/enrollment/{enrollment_id}` 立即清除；未知 id 也返回 204，可安全重试 |
+
+`enrollment_id` 失效（过期 / 重启 / 被 LRU 淘汰 / 删除）后再被使用时，服务端静默回退为普通 ASR、不返回 error：WS 路径仅记 WARN（见“WebSocket 错误消息”），REST `/api/asr/upload` 响应 `enrollment_used` 为 `false`。集成方应对失效有预期，必要时重新注册并更新所携带的 id。
+
+`asr_enrollment_min_sec` / `asr_enrollment_max_sec` / `asr_enrollment_ttl_sec` 虽在客户端覆写白名单内（见“临时配置覆写”），但注册是独立的 REST 调用、恒按服务端默认执行；流式端点首帧覆写这些值不会改变已注册 id 的行为。通用流式端点的 `start.enrollment_id` / `update_hotwords.enrollment_id` 用法与 TS-ASR 双音频 prompt 模板见 [通用流式 ASR WebSocket](transcribe-streaming-protocol.md)；AST v3 集成只需按本节注册，并按 [实时转写 AST v3 WebSocket](tuling-ast-v3-protocol.md) 把 id 放入 `header.resIdList[0]`。
 
 ### 情感上传
 
@@ -305,15 +360,15 @@ REST 接口使用标准 HTTP 状态码：
 
 | 状态码 | 含义 |
 |---|---|
-| 400 | 请求字段缺失、音频为空、音频无法解码、注册音频校验失败 |
-| 413 | 上传文件超过服务端大小限制 |
+| 400 | 请求字段缺失、音频为空、音频无法解码、注册音频校验失败、转写音频超过 `transcribe_max_audio_sec` 时长上限 |
+| 413 | 上传文件超过服务端大小限制（转写接口为 `transcribe_max_upload_bytes`，默认 512 MB） |
 | 422 | multipart 字段类型或必填字段不符合 FastAPI 校验 |
 | 502 | 后端模型服务推理失败 |
 | 502 | `/api/audio/analyze` 的 ASR、情感或文本清洗模型调用失败 |
 | 204 | `DELETE /api/asr/enrollment/{id}` 删除成功（未知 id 也返回 204） |
-| 202 | `POST /api/emotion/jobs` 已受理（需轮询 GET） |
-| 503 | 情感任务队列已满（`Retry-After`） |
-| 404 | `GET /api/emotion/jobs/{id}` 任务不存在或已过期 |
+| 202 | `POST /api/emotion/jobs` / `POST /api/asr/transcriptions` 已受理（需轮询 GET） |
+| 503 | 情感 / 转写任务队列已满（`Retry-After`） |
+| 404 | `GET /api/emotion/jobs/{id}` / `GET /api/asr/transcriptions/{id}` 任务不存在或已过期 |
 
 普通错误体示例：
 
@@ -338,6 +393,7 @@ REST 接口使用标准 HTTP 状态码：
 
 - [公网非实时音频分析 API](public-audio-analyze-api.md)
 - [非实时音频分析 API](audio-analyze-api.md)
+- [长音频离线转写 API](transcription-jobs-api.md)
 - [通用流式 ASR WebSocket](transcribe-streaming-protocol.md)
 - [实时转写 AST v3 WebSocket](tuling-ast-v3-protocol.md)
 - [整段情感识别 HTTP（异步）](emotion-streaming-protocol.md)

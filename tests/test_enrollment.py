@@ -2,12 +2,9 @@
 
 Covers
 ------
-1. The v4-aligned prompt builder in ``backend/asr/client.py`` — verifies
-   the exact ``messages`` structure for the four shapes the model was
-   trained on (plain ASR, ASR + hotwords, TS-ASR, TS-ASR + hotwords).
-   These tests are byte-for-byte assertions because v4 SFT is sensitive
-   to whitespace ordering (the ``\\n`` lives at the *start* of the second
-   text block in the TS-ASR shapes).
+1. The primary ASR prompt builders in ``backend/asr/client.py`` — verifies
+   the exact ``messages`` structures for Amphion 4B (interleaved user text)
+   and Amphion 1.7B (system text + audio-only user turn).
 2. The in-memory ``EnrollmentStore`` — duration validation, tail-trim,
    TTL eviction, LRU overflow, and round-trip get/delete.
 """
@@ -28,6 +25,8 @@ if str(ROOT) not in sys.path:
 from backend.asr.client import (  # noqa: E402
     build_audio_only_messages,
     build_primary_messages,
+    detect_and_fix_repetitions,
+    parse_model_output,
 )
 from backend.asr.enrollment import (  # noqa: E402
     EnrollmentError,
@@ -50,13 +49,13 @@ def _wav_b64(seconds: float, sr: int = SAMPLE_RATE) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Prompt builder — must match v4 task 1/2/5/6 byte-for-byte
+# Prompt builders — must match model-specific task matrices byte-for-byte
 # ---------------------------------------------------------------------------
 
 
-def test_primary_messages_task1_plain_asr():
-    """Task 1: ``Transcribe the following audio.`` + <audio>."""
-    msgs = build_primary_messages("TARGET_B64")
+def test_amphion_asr_task1_plain_asr():
+    """Amphion 4B: ``Transcribe the following audio.`` + <audio>."""
+    msgs = build_primary_messages("TARGET_B64", template="amphion_asr")
     assert len(msgs) == 1
     content = msgs[0]["content"]
     assert content == [
@@ -65,20 +64,24 @@ def test_primary_messages_task1_plain_asr():
     ]
 
 
-def test_primary_messages_task2_asr_hotwords():
-    """Task 2: hotwords joined with ``,`` (no spaces), comma after Hotwords:."""
+def test_amphion_asr_task2_asr_hotwords():
+    """Amphion 4B: hotwords joined with ``,`` (no spaces)."""
     msgs = build_primary_messages(
-        "TARGET_B64", hotwords=["江门", "彭丽媛", "奥体中心"]
+        "TARGET_B64",
+        hotwords=["江门", "彭丽媛", "奥体中心"],
+        template="amphion_asr",
     )
     text = msgs[0]["content"][0]["text"]
     assert text == "Transcribe the following audio.\nHotwords: 江门,彭丽媛,奥体中心"
     assert msgs[0]["content"][1]["input_audio"]["data"] == "TARGET_B64"
 
 
-def test_primary_messages_task5_tsasr():
-    """Task 5: dual text + dual audio with the ``\\n`` on second text head."""
+def test_amphion_asr_task5_tsasr():
+    """Amphion 4B: dual text + dual audio with leading newline."""
     msgs = build_primary_messages(
-        "TARGET_B64", enrollment_wav_base64="ENROLL_B64"
+        "TARGET_B64",
+        enrollment_wav_base64="ENROLL_B64",
+        template="amphion_asr",
     )
     content = msgs[0]["content"]
     assert content == [
@@ -92,12 +95,13 @@ def test_primary_messages_task5_tsasr():
     ]
 
 
-def test_primary_messages_task6_tsasr_hotwords():
-    """Task 6: second text adds ``\\nHotwords: w1,w2`` after the transcribe line."""
+def test_amphion_asr_task6_tsasr_hotwords():
+    """Amphion 4B: second text adds ``\\nHotwords: w1,w2``."""
     msgs = build_primary_messages(
         "TARGET_B64",
         hotwords=["北京", "清华大学"],
         enrollment_wav_base64="ENROLL_B64",
+        template="amphion_asr",
     )
     second_text = msgs[0]["content"][2]["text"]
     assert second_text == (
@@ -106,28 +110,131 @@ def test_primary_messages_task6_tsasr_hotwords():
     )
 
 
-def test_primary_messages_hotword_dedup_and_strip():
+def test_amphion_asr_hotword_dedup_and_strip():
     """Hotwords are stripped + deduped while preserving order, so the
     prompt bytes never gain stray whitespace from sloppy clients."""
     msgs = build_primary_messages(
         "TARGET_B64",
         hotwords=["北京", "  北京  ", "上海", "上海", "", "广州"],
+        template="amphion_asr",
     )
     text = msgs[0]["content"][0]["text"]
     assert text == "Transcribe the following audio.\nHotwords: 北京,上海,广州"
 
 
-def test_primary_messages_no_language_line_ever():
-    """v4 SFT has 0% Language: coverage. Even when callers pass a
-    ``src_lang`` value (via the upstream ``query_audio_model``
-    wrapper) the prompt must omit the line — assert via absence."""
-    msgs = build_primary_messages("TARGET_B64", hotwords=["北京"])
+def test_amphion_asr_has_no_language_line():
+    msgs = build_primary_messages(
+        "TARGET_B64",
+        hotwords=["北京"],
+        template="amphion_asr",
+    )
     assembled = "".join(
         item.get("text", "")
         for item in msgs[0]["content"]
         if item.get("type") == "text"
     )
     assert "Language:" not in assembled
+
+
+def test_amphion_asr_17b_task1_plain_asr():
+    msgs = build_primary_messages("TARGET_B64", template="amphion_asr_1.7b")
+    assert msgs == [
+        {"role": "system", "content": ""},
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_audio",
+                    "input_audio": {"data": "TARGET_B64", "format": "wav"},
+                }
+            ],
+        },
+    ]
+
+
+def test_amphion_asr_17b_task2_asr_hotwords():
+    msgs = build_primary_messages(
+        "TARGET_B64",
+        hotwords=["江门", "彭丽媛", "奥体中心"],
+        template="amphion_asr_1.7b",
+    )
+    assert msgs[0] == {
+        "role": "system",
+        "content": "Hotwords: 江门,彭丽媛,奥体中心",
+    }
+    assert msgs[1]["content"][0]["input_audio"]["data"] == "TARGET_B64"
+
+
+def test_amphion_asr_17b_task5_tsasr():
+    msgs = build_primary_messages(
+        "TARGET_B64",
+        enrollment_wav_base64="ENROLL_B64",
+        template="amphion_asr_1.7b",
+    )
+    assert msgs == [
+        {
+            "role": "system",
+            "content": "Given the speaker's voice in the first audio.",
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_audio",
+                    "input_audio": {"data": "ENROLL_B64", "format": "wav"},
+                },
+                {
+                    "type": "input_audio",
+                    "input_audio": {"data": "TARGET_B64", "format": "wav"},
+                },
+            ],
+        },
+    ]
+
+
+def test_amphion_asr_17b_task6_tsasr_hotwords():
+    msgs = build_primary_messages(
+        "TARGET_B64",
+        hotwords=["北京", "清华大学"],
+        enrollment_wav_base64="ENROLL_B64",
+        template="amphion_asr_1.7b",
+    )
+    assert msgs[0] == {
+        "role": "system",
+        "content": (
+            "Given the speaker's voice in the first audio.\n"
+            "Hotwords: 北京,清华大学"
+        ),
+    }
+    assert [item["input_audio"]["data"] for item in msgs[1]["content"]] == [
+        "ENROLL_B64",
+        "TARGET_B64",
+    ]
+
+
+def test_unknown_primary_prompt_template_raises():
+    with pytest.raises(ValueError):
+        build_primary_messages("TARGET_B64", template="does_not_exist")
+
+
+def test_parse_qwen3_asr_language_prefix():
+    result = parse_model_output(
+        "language Chinese<asr_text>你好世界",
+        enable_repetition_fix=False,
+    )
+    assert result["transcription"] == "你好世界"
+    assert result["detected_language"] == "Chinese"
+
+
+def test_parse_model_output_passes_through_bare_text():
+    result = parse_model_output("你好世界", enable_repetition_fix=False)
+    assert result["transcription"] == "你好世界"
+    assert result["detected_language"] is None
+
+
+def test_detect_and_fix_repetitions_collapses_decode_loop():
+    assert detect_and_fix_repetitions("哈" * 21) == "哈"
+    assert detect_and_fix_repetitions("abc" * 21) == "abc"
 
 
 def test_audio_only_messages_has_no_text_item():

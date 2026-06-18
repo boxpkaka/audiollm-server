@@ -18,7 +18,11 @@ http_pool:
 upstreams:
   amphion_asr:
     base_url: http://localhost:8009
-    model_name: AmphionASR-4.3B
+    model_name: AmphionASR-1.7B
+    # Prompt template follows the served checkpoint:
+    #   AmphionASR-4.3B -> amphion_asr
+    #   AmphionASR-1.7B -> amphion_asr_1.7b
+    prompt_template: amphion_asr_1.7b
     timeout: 120
   qwen_asr:
     base_url: http://localhost:8001
@@ -49,7 +53,7 @@ upstreams:
 defaults:
   vad:
     vad_threshold: 0.65
-    silence_duration_ms: 350
+    silence_duration_ms: 1000
     vad_smoothing_alpha: 0.3
     vad_start_frames: 20
     vad_pre_speech_ms: 500
@@ -57,7 +61,7 @@ defaults:
     min_segment_duration_ms: 350
   pseudo_stream:
     enable_pseudo_stream: true
-    pseudo_stream_interval_ms: 500
+    pseudo_stream_interval_ms: 800
     pseudo_stream_first_partial_ms: 200   # 不变量: <= min_segment_duration_ms
   asr:
     enable_primary_asr: true
@@ -76,11 +80,29 @@ defaults:
     enable_asr_itn: true
     asr_itn_enable_0_to_9: false
     enable_asr_plate_normalize: true
+    enable_asr_repetition_fix: true
   enrollment:
     asr_enrollment_min_sec: 1.0
     asr_enrollment_max_sec: 8.0
     asr_enrollment_ttl_sec: 3600
     asr_enrollment_max_entries: 256       # 进程级 store 容量(非 per-endpoint)
+  transcribe:                             # 离线长音频转写 job (POST /api/asr/transcriptions)
+                                          # 本组只放纯调参; 用哪个模型/是否融合在下方 rest.routes.transcribe
+                                          # 调参依据: docs/transcription-jobs-benchmark.md(H20 实测扫参)
+    transcribe_max_concurrent_jobs: 2     # 同时 running 的 job 数; 提到 4 吞吐不变(瓶颈在段级
+                                          # 并发), 只多占内存且拖慢先到任务
+    transcribe_segment_concurrency: 4     # 单 job 内并行推理的段数(总 vLLM 压力 = 两者乘积);
+                                          # 提到 8 单 job 仅 -3.6s, 但峰值压力翻倍挤压实时流量
+    transcribe_job_queue_max: 8           # 排队上限(含 running); 8 个 32min 会议实测 41.5s 清空
+    transcribe_job_ttl_sec: 3600          # 终态 job 结果保留时长
+    transcribe_max_segment_sec: 30.0      # 连续语音强切上限(VAD 只在静音处切); 15/30 性能无差异
+    transcribe_max_upload_bytes: 536870912  # 512MB; 2h 16k mono WAV ≈ 220MB
+    transcribe_max_audio_sec: 10800       # 超长直接 400 拒绝(不尾截, 不静默丢内容)
+    transcribe_silence_duration_ms: 800   # 仅离线转写的切段停顿; 0 = 跟随全局
+                                          # silence_duration_ms(350, 为实时调的低延迟值)。
+                                          # 离线无延迟代价, 拉长可让纪要段落更完整且更快
+                                          # (实测 350ms: 636 段 p50 1.5s; 800ms: 303 段
+                                          #  p50 3.2s, e2e 还快 11%)
   emotion:
     emotion_task_mode: ser
     emotion_max_audio_seconds: 20.0
@@ -99,13 +121,21 @@ services:
   hotword: hotword_llm
   text_cleanup: dashscope_cleanup
 
-# REST/HTTP 路由的上游绑定(这些接口固定一套, 不做多实例)。
+# REST/HTTP 路由的上游绑定: upstreams 是所有 REST 接口的共享默认,
+# routes.<name> 是单接口覆写(省略 = 全部跟随共享默认与 defaults 全局开关)。
 rest:
-  upstreams:
+  upstreams:                     # 共享绑定(/api/asr/upload、/api/audio/analyze、情感 jobs)
     primary: amphion_asr
     secondary: qwen_asr
     emotion: amphion_emotion
     emotion_spec: amphion_spec
+  routes:
+    transcribe:                  # 长音频离线转写 (POST /api/asr/transcriptions) 专属推理配置
+      upstreams:
+        primary: amphion_asr     # 转写主模型(换模型改这里, 不影响 upload/analyze)
+        secondary: qwen_asr      # 仅 enable_dual_asr_fusion=true 时参与
+      enable_dual_asr_fusion: false  # 转写是否双模型融合。离线无延迟压力, 质量优先可改 true
+                                     # (每段 2 个 vLLM 请求, 吞吐约减半, 见 benchmark 文档)
 
 # WS 端点: 每个端点自主声明 协议/任务/上游绑定/策略(不从全局隐式继承)。
 #   protocol: native | astv3   (browser_demo 复用 native wire, 故归在 task)

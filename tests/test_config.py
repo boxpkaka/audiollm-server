@@ -34,6 +34,7 @@ from backend.config import (  # noqa: E402
     CLIENT_OVERRIDABLE_FIELDS,
     ENDPOINTS,
     VALID_ENDPOINT_COMBINATIONS,
+    VALID_PRIMARY_PROMPT_TEMPLATES,
     Config,
     Upstream,
     default_config,
@@ -130,9 +131,26 @@ def test_upstream_base_url_stripped_and_max_tokens(tmp_path: Path) -> None:
     data["upstreams"]["p"]["base_url"] = "http://p:1/"  # trailing slash
     parsed = load_parsed(_write_yaml(tmp_path, data))
     assert parsed.upstreams["p"].base_url == "http://p:1"
+    assert parsed.upstreams["p"].prompt_template == "amphion_asr"
     assert parsed.upstreams["clean"].max_tokens == 99
     assert parsed.upstreams["p"].max_tokens is None
     assert isinstance(parsed.upstreams["p"], Upstream)
+
+
+def test_unknown_primary_prompt_template_fails(tmp_path: Path) -> None:
+    data = _minimal()
+    data["upstreams"]["p"]["prompt_template"] = "unknown_template"
+    with pytest.raises(ValueError, match="prompt_template"):
+        load_parsed(_write_yaml(tmp_path, data))
+
+
+def test_prompt_template_validation_applies_to_config_construction() -> None:
+    with pytest.raises(ValueError, match="vllm_prompt_template"):
+        Config(vllm_prompt_template="unknown_template")
+    with pytest.raises(ValueError, match="astv3_vllm_prompt_template"):
+        Config(astv3_vllm_prompt_template="unknown_template")
+    with pytest.raises(ValueError, match="astv3_vllm_prompt_template"):
+        load_config().override(astv3_vllm_prompt_template="unknown_template")
 
 
 # --------------------------------------------------------------------------- #
@@ -145,6 +163,7 @@ def test_rest_projection_maps_roles_to_fields(tmp_path: Path) -> None:
     cfg = parsed.default_config
     assert cfg.vllm_base_url == "http://p:1"
     assert cfg.vllm_model_name == "P"
+    assert cfg.vllm_prompt_template == "amphion_asr"
     assert cfg.asr_request_timeout == 11  # primary upstream timeout
     assert cfg.secondary_vllm_base_url == "http://s:2"
     assert cfg.emotion_vllm_base_url == "http://e:3"
@@ -169,7 +188,9 @@ def test_text_cleanup_bridge_appends_v1(tmp_path: Path) -> None:
 def test_shipped_config_projects_rest_bindings() -> None:
     cfg = load_config()  # reads the shipped config.yaml
     assert cfg.vllm_base_url == "http://localhost:8009"
-    assert cfg.vllm_model_name == "AmphionASR-4.3B"
+    assert cfg.vllm_model_name == "AmphionASR-1.7B"
+    assert cfg.vllm_prompt_template == "amphion_asr_1.7b"
+    assert cfg.vllm_prompt_template in VALID_PRIMARY_PROMPT_TEMPLATES
     assert cfg.secondary_vllm_base_url == "http://localhost:8001"
     assert cfg.emotion_vllm_base_url == "http://localhost:8222"
     assert cfg.emotion_spec_vllm_base_url == "http://localhost:9001"
@@ -182,6 +203,7 @@ def test_shipped_config_projects_rest_bindings() -> None:
     assert cfg.enable_secondary_asr is True
     assert cfg.emotion_task_mode == "ser"
     assert cfg.emotion_spec_task_mode == "sepc"
+    assert cfg.enable_asr_repetition_fix is True
     assert (
         cfg.text_cleanup_base_url
         == "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -284,6 +306,7 @@ def test_resolve_binds_per_endpoint_primary(tmp_path: Path) -> None:
     data["upstreams"]["other"] = {
         "base_url": "http://other:9",
         "model_name": "OTHER",
+        "prompt_template": "amphion_asr_1.7b",
         "timeout": 7,
     }
     data["endpoints"] = [
@@ -298,6 +321,7 @@ def test_resolve_binds_per_endpoint_primary(tmp_path: Path) -> None:
     cfg = resolve_endpoint(parsed.endpoints[0], parsed)
     assert cfg.vllm_base_url == "http://other:9"
     assert cfg.vllm_model_name == "OTHER"
+    assert cfg.vllm_prompt_template == "amphion_asr_1.7b"
     assert cfg.asr_request_timeout == 7
     # secondary still bound from this endpoint's own upstreams
     assert cfg.secondary_vllm_base_url == "http://s:2"
@@ -342,6 +366,7 @@ def test_resolve_real_tuling_primary_only() -> None:
     spec = next(e for e in ENDPOINTS if e.path == "/tuling/ast/v3")
     cfg = resolve_endpoint(spec)
     assert cfg.vllm_base_url == "http://localhost:8009"  # amphion_asr (primary)
+    assert cfg.vllm_prompt_template == "amphion_asr_1.7b"
     assert cfg.enable_secondary_asr is False  # lock + no secondary binding
     assert cfg.enable_dual_asr_fusion is False
 
@@ -463,8 +488,10 @@ def test_client_overridable_fields_are_real_and_safe() -> None:
     assert CLIENT_OVERRIDABLE_FIELDS <= names
     forbidden = {
         "vllm_base_url",
+        "vllm_prompt_template",
         "astv3_vllm_base_url",
         "astv3_vllm_model_name",
+        "astv3_vllm_prompt_template",
         "secondary_vllm_base_url",
         "emotion_vllm_base_url",
         "emotion_spec_vllm_base_url",
@@ -473,6 +500,7 @@ def test_client_overridable_fields_are_real_and_safe() -> None:
         "text_cleanup_api_key_env",
         "http_max_connections",
         "http_max_keepalive_connections",
+        "enable_asr_repetition_fix",
     }
     assert CLIENT_OVERRIDABLE_FIELDS.isdisjoint(forbidden)
 
