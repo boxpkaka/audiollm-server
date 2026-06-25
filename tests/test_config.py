@@ -381,6 +381,7 @@ def test_resolve_real_ws_audio_binds_emotion_spec() -> None:
 def test_get_service_upstream() -> None:
     assert get_service_upstream("text_cleanup").name == "dashscope_cleanup"
     assert get_service_upstream("hotword").name == "hotword_llm"
+    assert get_service_upstream("recall").name == "triton_recall"
     assert get_service_upstream("nonexistent") is None
 
 
@@ -392,6 +393,16 @@ def test_get_service_upstream() -> None:
 def test_fusion_requires_secondary_invariant() -> None:
     cfg = Config(enable_secondary_asr=False, enable_dual_asr_fusion=True)
     assert cfg.enable_dual_asr_fusion is False
+
+
+def test_encoder_bypass_requires_recall_invariant() -> None:
+    cfg = Config(enable_hotword_recall=False, enable_encoder_bypass=True)
+    assert cfg.enable_encoder_bypass is False
+
+
+def test_recall_top_k_clamps_to_non_negative() -> None:
+    cfg = Config(recall_top_k=-1)
+    assert cfg.recall_top_k == 0
 
 
 def test_pseudo_stream_first_partial_dataclass_default_is_neutral() -> None:
@@ -439,6 +450,12 @@ def test_pseudo_stream_first_partial_client_overridable() -> None:
     assert "pseudo_stream_first_partial_ms" in CLIENT_OVERRIDABLE_FIELDS
     out = load_config().override_client(pseudo_stream_first_partial_ms=200)
     assert out.pseudo_stream_first_partial_ms == 200
+
+
+def test_recall_knobs_client_overridable() -> None:
+    assert {"enable_hotword_recall", "recall_top_k"} <= CLIENT_OVERRIDABLE_FIELDS
+    out = load_config().override_client(recall_top_k=3)
+    assert out.recall_top_k == 3
 
 
 def test_pseudo_stream_first_partial_clamp_applies_on_override() -> None:
@@ -501,6 +518,7 @@ def test_client_overridable_fields_are_real_and_safe() -> None:
         "http_max_connections",
         "http_max_keepalive_connections",
         "enable_asr_repetition_fix",
+        "enable_encoder_bypass",
     }
     assert CLIENT_OVERRIDABLE_FIELDS.isdisjoint(forbidden)
 

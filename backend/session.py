@@ -368,10 +368,13 @@ class AudioSession:
                 primary_task = asyncio.create_task(
                     query_audio_model(
                         wav_b64,
-                        hotwords=list(self.hotwords),
+                        hotwords=[],
                         src_lang=self.src_lang,
+                        audio_pcm=None,
+                        audio_sample_rate=SAMPLE_RATE,
                         enrollment_wav_base64=self.enrollment_b64,
                         prompt_template=default_config.vllm_prompt_template,
+                        runtime_config=default_config,
                     )
                 )
             if default_config.enable_secondary_asr:
@@ -488,7 +491,7 @@ class AudioSession:
         # the primary alone, saving one vLLM call per segment.
         if default_config.enable_dual_asr_fusion:
             secondary_res, primary_res = await self._dual_asr_pipeline(
-                seg_id, wav_b64, hw_snapshot, lang_snapshot
+                seg_id, wav_b64, hw_snapshot, lang_snapshot, audio_pcm=segment
             )
             if secondary_res is None and primary_res is None:
                 is_silence = True
@@ -499,8 +502,11 @@ class AudioSession:
                         wav_b64,
                         hotwords=hw_snapshot,
                         src_lang=lang_snapshot,
+                        audio_pcm=segment,
+                        audio_sample_rate=SAMPLE_RATE,
                         enrollment_wav_base64=self.enrollment_b64,
                         prompt_template=default_config.vllm_prompt_template,
+                        runtime_config=default_config,
                     ),
                     timeout=default_config.primary_asr_timeout,
                 )
@@ -523,8 +529,9 @@ class AudioSession:
             text = ""
             fused: dict | None = None
         else:
+            fusion_hotwords = self._fusion_hotwords(primary_result, hw_snapshot)
             fused = choose_fused_result(
-                primary_result, secondary_result, hotwords=hw_snapshot
+                primary_result, secondary_result, hotwords=fusion_hotwords
             )
             text = str(fused.get("text") or "").strip()
             if text:
@@ -667,6 +674,8 @@ class AudioSession:
         wav_b64: str,
         hw_snapshot: list[str],
         lang_snapshot: str,
+        *,
+        audio_pcm: np.ndarray | None = None,
     ) -> tuple:
         """Run both ASR models in parallel, wait for both, return results.
 
@@ -682,10 +691,13 @@ class AudioSession:
                 asyncio.wait_for(
                     query_audio_model(
                         wav_b64,
-                        hotwords=hw_snapshot,
+                        hotwords=hw_snapshot if audio_pcm is not None else [],
                         src_lang=lang_snapshot,
+                        audio_pcm=audio_pcm,
+                        audio_sample_rate=SAMPLE_RATE,
                         enrollment_wav_base64=self.enrollment_b64,
                         prompt_template=default_config.vllm_prompt_template,
+                        runtime_config=default_config,
                     ),
                     timeout=default_config.primary_asr_timeout,
                 )
@@ -723,3 +735,11 @@ class AudioSession:
                 primary_res = err
 
         return secondary_res, primary_res
+
+    @staticmethod
+    def _fusion_hotwords(primary_result, fallback: list[str]) -> list[str]:
+        if primary_result:
+            reported = primary_result.get("reported_hotwords") or []
+            if reported:
+                return [str(word) for word in reported]
+        return fallback

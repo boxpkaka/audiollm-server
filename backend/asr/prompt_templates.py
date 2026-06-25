@@ -31,13 +31,24 @@ def audio_item(wav_b64: str) -> dict[str, Any]:
     }
 
 
+def audio_embeds_item(audio_embeds_b64: str, uuid: str) -> dict[str, Any]:
+    return {
+        "type": "audio_embeds",
+        "audio_embeds": audio_embeds_b64,
+        "uuid": uuid,
+    }
+
+
 def _amphion_asr(
     target_wav_base64: str,
     *,
     hotwords: list[str] | None = None,
     enrollment_wav_base64: str | None = None,
+    audio_embeds_b64: str | None = None,
+    audio_embeds_uuid: str | None = None,
 ) -> list[dict]:
     """Amphion 4B swift style: text and audio interleaved in user turn."""
+    _ = audio_embeds_b64, audio_embeds_uuid
     hws = sanitize_hotwords(hotwords)
     hw_str = ",".join(hws) if hws else ""
     has_enroll = bool(enrollment_wav_base64)
@@ -66,6 +77,8 @@ def _amphion_asr_1_7b(
     *,
     hotwords: list[str] | None = None,
     enrollment_wav_base64: str | None = None,
+    audio_embeds_b64: str | None = None,
+    audio_embeds_uuid: str | None = None,
 ) -> list[dict]:
     """Amphion 1.7B Qwen3-ASR style: text in system, audio-only user turn."""
     hws = sanitize_hotwords(hotwords)
@@ -81,7 +94,10 @@ def _amphion_asr_1_7b(
     audio_content: list[dict[str, Any]] = []
     if has_enroll:
         audio_content.append(audio_item(enrollment_wav_base64))  # type: ignore[arg-type]
-    audio_content.append(audio_item(target_wav_base64))
+    if audio_embeds_b64 and audio_embeds_uuid and not has_enroll:
+        audio_content.append(audio_embeds_item(audio_embeds_b64, audio_embeds_uuid))
+    else:
+        audio_content.append(audio_item(target_wav_base64))
 
     return [
         {"role": "system", "content": "\n".join(system_lines)},
@@ -105,6 +121,8 @@ def build_primary_messages(
     *,
     hotwords: list[str] | None = None,
     enrollment_wav_base64: str | None = None,
+    audio_embeds_b64: str | None = None,
+    audio_embeds_uuid: str | None = None,
     template: str,
 ) -> list[dict]:
     """Build primary ASR chat messages for the selected model template."""
@@ -118,4 +136,6 @@ def build_primary_messages(
         target_wav_base64,
         hotwords=hotwords,
         enrollment_wav_base64=enrollment_wav_base64,
+        audio_embeds_b64=audio_embeds_b64,
+        audio_embeds_uuid=audio_embeds_uuid,
     )

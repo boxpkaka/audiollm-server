@@ -17,6 +17,8 @@ from __future__ import annotations
 import asyncio
 import logging
 
+import numpy as np
+
 from ..config import Config
 from .client import query_audio_model, query_audio_model_secondary
 from .fusion import choose_fused_result
@@ -62,6 +64,7 @@ async def run_oneshot_asr(
     cfg: Config,
     hotwords: list[str],
     language: str,
+    audio_pcm: np.ndarray | None = None,
     enrollment_b64: str | None = None,
 ) -> dict:
     """Transcribe one clip with the configured primary/secondary models.
@@ -80,11 +83,13 @@ async def run_oneshot_asr(
                     wav_b64,
                     hotwords=hotwords,
                     src_lang=language or "N/A",
+                    audio_pcm=audio_pcm,
                     enrollment_wav_base64=enrollment_b64,
                     base_url=cfg.vllm_base_url,
                     model_name=cfg.vllm_model_name,
                     prompt_template=cfg.vllm_prompt_template,
                     timeout=cfg.asr_request_timeout,
+                    runtime_config=cfg,
                 ),
                 timeout=cfg.primary_asr_timeout,
             )
@@ -138,10 +143,11 @@ async def run_oneshot_asr(
     elif secondary_result and not primary_result:
         text = str(secondary_result.get("transcription") or "").strip()
     else:
+        fusion_hotwords = _fusion_hotwords(primary_result, hotwords)
         fusion_payload = choose_fused_result(
             primary_result,
             secondary_result,
-            hotwords=hotwords,
+            hotwords=fusion_hotwords,
             similarity_threshold=cfg.fusion_similarity_threshold,
             min_primary_score=cfg.fusion_min_primary_score,
             max_repetition_ratio=cfg.fusion_max_repetition_ratio,
@@ -172,3 +178,11 @@ async def run_oneshot_asr(
         "secondary": model_result_payload(secondary_res),
         "fusion": fusion_payload,
     }
+
+
+def _fusion_hotwords(primary_result, fallback: list[str]) -> list[str]:
+    if primary_result:
+        reported = primary_result.get("reported_hotwords") or []
+        if reported:
+            return [str(word) for word in reported]
+    return fallback

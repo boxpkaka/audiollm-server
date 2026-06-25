@@ -182,9 +182,13 @@ async def transcribe_pcm_i16(
     semaphore = asyncio.Semaphore(max(1, int(cfg.transcribe_segment_concurrency)))
     done_count = 0
 
-    async def infer(wav_b64: str) -> dict:
+    async def infer(wav_b64: str, pcm: np.ndarray) -> dict:
         return await run_oneshot_asr(
-            wav_b64, cfg=cfg, hotwords=hotwords, language=language
+            wav_b64,
+            cfg=cfg,
+            hotwords=hotwords,
+            language=language,
+            audio_pcm=pcm,
         )
 
     async def run_one(seg: OfflineSegment) -> dict:
@@ -199,12 +203,12 @@ async def transcribe_pcm_i16(
             wav_b64 = pcm_to_wav_base64(seg.pcm)
             try:
                 try:
-                    res = await infer(wav_b64)
+                    res = await infer(wav_b64, seg.pcm)
                 except Exception:
                     # One retry absorbs transient upstream hiccups; a second
                     # failure is recorded on the entry, not raised, so one bad
                     # segment can't sink the rest of the meeting.
-                    res = await infer(wav_b64)
+                    res = await infer(wav_b64, seg.pcm)
                 entry["text"] = str(res.get("text") or "")
                 if res.get("language"):
                     entry["language"] = res["language"]

@@ -19,6 +19,7 @@ dependencies = [
     "python-multipart",
     "pyyaml",
     "ten-vad",
+    "tritonclient[http]>=2.69.0",
     "uvicorn[standard]",
     "websockets",
     "wetext>=0.1.2",

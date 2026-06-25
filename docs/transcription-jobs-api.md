@@ -28,7 +28,7 @@
 |---|---|---|---|
 | `audio` | file | 是 | WAV 文件（PCM 8/16/24/32-bit，任意采样率与声道数，服务端重采样到 16 kHz mono）。压缩格式（flac/mp3/m4a）需客户端先转码，例如 `ffmpeg -i in.flac -ac 1 -ar 16000 -sample_fmt s16 out.wav` |
 | `language` | string | 否 | 语言提示，如 `zh`、`en`；空为自动检测 |
-| `hotwords` | string | 否 | 逗号分隔热词，透传给每段 ASR（适合人名、术语） |
+| `hotwords` | string | 否 | 兼容旧客户端字段；当前不再透传给每段 ASR，热词偏置来自 Triton 全局池召回 |
 
 不支持 `enrollment_id`：目标说话人过滤只保留单一说话人的语音，与多人会议转写语义相反。
 

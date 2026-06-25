@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import backend.tasks.asr as asr_task_mod  # noqa: E402
 from backend.config import SAMPLE_RATE, load_config  # noqa: E402
 from backend.streaming.audio_stream import (  # noqa: E402
     VadSegmentedStream,
@@ -604,6 +605,53 @@ async def test_asr_engine_on_stop_silent_on_disconnect():
     engine = AsrTaskEngine()
     await engine.on_stop(ctx, sent_any_response=False, stopped=False)
     assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_asr_partial_uses_pure_vllm_without_recall_or_hotwords(monkeypatch):
+    calls: list[dict] = []
+
+    async def fake_query_audio_model(_wav_b64, hotwords=None, **kwargs):
+        calls.append({"hotwords": hotwords, **kwargs})
+        return {
+            "transcription": "中间结果",
+            "reported_hotwords": ["不应使用"],
+            "raw_text": "中间结果",
+            "detected_language": "zh",
+        }
+
+    monkeypatch.setattr(asr_task_mod, "query_audio_model", fake_query_audio_model)
+
+    sent: list[dict] = []
+
+    async def _send_json(payload):
+        sent.append(payload)
+        return True
+
+    cfg = load_config().override(
+        enable_primary_asr=True,
+        enable_secondary_asr=False,
+        enable_hotword_recall=True,
+        enable_encoder_bypass=True,
+    )
+    ctx = SessionContext(
+        cfg=cfg,
+        language="zh",
+        src_lang="Chinese",
+        hotwords=["会话热词"],
+        send_json=_send_json,
+    )
+    engine = AsrTaskEngine()
+
+    await engine.handle_partial(
+        PartialSnapshot(pcm=np.ones(1600, dtype=np.float32) * 0.05),
+        ctx,
+    )
+
+    assert calls
+    assert calls[0]["hotwords"] == []
+    assert calls[0]["audio_pcm"] is None
+    assert sent == [{"type": "partial", "text": "中间结果", "language": "zh"}]
 
 
 # ---------------------------------------------------------------------------

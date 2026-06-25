@@ -1,10 +1,16 @@
+import logging
 import re
 from typing import Any, TypedDict
 
-from ..config import default_config
+import numpy as np
+
+from ..config import SAMPLE_RATE, Config, default_config
 from ..http_client import get_client
 from .prompt_templates import audio_item
 from .prompt_templates import build_primary_messages as _build_primary_messages
+from .recall import recall_audio
+
+logger = logging.getLogger(__name__)
 
 
 class ASRResult(TypedDict):
@@ -19,6 +25,8 @@ def build_primary_messages(
     *,
     hotwords: list[str] | None = None,
     enrollment_wav_base64: str | None = None,
+    audio_embeds_b64: str | None = None,
+    audio_embeds_uuid: str | None = None,
     template: str | None = None,
 ) -> list[dict]:
     """Build primary ASR messages for the selected model prompt template."""
@@ -26,6 +34,8 @@ def build_primary_messages(
         target_wav_base64,
         hotwords=hotwords,
         enrollment_wav_base64=enrollment_wav_base64,
+        audio_embeds_b64=audio_embeds_b64,
+        audio_embeds_uuid=audio_embeds_uuid,
         template=template or default_config.vllm_prompt_template,
     )
 
@@ -246,11 +256,14 @@ async def query_audio_model(
     hotwords: list[str] | None = None,
     *,
     src_lang: str = "N/A",  # accepted for callsite compatibility, ignored
+    audio_pcm: np.ndarray | None = None,
+    audio_sample_rate: int = SAMPLE_RATE,
     enrollment_wav_base64: str | None = None,
     base_url: str | None = None,
     model_name: str | None = None,
     prompt_template: str | None = None,
     timeout: float | None = None,
+    runtime_config: Config | None = None,
 ) -> ASRResult:
     """Primary ASR call.
 
@@ -260,18 +273,73 @@ async def query_audio_model(
     duplicating call sites.
     """
     _ = src_lang  # noqa: F841 — preserved for compatibility, see docstring
+    cfg = runtime_config or default_config
+    template = prompt_template or cfg.vllm_prompt_template
+    effective_hotwords = list(hotwords or [])
+    audio_embeds_b64: str | None = None
+    audio_embeds_uuid: str | None = None
+
+    if cfg.enable_hotword_recall and audio_pcm is not None:
+        # The deployed recall service owns the global hotword pool; per-session
+        # hotword lists are no longer a prompt-sized candidate pool.
+        effective_hotwords = []
+        want_bypass = (
+            cfg.enable_encoder_bypass
+            and template == "amphion_asr_1.7b"
+            and enrollment_wav_base64 is None
+        )
+        try:
+            recalled = await recall_audio(
+                audio_pcm,
+                cfg,
+                sample_rate=audio_sample_rate,
+                want_audio_embeds=want_bypass,
+            )
+            effective_hotwords = recalled.words
+            if want_bypass and recalled.audio_embeds_b64:
+                audio_embeds_b64 = recalled.audio_embeds_b64
+                audio_embeds_uuid = recalled.uuid
+        except Exception as exc:
+            logger.warning("Triton hotword recall failed; using raw ASR audio: %s", exc)
+            effective_hotwords = []
+
     messages = build_primary_messages(
         audio_wav_base64,
-        hotwords=hotwords,
+        hotwords=effective_hotwords,
         enrollment_wav_base64=enrollment_wav_base64,
-        template=prompt_template,
+        audio_embeds_b64=audio_embeds_b64,
+        audio_embeds_uuid=audio_embeds_uuid,
+        template=template,
     )
-    return await _post_chat(
-        messages,
-        base_url=base_url or default_config.vllm_base_url,
-        model_name=model_name or default_config.vllm_model_name,
-        timeout=timeout if timeout is not None else default_config.asr_request_timeout,
-    )
+    request_base_url = base_url or cfg.vllm_base_url
+    request_model_name = model_name or cfg.vllm_model_name
+    request_timeout = timeout if timeout is not None else cfg.asr_request_timeout
+    try:
+        result = await _post_chat(
+            messages,
+            base_url=request_base_url,
+            model_name=request_model_name,
+            timeout=request_timeout,
+        )
+    except Exception:
+        if not audio_embeds_b64:
+            raise
+        logger.warning("Primary ASR audio_embeds request failed; retrying raw audio")
+        fallback_messages = build_primary_messages(
+            audio_wav_base64,
+            hotwords=effective_hotwords,
+            enrollment_wav_base64=enrollment_wav_base64,
+            template=template,
+        )
+        result = await _post_chat(
+            fallback_messages,
+            base_url=request_base_url,
+            model_name=request_model_name,
+            timeout=request_timeout,
+        )
+    if effective_hotwords:
+        result["reported_hotwords"] = effective_hotwords
+    return result
 
 
 async def query_audio_model_secondary(

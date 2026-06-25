@@ -82,13 +82,13 @@ Client                                      Server
 | 字段 | 类型 | 必传 | 说明 |
 |---|---|---|---|
 | payload.audio.audio | String | 是 | base64 编码的 PCM 音频分片 |
-| payload.text.text | String | 否 | 文本类型热词，仅在首帧（status=0）生效，按逗号/顿号/分号/换行切分为热词列表 |
+| payload.text.text | String | 否 | 兼容旧客户端的文本类型热词字段；当前不再驱动 ASR 偏置 |
 
 ### 状态机与音频
 
 | status | 含义 | 服务端处理 |
 |---|---|---|
-| 0 | 首帧 | 建立会话、捕获 traceId、生成 sid、读取热词；若本帧带音频则同时送入 VAD |
+| 0 | 首帧 | 建立会话、捕获 traceId、生成 sid；兼容读取旧热词字段但不用于 ASR 偏置；若本帧带音频则同时送入 VAD |
 | 1 | 中间帧 | 解码音频送入 VAD |
 | 2 | 尾帧 | 先送本帧音频，再 flush 残余音频结束会话 |
 
@@ -145,7 +145,7 @@ ASR 模型组合 / 超时：
 | fusion_min_primary_score | float | 0.55 | 主模型文本质量分达标线，低于则主结果不被单独信任 | 无效 |
 | fusion_max_repetition_ratio | float | 0.35 | 主模型 token 重复率上限，超过判为复读/幻觉风险并回退副模型 | 无效 |
 | fusion_disagreement_threshold | float | 0.55 | 主副分歧度（1−相似度）上限，超过且主热词不占优时判为幻觉风险 | 无效 |
-| fusion_hotword_boost | float | 0.12 | 质量分中每命中一个热词的加分系数，累计封顶 0.35 | 无效 |
+| fusion_hotword_boost | float | 0.12 | 质量分中每命中一个召回热词的加分系数，累计封顶 0.35 | 无效 |
 | fusion_primary_score_margin | float | 0.08 | 主质量分需至少高出副模型该边际，才判定主明显更好 | 无效 |
 
 TS-ASR 注册参数（约束注册接口的时长校验与缓存 TTL）：
@@ -411,5 +411,6 @@ python docs/examples/ws_ast_v3.py sample.wav \
 ## 相关文档
 
 - [API 总览](api-reference.md)
+- [AST v3 多并发性能与极限压测报告](tuling-ast-v3-benchmark.md)
 - [通用流式 ASR WebSocket](transcribe-streaming-protocol.md)
 - [分段情感识别 WebSocket](emotion-segmented-streaming-protocol.md)

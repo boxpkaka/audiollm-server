@@ -1,8 +1,39 @@
 # /tuling/ast/v3 多并发性能与极限压测报告
 
-日期：2026-06-10
+日期：2026-06-10；补测：2026-06-25
 测试脚本：`scripts/bench_tuling_ttft.py`（支持 lhotse manifests / 单 wav 数据源、RTF、尾部时延、并发梯度、错峰起跑）
-原始数据：`bench_results/tuling_astv3_*.json`
+原始数据：`bench_results/tuling_astv3_*.json`、`bench_results/tuling_astv3_123wav_recall_bypass_realtime_c*.json`
+
+## 0. 2026-06-25 热词召回与 encoder bypass 补测
+
+本节使用 `/home/ubuntu/123.wav` 对 `/tuling/ast/v3` 做同相位多路实时压测，用于验证 Triton 热词召回与 encoder bypass 接入后的当前链路。压测前发现 systemd 旧进程未加载 recall 配置字段，已重启 `audiollm-demo` 后重测；下表只记录重启后的有效数据。
+
+| 项目 | 值 |
+|---|---|
+| 端点 | ws://127.0.0.1:8080/tuling/ast/v3，同机回环 |
+| 被测主模型 | AmphionASR-1.7B，vLLM，localhost:8009 |
+| 热词链路 | enable_hotword_recall=true、recall_top_k=50、enable_encoder_bypass=true |
+| Triton 召回服务 | http://localhost:10001，rag_asr_retrieve |
+| 端点策略 | /tuling/ast/v3 primary-only；partial 纯 vLLM raw audio；final 段启用 Triton recall 与 encoder bypass |
+| 公共配置 | primary_asr_timeout=4.0s、http_pool.max_connections=32、silence_duration_ms=1000、pseudo_stream_interval_ms=800 |
+| 测试音频 | /home/ubuntu/123.wav，24 kHz mono WAV，64.63 s；客户端按脚本重采样到 16 kHz mono s16le PCM |
+| 发送参数 | realtime 模式，chunk 128 ms，每路独立 WebSocket，同相位起跑 |
+| 日志检查 | 当前后端 PID 在压测窗口内无 ERROR、Timeout、Traceback、fallback、Unknown defaults |
+
+| 并发 | 成功率 | 首字-体感 p50/p90 (ms) | 首字-协议 p50/p90 (ms) | 首段终稿 p50/p90 (ms) | 尾字 p50/p90 (ms) | 会话收尾 p50/p90 (ms) | 有效吞吐 | wall |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 1/1 | 1829/1829 | 1879/1879 | 3212/3212 | 201/201 | 202/202 | 0.99x | 65.2s |
+| 4 | 4/4 | 1792/1793 | 1842/1843 | 3023/3036 | 236/268 | 236/268 | 3.94x | 65.6s |
+| 8 | 8/8 | 1813/1814 | 1863/1864 | 3065/3115 | 388/460 | 388/460 | 7.85x | 65.8s |
+| 16 | 16/16 | 1839/1841 | 1889/1891 | 3110/3203 | 481/633 | 482/633 | 15.61x | 66.2s |
+| 32 | 32/32 | 1944/1948 | 1994/1998 | 3207/3434 | 1059/1308 | 1060/1308 | 30.76x | 67.2s |
+
+结论：
+
+- 1-32 路同相位实时推流全部成功，无 error 帧、无 final 超时、无 recall/bypass fallback 日志。
+- partial 首字由纯 vLLM raw-audio 路径产生，1-16 路基本稳定在约 1.84-1.89 s；32 路上升到约 1.99 s，退化约 115 ms。
+- final 段启用 recall+bypass 后，尾字时延随同步 final burst 增长：1 路约 201 ms，16 路约 481 ms，32 路约 1.06 s；32 路 p90 约 1.31 s，属于可见但可控的尾部排队。
+- 本轮未继续压到失败边界；容量结论仅覆盖 `/home/ubuntu/123.wav` 同相位 32 路以内，不替代第 5-7 节历史极限压测结论。
 
 ## 1. 测试环境
 
@@ -159,6 +190,14 @@ uv run python scripts/bench_tuling_ttft.py \
 
 # 长音频错峰 N 路（typical case）：加 --stagger-ms 1500
 # 注意：>56 路的档位会触发会话失败风暴，风暴后服务可能需要重启才能恢复
+
+# 2026-06-25 /home/ubuntu/123.wav + Triton recall/bypass 补测
+uv run python scripts/bench_tuling_ttft.py \
+  --url ws://127.0.0.1:8080/tuling/ast/v3 \
+  --wav /home/ubuntu/123.wav \
+  --limit 32 --warmup 0 --send-mode realtime --chunk-ms 128 --concurrency 32 \
+  --final-timeout 120 \
+  --output bench_results/tuling_astv3_123wav_recall_bypass_realtime_c32.json
 ```
 
 ## 10. 数据文件索引
@@ -173,3 +212,4 @@ uv run python scripts/bench_tuling_ttft.py \
 | tuling_astv3_120call_c64_stagger.json | 64 路错峰（口径 B） |
 | tuling_astv3_120call_c96_stagger.json | 96 路错峰（口径 B） |
 | tuling_astv3_120call_c128_stagger.json | 128 路错峰，全失败（口径 B） |
+| tuling_astv3_123wav_recall_bypass_realtime_c1/c4/c8/c16/c32.json | 2026-06-25 /home/ubuntu/123.wav 同相位 realtime 补测，热词召回与 encoder bypass 生效 |
