@@ -26,6 +26,7 @@ from .asr.enrollment import (
     get_enrollment_store,
 )
 from .asr.jobs import get_transcription_job_store
+from .asr.k2.client import close_k2_channels
 from .asr.oneshot import OneshotAsrError, run_oneshot_asr
 from .asr.recall import (
     add_hotwords as add_recall_hotwords,
@@ -46,7 +47,12 @@ from .emotion.service import EmotionDecodeError, decode_wav_capped
 from .emotion_spec.jobs import get_emotion_spec_job_store
 from .http_client import close_client
 from .session import AudioSession
-from .streaming import AstV3Protocol, StreamingSession, VadSegmentedStream
+from .streaming import (
+    AstV3Protocol,
+    K2SegmentedStream,
+    StreamingSession,
+    VadSegmentedStream,
+)
 from .tasks import AsrTaskEngine, EmotionTaskEngine
 from .text_cleanup import clean_asr_text
 from .text_cleanup.client import TextCleanupConfigError
@@ -60,6 +66,7 @@ FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
+    await close_k2_channels()
     await close_client()
 
 
@@ -81,9 +88,10 @@ async def audio_ws(websocket: WebSocket):
 async def transcribe_streaming_ws(websocket: WebSocket, language: str = ""):
     await websocket.accept()
     logger.info("Transcribe-streaming connected (language=%s)", language)
+    cfg = load_config()
     session = StreamingSession(
         websocket,
-        stream=VadSegmentedStream(),
+        stream=K2SegmentedStream() if cfg.k2_enabled else VadSegmentedStream(),
         engine=AsrTaskEngine(),
         language=language,
     )
@@ -125,7 +133,7 @@ async def tuling_ast_v3_ws(websocket: WebSocket):
         astv3_overrides["vllm_prompt_template"] = cfg.astv3_vllm_prompt_template
     session = StreamingSession(
         websocket,
-        stream=VadSegmentedStream(),
+        stream=K2SegmentedStream() if cfg.k2_enabled else VadSegmentedStream(),
         engine=AsrTaskEngine(emit_timing=True),
         protocol=AstV3Protocol(),
         config_overrides=astv3_overrides,

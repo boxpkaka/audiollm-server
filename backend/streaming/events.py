@@ -42,6 +42,18 @@ class PartialSnapshot:
 
 
 @dataclass
+class PartialText:
+    """A ready-to-send partial transcript produced by an upstream stream.
+
+    Unlike :class:`PartialSnapshot`, this already contains text and must not
+    trigger another ASR model call.
+    """
+
+    text: str
+    language: str | None = None
+
+
+@dataclass
 class SpeechStarted:
     """VAD just transitioned silent -> speaking.
 

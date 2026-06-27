@@ -24,8 +24,14 @@ from fastapi import WebSocket, WebSocketDisconnect
 from ..asr.enrollment import get_enrollment_store
 from ..asr.hotword import query_text_hotwords, sanitize_hotwords
 from ..config import Config, load_config
-from .audio_stream import AudioStream
-from .events import PartialSnapshot, SegmentReady, SpeechDropped, SpeechStarted
+from .audio_stream import AudioStream, VadSegmentedStream
+from .events import (
+    PartialSnapshot,
+    PartialText,
+    SegmentReady,
+    SpeechDropped,
+    SpeechStarted,
+)
 from .protocol import ControlAction, NativeProtocol, PcmAction, WireProtocol
 
 if TYPE_CHECKING:
@@ -151,7 +157,16 @@ class StreamingSession:
                 self.ctx.language,
             )
         try:
-            await asyncio.gather(self._receive_loop(), self._work_loop())
+            if await self._start_async_stream_or_fallback():
+                receive_task = asyncio.create_task(self._receive_loop())
+                event_task = asyncio.create_task(self._stream_event_loop())
+                work_task = asyncio.create_task(self._work_loop())
+                await receive_task
+                await event_task
+                await self._work_queue.put(_SENTINEL)
+                await work_task
+            else:
+                await asyncio.gather(self._receive_loop(), self._work_loop())
         except Exception:
             logger.exception("StreamingSession[%s] error", self.engine.name)
         finally:
@@ -169,7 +184,28 @@ class StreamingSession:
             for task in self._extract_tasks:
                 task.cancel()
             await asyncio.gather(*self._extract_tasks, return_exceptions=True)
+        aclose = getattr(self.stream, "aclose", None)
+        if callable(aclose):
+            await aclose()
         logger.info("StreamingSession[%s] ended", self.engine.name)
+
+    async def _start_async_stream_or_fallback(self) -> bool:
+        start = getattr(self.stream, "start", None)
+        if not callable(start):
+            return False
+        try:
+            await start()
+            return True
+        except Exception as exc:
+            if getattr(self.cfg, "k2_fallback_to_local", True):
+                logger.warning(
+                    "Async stream start failed; falling back to local VAD: %s",
+                    exc,
+                )
+                self.stream = VadSegmentedStream()
+                self.stream.configure(self.cfg)
+                return False
+            raise
 
     # ------------------------------------------------------------------
     # IO helpers
@@ -227,9 +263,10 @@ class StreamingSession:
             logger.info("WebSocket disconnected (%s)", self.engine.name)
         finally:
             # Always flush remaining audio so engine sees the tail.
-            for ev in self.stream.flush(force=True):
+            for ev in await self._flush_stream(force=True):
                 await self._dispatch_stream_event(ev)
-            await self._work_queue.put(_SENTINEL)
+            if not callable(getattr(self.stream, "events", None)):
+                await self._work_queue.put(_SENTINEL)
 
     async def _handle_control(self, ctrl: dict) -> bool:
         """Dispatch one already-parsed control message; return True to stop."""
@@ -383,7 +420,7 @@ class StreamingSession:
             return
         self._stopped = True
         logger.info("Stop received (%s), flushing", self.engine.name)
-        for ev in self.stream.flush(force=True):
+        for ev in await self._flush_stream(force=True):
             await self._dispatch_stream_event(ev)
 
     # ------------------------------------------------------------------
@@ -391,7 +428,10 @@ class StreamingSession:
     # ------------------------------------------------------------------
 
     async def _handle_pcm(self, pcm_bytes: bytes) -> None:
-        for ev in self.stream.feed(pcm_bytes):
+        result = self.stream.feed(pcm_bytes)
+        if hasattr(result, "__await__"):
+            result = await result
+        for ev in result:
             await self._dispatch_stream_event(ev)
 
     async def _dispatch_stream_event(self, ev) -> None:
@@ -403,6 +443,8 @@ class StreamingSession:
             self._enqueue_segment(ev)
         elif isinstance(ev, PartialSnapshot):
             self._maybe_launch_partial(ev)
+        elif isinstance(ev, PartialText):
+            await self._safe_partial_text(ev)
         elif isinstance(ev, SpeechStarted):
             await self._safe_speech_start()
         elif isinstance(ev, SpeechDropped):
@@ -428,6 +470,23 @@ class StreamingSession:
             self._ws_closed = True
         except Exception:
             logger.debug("engine.handle_partial failed", exc_info=True)
+
+    async def _safe_partial_text(self, part: PartialText) -> None:
+        text = str(part.text or "").strip()
+        if not text:
+            return
+        try:
+            await self._send_json(
+                {
+                    "type": "partial",
+                    "text": text,
+                    "language": part.language or self.ctx.language,
+                }
+            )
+        except WebSocketDisconnect:
+            self._ws_closed = True
+        except Exception:
+            logger.debug("partial text send failed", exc_info=True)
 
     async def _safe_speech_start(self) -> None:
         try:
@@ -477,3 +536,22 @@ class StreamingSession:
             )
         except Exception:
             logger.exception("engine.on_stop failed")
+
+    async def _flush_stream(self, *, force: bool) -> list:
+        result = self.stream.flush(force=force)
+        if hasattr(result, "__await__"):
+            result = await result
+        return list(result or [])
+
+    async def _stream_event_loop(self) -> None:
+        events = getattr(self.stream, "events", None)
+        if not callable(events):
+            return
+        try:
+            async for ev in events():
+                await self._dispatch_stream_event(ev)
+        except WebSocketDisconnect:
+            self._ws_closed = True
+        except Exception as exc:
+            logger.exception("Async stream event loop failed")
+            await self._send_json({"type": "error", "message": str(exc)})

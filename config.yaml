@@ -67,6 +67,16 @@ defaults:
     enable_pseudo_stream: true
     pseudo_stream_interval_ms: 800
     pseudo_stream_first_partial_ms: 200   # 不变量: <= min_segment_duration_ms
+  k2:
+    k2_enabled: false
+    k2_target: localhost:50051
+    k2_sample_rate: 16000
+    k2_include_token_timestamps: false    # k2 只做纯识别:不取 token timestamps
+    k2_connect_timeout_sec: 5.0
+    k2_fallback_to_local: true
+    k2_max_segment_sec: 30.0              # k2 长时间不出 endpoint 时本地强切兜底
+    k2_preroll_ms: 300                    # 送 LLM final 前 TenVad 修剪的起音预滚
+    k2_idle_keep_ms: 1500                 # 未见 k2 partial 前静音缓冲只保留最近窗口
   asr:
     enable_primary_asr: true
     enable_secondary_asr: true            # 端点未绑 secondary 上游时, 投影强制 false

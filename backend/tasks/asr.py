@@ -142,16 +142,12 @@ class AsrTaskEngine(BaseTaskEngine):
         primary_res: object = None
         secondary_res: object = None
 
-        if cfg.enable_secondary_asr and cfg.enable_primary_asr:
-            secondary_res, primary_res = await self._dual_asr(
-                wav_b64,
-                hw_snapshot,
-                ctx,
-                audio_pcm=None,
-            )
-            if secondary_res is None and primary_res is None:
-                return
-        elif cfg.enable_primary_asr:
+        # Pseudo-streaming is intentionally primary-only when the primary is
+        # online: it should be pure vLLM raw-audio inference, without hotword
+        # recall/bypass and without the secondary noise gate suppressing short
+        # early snapshots. The secondary remains a fallback for deployments that
+        # turn the primary off.
+        if cfg.enable_primary_asr:
             primary_res = await asyncio.wait_for(
                 query_audio_model(
                     wav_b64,
@@ -187,8 +183,8 @@ class AsrTaskEngine(BaseTaskEngine):
         if primary_result is None and secondary_result is None:
             return
 
-        # Noise gate: if secondary is enabled and produced empty text, skip.
-        if cfg.enable_secondary_asr:
+        # Noise gate only applies when secondary is the actual partial source.
+        if secondary_result is not None and primary_result is None:
             sec_text = str(
                 (secondary_result or {}).get("transcription") or ""
             ).strip()

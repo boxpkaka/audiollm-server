@@ -165,7 +165,10 @@ class AudioSession:
             now = time.monotonic()
             if now - self._last_partial_time >= self._pseudo_stream_interval:
                 snapshot = self.vad.snapshot_incomplete_speech()
-                if snapshot is not None and len(snapshot) >= MIN_SEGMENT_SAMPLES:
+                partial_min_samples = int(
+                    SAMPLE_RATE * default_config.pseudo_stream_first_partial_ms / 1000
+                )
+                if snapshot is not None and len(snapshot) >= partial_min_samples:
                     if self._partial_task is None or self._partial_task.done():
                         self._last_partial_time = now
                         self._partial_seq += 1
@@ -347,13 +350,10 @@ class AudioSession:
     ) -> None:
         """Emit a rolling partial using whichever decoder(s) are online.
 
-        - Both on  : run in parallel; secondary acts as a noise gate
-                     (primary tends to hallucinate on near-silence), and
-                     the partial text comes from primary so hotwords /
-                     language / target-speaker prompts apply.
-        - Primary only : no noise gate; better to leak an occasional
-                         hallucinated partial than to have the live
-                         caption go completely silent.
+        - Primary on : use primary only. Pseudo-streaming is expected to be
+                       pure vLLM raw-audio inference; using the secondary as
+                       an early-snapshot noise gate suppressed too many short
+                       real speech partials in the browser demo.
         - Secondary only : use the secondary text directly. It is
                            weaker (no hotwords / TS), but still useful
                            as a live caption when primary is offline.
@@ -377,7 +377,7 @@ class AudioSession:
                         runtime_config=default_config,
                     )
                 )
-            if default_config.enable_secondary_asr:
+            elif default_config.enable_secondary_asr:
                 secondary_task = asyncio.create_task(
                     query_audio_model_secondary(wav_b64)
                 )
@@ -388,11 +388,9 @@ class AudioSession:
                 secondary_text = str(
                     (secondary_res or {}).get("transcription") or ""
                 ).strip()
-                # When secondary is the gate (primary present) or the
-                # sole source, an empty result means "silence" — skip.
+                # When secondary is the sole source, an empty result means
+                # "silence" — skip.
                 if not secondary_text:
-                    if primary_task is not None:
-                        primary_task.cancel()
                     return
 
             if primary_task is not None:
@@ -406,22 +404,18 @@ class AudioSession:
             if not text:
                 return
 
-            # Utterance lifecycle gate: _enqueue_segment zeroes out
-            # _utterance_id when the final segment goes into the ASR
-            # queue (and a fresh speech burst would set it to a *new*
-            # id). Either way, an inflight partial whose utterance no
-            # longer matches is racing the final response — letting it
-            # through flips the bubble back to "streaming" on the client
-            # and silently overwrites the finalized text. This is the
-            # only point where we can serialize partial/final because the
-            # async task creation-to-completion interval is not lockable.
+            # _enqueue_segment zeroes out _utterance_id as soon as the final
+            # segment enters the ASR queue, but the final text may still take a
+            # while. Let a racing partial through so short utterances can show
+            # live text during that final wait. The browser now marks finalized
+            # utterances with seq=Infinity, so any truly late partial arriving
+            # after final is dropped client-side instead of regressing the UI.
             if self._utterance_id != utterance_id:
                 logger.debug(
-                    "Drop stale partial for %s seq=%s (utterance finalized)",
+                    "Emit racing partial for %s seq=%s (utterance finalized)",
                     utterance_id,
                     seq,
                 )
-                return
 
             await self._send_json(
                 {

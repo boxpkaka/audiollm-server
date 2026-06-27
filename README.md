@@ -335,6 +335,24 @@ SERVICE=my-demo scripts/restart_service.sh   # 指定其他 systemd 服务名
 | `pseudo_stream_interval_ms` | int | `500` | 伪流式输出的最小间隔（毫秒），值越小更新越频繁；仅节流首个之后的刷新，不影响首字 |
 | `pseudo_stream_first_partial_ms` | int | `200` | 每段语音首个 partial（伪流式中间结果）的触发门槛，从 `min_segment_duration_ms` 解耦（dataclass 兜底 350，config.yaml 默认设 200 走低延迟）；与 `vad_start_frames` 按 max 决定首字延迟 |
 
+#### k2 流式 ASR partial
+
+`/transcribe-streaming` 与 `/tuling/ast/v3` 可通过 `defaults.k2.k2_enabled=true` 接入外部 k2 gRPC 流式 ASR 服务。k2 只做纯识别：只接收 16 kHz mono PCM_S16LE 音频，不接热词、不接目标说话人注册、不返回 token timestamps。它的 partial 直接下发给客户端；final 仍由本服务的 LLM ASR 路径产生，因此热词召回、目标说话人过滤、ITN、车牌规范化与双模型融合只作用于 final。
+
+| 参数 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `k2_enabled` | bool | `false` | 是否启用 k2 替代本地伪流式 partial；仅影响 `/transcribe-streaming` 与 `/tuling/ast/v3` |
+| `k2_target` | string | `localhost:50051` | k2 gRPC 服务地址，服务端配置，不可客户端覆写 |
+| `k2_sample_rate` | int | `16000` | k2 期望采样率；启动时会通过 ServerInfo 校验 |
+| `k2_include_token_timestamps` | bool | `false` | 当前固定不启用，保留为显式配置 |
+| `k2_connect_timeout_sec` | float | `5.0` | k2 ServerInfo / 建连探测超时 |
+| `k2_fallback_to_local` | bool | `true` | k2 启动失败时回退本地 VAD + 伪流式 |
+| `k2_max_segment_sec` | float | `30.0` | k2 长时间不返回 endpoint 时本地强切上限，防止缓冲无限增长 |
+| `k2_preroll_ms` | int | `300` | k2 段送入 LLM final 前,本地 TenVad 修剪时保留的起音预滚 |
+| `k2_idle_keep_ms` | int | `1500` | k2 尚未返回 partial 前，静音期本地缓冲只保留最近窗口 |
+
+k2 模式下,切段权威是 k2 的 endpoint,`silence_duration_ms` / `vad_start_frames` / `pseudo_stream_interval_ms` / `pseudo_stream_first_partial_ms` 不再决定这两个端点的切点或首字时机；`enable_pseudo_stream=false` 仍会抑制 partial 下发。浏览器 Demo `/ws/audio` 仍走 legacy `backend/session.py`,不受 k2 配置影响。
+
 #### 文本规范化 (ITN / 车牌)
 
 final 转写默认做逆文本规范化（口语数字→阿拉伯数字）与车牌格式规范化；partial 保持口语形式不变（避免抖动）。通用 ITN 由本地 wetext 实现（不依赖 pynini、不联网），车牌层为零依赖正则。两者仅作用于 final，且任何异常都回退原文，不影响 ASR 主流程。

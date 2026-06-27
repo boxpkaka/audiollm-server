@@ -34,7 +34,8 @@ from backend.streaming.audio_stream import (  # noqa: E402
     VadSegmentedStream,
     WholeUtteranceStream,
 )
-from backend.streaming.events import PartialSnapshot, SegmentReady  # noqa: E402
+from backend.streaming.events import PartialSnapshot, PartialText, SegmentReady  # noqa: E402
+from backend.streaming.k2_stream import K2SegmentedStream  # noqa: E402
 from backend.streaming.protocol import (  # noqa: E402
     AstV3Protocol,
     ControlAction,
@@ -242,6 +243,76 @@ def test_partial_floor_still_blocks_too_short_snapshot():
     assert not any(isinstance(e, PartialSnapshot) for e in events)
 
 
+def test_k2_segment_trim_uses_preroll_and_drops_silence(monkeypatch):
+    stream = K2SegmentedStream()
+    cfg = load_config().override(
+        k2_preroll_ms=100,
+        min_segment_duration_ms=200,
+        vad_keep_tail_ms=40,
+    )
+    stream.configure(cfg)
+    hop = VadSegmentedStream().vad.hop_size
+    monkeypatch.setattr(stream, "_vad_speech_spans", lambda _pcm: [(20 * hop, 60 * hop)])
+
+    raw = _silent_pcm_bytes(hop * 80)
+    trimmed = stream._trim_segment(raw, base_sample=1000)
+
+    assert trimmed is not None
+    pcm, start_sample, end_sample = trimmed
+    assert pcm.dtype == np.float32
+    assert start_sample == 1000 + max(0, 20 * hop - int(SAMPLE_RATE * 0.1))
+    assert end_sample <= 1000 + hop * 80
+
+    monkeypatch.setattr(stream, "_vad_speech_spans", lambda _pcm: [])
+    assert stream._trim_segment(raw, base_sample=0) is None
+
+
+def test_k2_idle_buffer_is_bounded_before_first_partial():
+    stream = K2SegmentedStream()
+    cfg = load_config().override(k2_idle_keep_ms=100, k2_max_segment_sec=0)
+    stream.configure(cfg)
+
+    stream.feed(_silent_pcm_bytes(SAMPLE_RATE))
+
+    keep_bytes = int(SAMPLE_RATE * 0.1) * 2
+    assert len(stream._buffer) == keep_bytes
+    assert stream._buffer_start_sample == SAMPLE_RATE - int(SAMPLE_RATE * 0.1)
+
+
+def test_k2_idle_buffer_preserves_fast_fed_speech():
+    stream = K2SegmentedStream()
+    cfg = load_config().override(
+        k2_idle_keep_ms=100,
+        k2_max_segment_sec=0,
+        vad_start_frames=1,
+        vad_threshold=0.1,
+    )
+    stream.configure(cfg)
+
+    stream.feed(_tone_pcm_bytes(SAMPLE_RATE))
+
+    assert stream._idle_seen_speech is True
+    assert len(stream._buffer) == SAMPLE_RATE * 2
+    assert stream._buffer_start_sample == 0
+
+
+def test_k2_force_cut_emits_segment(monkeypatch):
+    stream = K2SegmentedStream()
+    cfg = load_config().override(k2_max_segment_sec=0.01, k2_idle_keep_ms=0)
+    stream.configure(cfg)
+
+    def fake_trim(_raw, base_sample):
+        return np.ones(160, dtype=np.float32), base_sample, base_sample + 160
+
+    monkeypatch.setattr(stream, "_trim_segment", fake_trim)
+    stream.feed(_silent_pcm_bytes(320))
+
+    ev = stream._event_q.get_nowait()
+    assert isinstance(ev, SegmentReady)
+    assert ev.pcm.shape == (160,)
+    assert len(stream._buffer) == 0
+
+
 # ---------------------------------------------------------------------------
 # Session tests with a fake engine
 # ---------------------------------------------------------------------------
@@ -296,6 +367,50 @@ class _ScriptedStream:
         return list(self._flush_events) if force else []
 
 
+class _AsyncScriptedStream:
+    """Async stream fake that emits ready-to-send k2-style events."""
+
+    def __init__(self):
+        self.cfg = None
+        self.started = False
+        self.feed_calls: list[bytes] = []
+        self.flush_calls: list[bool] = []
+        self._events: asyncio.Queue = asyncio.Queue()
+
+    def configure(self, cfg):
+        self.cfg = cfg
+
+    async def start(self):
+        self.started = True
+
+    def feed(self, pcm_bytes):
+        self.feed_calls.append(pcm_bytes)
+        self._events.put_nowait(PartialText(text="k2 partial"))
+        self._events.put_nowait(
+            SegmentReady(
+                pcm=np.ones(400, dtype=np.float32) * 0.1,
+                start_ms=10.0,
+                end_ms=35.0,
+            )
+        )
+        return []
+
+    async def events(self):
+        while True:
+            ev = await self._events.get()
+            if ev is None:
+                break
+            yield ev
+
+    async def flush(self, *, force):
+        self.flush_calls.append(force)
+        self._events.put_nowait(None)
+        return []
+
+    async def aclose(self):
+        return None
+
+
 @pytest.mark.asyncio
 async def test_session_dispatches_start_pcm_segment_and_stop():
     seg = SegmentReady(pcm=np.ones(800, dtype=np.float32) * 0.1)
@@ -320,6 +435,28 @@ async def test_session_dispatches_start_pcm_segment_and_stop():
     assert engine.segments[0].pcm.shape == (800,)
     assert engine.stop_calls == [(True, True)]
     assert stream.flush_calls and stream.flush_calls[-1] is True
+
+
+@pytest.mark.asyncio
+async def test_session_dispatches_async_partial_text_and_segment():
+    stream = _AsyncScriptedStream()
+    engine = _RecorderEngine()
+    ws = FakeWebSocket([
+        {"text": '{"type":"start","sample_rate_hz":16000,"channels":1}'},
+        {"bytes": _silent_pcm_bytes(160)},
+        {"text": '{"type":"stop"}'},
+    ])
+
+    session = StreamingSession(ws, stream=stream, engine=engine)
+    await session.run()
+    await session.cleanup()
+
+    assert stream.started is True
+    assert stream.flush_calls and stream.flush_calls[-1] is True
+    assert any(m == {"type": "partial", "text": "k2 partial", "language": ""} for m in ws.sent)
+    assert any(m.get("type") == "ack" for m in ws.sent)
+    assert len(engine.segments) == 1
+    assert engine.partials == []  # PartialText must not call handle_partial/vLLM.
 
 
 @pytest.mark.asyncio
@@ -620,7 +757,11 @@ async def test_asr_partial_uses_pure_vllm_without_recall_or_hotwords(monkeypatch
             "detected_language": "zh",
         }
 
+    async def fail_secondary(*_args, **_kwargs):
+        raise AssertionError("partial should use primary-only pure vLLM")
+
     monkeypatch.setattr(asr_task_mod, "query_audio_model", fake_query_audio_model)
+    monkeypatch.setattr(asr_task_mod, "query_audio_model_secondary", fail_secondary)
 
     sent: list[dict] = []
 
@@ -630,7 +771,7 @@ async def test_asr_partial_uses_pure_vllm_without_recall_or_hotwords(monkeypatch
 
     cfg = load_config().override(
         enable_primary_asr=True,
-        enable_secondary_asr=False,
+        enable_secondary_asr=True,
         enable_hotword_recall=True,
         enable_encoder_bypass=True,
     )

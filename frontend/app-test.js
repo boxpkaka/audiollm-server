@@ -60,11 +60,10 @@
 
     // --- Hotword state ---
     let hotwords = [];
-    let hotwordEnabled = localStorage.getItem('hotword_enabled') !== '0';
+    let hotwordPoolTotal = 0;
 
     const SYNC_PILL_BASE = 'status-pill';
-    const HOTWORD_BUCKETS = ['auto', 'chinese', 'english', 'indonesian', 'thai'];
-    const HOTWORDS_PER_LANG_MIGRATED = 'hotwords_per_lang_migrated';
+    const HOTWORD_POOL_LIMIT = 1000;
     const UI_TO_API_LANG = {
       auto: 'N/A',
       chinese: 'Chinese',
@@ -73,48 +72,12 @@
       thai: 'Thai',
     };
 
-    function migrateLegacyHotwords() {
-      if (localStorage.getItem(HOTWORDS_PER_LANG_MIGRATED) === '1') return;
-      const legacy = localStorage.getItem('hotwords');
-      if (legacy) {
-        try {
-          const arr = JSON.parse(legacy);
-          if (Array.isArray(arr)) {
-            HOTWORD_BUCKETS.forEach((b) => {
-              if (localStorage.getItem(`hotwords_${b}`) === null) {
-                localStorage.setItem(`hotwords_${b}`, JSON.stringify(arr));
-              }
-            });
-          }
-        } catch {
-          /* ignore */
-        }
-      }
-      localStorage.setItem(HOTWORDS_PER_LANG_MIGRATED, '1');
-    }
-
-    function readHotwordBucket(langForUi) {
-      const raw = localStorage.getItem(`hotwords_${langForUi}`);
-      if (raw === null) return [];
-      try {
-        const arr = JSON.parse(raw);
-        return Array.isArray(arr) ? arr : [];
-      } catch {
-        return [];
-      }
-    }
-
-    function writeHotwordBucket(langForUi, words) {
-      localStorage.setItem(`hotwords_${langForUi}`, JSON.stringify(words));
-    }
-
     function apiLangFromUi(langForUi) {
       return UI_TO_API_LANG[langForUi] || 'N/A';
     }
 
-    migrateLegacyHotwords();
     let srcLangUi = localStorage.getItem('asr_src_lang') || 'auto';
-    if (!HOTWORD_BUCKETS.includes(srcLangUi)) srcLangUi = 'auto';
+    if (!Object.prototype.hasOwnProperty.call(UI_TO_API_LANG, srcLangUi)) srcLangUi = 'auto';
 
     // --- DOM refs ---
     const micBtn = document.getElementById('mic-btn');
@@ -126,6 +89,7 @@
     const hotwordAddBtn = document.getElementById('hotword-add-btn');
     const hotwordList = document.getElementById('hotword-list');
     const hotwordClearBtn = document.getElementById('hotword-clear-btn');
+    const hotwordReloadBtn = document.getElementById('hotword-reload-btn');
     const hotwordEnabledInput = document.getElementById('hotword-enabled');
     const hotwordSyncStatus = document.getElementById('hotword-sync-status');
     const hotwordCount = document.getElementById('hotword-count');
@@ -189,93 +153,181 @@
         tag.querySelector('button').addEventListener('click', () => removeHotword(idx));
         hotwordList.appendChild(tag);
       });
-      setDynText(hotwordCount, 'asr.hotword.count', { n: hotwords.length });
+      const total = Math.max(hotwordPoolTotal, hotwords.length);
+      const key = total > hotwords.length ? 'asr.hotword.countShown' : 'asr.hotword.count';
+      setDynText(hotwordCount, key, { n: hotwords.length, total });
     }
 
-    function getEffectiveHotwords() {
-      return hotwordEnabled ? hotwords : [];
-    }
-
-    // Hotwords are applied per-session on the AST v3 first frame, so there is
-    // no live sync channel. The pill just reflects whether hotwords will be
-    // sent on the next recording.
     function refreshHotwordStatus() {
       if (!hotwordSyncStatus) return;
       hotwordSyncStatus.className = SYNC_PILL_BASE;
-      const key = hotwordEnabled ? 'asr.sync.active' : 'asr.sync.paused';
-      setDynText(hotwordSyncStatus, key);
-      hotwordSyncStatus.dataset.state = hotwordEnabled ? 'ready' : 'waiting';
+      setDynText(hotwordSyncStatus, 'asr.sync.poolActive');
+      hotwordSyncStatus.dataset.state = 'ready';
     }
 
-    function saveAndSyncHotwords() {
-      hotwords = sanitizeHotwords(hotwords);
-      writeHotwordBucket(srcLangUi, hotwords);
-      localStorage.setItem('hotwords', JSON.stringify(hotwords));
-      renderHotwords();
-      refreshHotwordStatus();
+    function setHotwordPoolBusy(busy) {
+      [hotwordAddBtn, hotwordClearBtn, hotwordReloadBtn].forEach((btn) => {
+        if (btn) btn.disabled = busy;
+      });
     }
 
-    function addHotword(text) {
+    async function readJsonResponse(resp) {
+      let payload = null;
+      try {
+        payload = await resp.json();
+      } catch {
+        payload = null;
+      }
+      if (!resp.ok) {
+        const detail = payload && (payload.detail || payload.message);
+        throw new Error(typeof detail === 'string' ? detail : `HTTP ${resp.status}`);
+      }
+      return payload || {};
+    }
+
+    async function loadHotwordPool() {
+      if (hotwordSyncStatus) {
+        hotwordSyncStatus.className = SYNC_PILL_BASE;
+        setDynText(hotwordSyncStatus, 'asr.sync.waiting');
+        hotwordSyncStatus.dataset.state = 'waiting';
+      }
+      try {
+        const resp = await fetch(`/api/asr/hotword-pool?limit=${HOTWORD_POOL_LIMIT}`);
+        const payload = await readJsonResponse(resp);
+        hotwords = sanitizeHotwords(payload.hotwords || []);
+        hotwordPoolTotal = Number(payload.total_count || hotwords.length);
+        renderHotwords();
+        refreshHotwordStatus();
+      } catch (err) {
+        if (hotwordSyncStatus) {
+          hotwordSyncStatus.className = SYNC_PILL_BASE;
+          setDynText(hotwordSyncStatus, 'asr.sync.offline');
+          hotwordSyncStatus.dataset.state = 'offline';
+        }
+        if (hotwordExtractStatus) {
+          hotwordExtractStatus.textContent = t('asr.hotword.poolError', {
+            msg: err && err.message ? err.message : String(err),
+          });
+          hotwordExtractStatus.classList.add('is-error');
+        }
+      }
+    }
+
+    async function mutateHotwordPool(method, words) {
+      const clean = sanitizeHotwords(words);
+      if (clean.length === 0) return;
+      setHotwordPoolBusy(true);
+      try {
+        const resp = await fetch('/api/asr/hotword-pool', {
+          method,
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ hotwords: clean }),
+        });
+        await readJsonResponse(resp);
+        await loadHotwordPool();
+      } finally {
+        setHotwordPoolBusy(false);
+      }
+    }
+
+    async function reloadHotwordPool() {
+      setHotwordPoolBusy(true);
+      try {
+        const resp = await fetch('/api/asr/hotword-pool/reload', { method: 'POST' });
+        await readJsonResponse(resp);
+        await loadHotwordPool();
+        if (hotwordExtractStatus) {
+          hotwordExtractStatus.textContent = t('asr.hotword.reloaded');
+          hotwordExtractStatus.className = 'hotword-extract-status is-success';
+        }
+      } finally {
+        setHotwordPoolBusy(false);
+      }
+    }
+
+    async function addHotword(text) {
       const words = text
         .split(/[,，\n]/)
         .map((w) => w.trim())
         .filter((w) => w && !hotwords.includes(w));
       if (words.length === 0) return;
-      hotwords.push(...words);
-      saveAndSyncHotwords();
+      try {
+        await mutateHotwordPool('POST', words);
+      } catch (err) {
+        showHotwordPoolError(err);
+      }
     }
 
-    function removeHotword(idx) {
-      hotwords.splice(idx, 1);
-      saveAndSyncHotwords();
+    async function removeHotword(idx) {
+      const word = hotwords[idx];
+      if (!word) return;
+      try {
+        await mutateHotwordPool('DELETE', [word]);
+      } catch (err) {
+        showHotwordPoolError(err);
+      }
     }
 
-    function clearHotwords() {
-      hotwords = [];
-      saveAndSyncHotwords();
+    async function clearHotwords() {
+      if (hotwords.length === 0) return;
+      if (!window.confirm(t('asr.hotword.confirmClear', { n: hotwords.length }))) return;
+      try {
+        await mutateHotwordPool('DELETE', hotwords);
+      } catch (err) {
+        showHotwordPoolError(err);
+      }
+    }
+
+    function showHotwordPoolError(err) {
+      if (hotwordSyncStatus) {
+        hotwordSyncStatus.className = SYNC_PILL_BASE;
+        setDynText(hotwordSyncStatus, 'asr.sync.offline');
+        hotwordSyncStatus.dataset.state = 'offline';
+      }
+      if (hotwordExtractStatus) {
+        hotwordExtractStatus.textContent = t('asr.hotword.poolError', {
+          msg: err && err.message ? err.message : String(err),
+        });
+        hotwordExtractStatus.className = 'hotword-extract-status is-error';
+      }
     }
 
     hotwordAddBtn.addEventListener('click', () => {
-      addHotword(hotwordInput.value);
+      void addHotword(hotwordInput.value);
       hotwordInput.value = '';
     });
 
     hotwordInput.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
         e.preventDefault();
-        addHotword(hotwordInput.value);
+        void addHotword(hotwordInput.value);
         hotwordInput.value = '';
       }
     });
 
-    hotwordClearBtn.addEventListener('click', clearHotwords);
+    hotwordClearBtn.addEventListener('click', () => { void clearHotwords(); });
+    if (hotwordReloadBtn) {
+      hotwordReloadBtn.addEventListener('click', () => {
+        reloadHotwordPool().catch(showHotwordPoolError);
+      });
+    }
 
-    hotwordEnabledInput.checked = hotwordEnabled;
-    hotwordEnabledInput.addEventListener('change', () => {
-      hotwordEnabled = hotwordEnabledInput.checked;
-      localStorage.setItem('hotword_enabled', hotwordEnabled ? '1' : '0');
-      refreshHotwordStatus();
-    });
+    hotwordEnabledInput.checked = true;
+    hotwordEnabledInput.disabled = true;
+    hotwordEnabledInput.closest('label')?.setAttribute('title', t('asr.hotword.poolManaged'));
 
     if (asrLangSelect) {
       asrLangSelect.value = srcLangUi;
       asrLangSelect.addEventListener('change', () => {
         const next = asrLangSelect.value;
-        if (!HOTWORD_BUCKETS.includes(next)) return;
-        writeHotwordBucket(srcLangUi, sanitizeHotwords(hotwords));
+        if (!Object.prototype.hasOwnProperty.call(UI_TO_API_LANG, next)) return;
         srcLangUi = next;
         localStorage.setItem('asr_src_lang', srcLangUi);
-        hotwords = sanitizeHotwords(readHotwordBucket(srcLangUi));
-        localStorage.setItem('hotwords', JSON.stringify(hotwords));
-        renderHotwords();
-        refreshHotwordStatus();
       });
     }
 
-    hotwords = sanitizeHotwords(readHotwordBucket(srcLangUi));
-    localStorage.setItem('hotwords', JSON.stringify(hotwords));
     renderHotwords();
-    refreshHotwordStatus();
+    void loadHotwordPool();
 
     // --- Disable AST v3-unsupported controls (kept in DOM, greyed out) ---
     function disableUnsupported() {
@@ -343,10 +395,6 @@
         },
         payload: { audio: { audio: '' } },
       };
-      const hw = getEffectiveHotwords();
-      if (hw.length) {
-        frame.payload.text = { text: hw.join(',') };
-      }
       ws.send(JSON.stringify(frame));
     }
 
@@ -534,14 +582,11 @@
         showShimmer(content, false);
         const textEl = content.querySelector('.bubble-text');
         const finalText = text || '';
-        const wordsForHighlight = Array.from(new Set(getEffectiveHotwords()));
-
         textEl.removeAttribute('data-dyn-key');
         textEl.removeAttribute('data-dyn-vars');
         textEl.style.fontStyle = '';
         textEl.style.color = '';
         setBubbleText(textEl, finalText);
-        applyHotwordHighlights(textEl, finalText, wordsForHighlight);
       } else if (status === 'error') {
         showShimmer(content, false);
         const body = content.querySelector('.bubble-content');

@@ -166,6 +166,24 @@ class Config:
     enable_pseudo_stream: bool = True
     pseudo_stream_interval_ms: int = 500
 
+    # ---- ASR: k2 streaming recognizer for partials / endpoint authority ----
+    # k2 is an external gRPC streaming ASR service. In this integration it is
+    # deliberately plain recognition only: no hotwords, no target-speaker
+    # enrollment, no token timestamps. Its partial text replaces local
+    # pseudo-streaming, while final text still comes from the LLM ASR pipeline.
+    k2_enabled: bool = False
+    k2_target: str = ""
+    k2_sample_rate: int = SAMPLE_RATE
+    k2_include_token_timestamps: bool = False
+    k2_connect_timeout_sec: float = 5.0
+    k2_fallback_to_local: bool = True
+    # Local assembly guards around the k2 endpoint authority. These keep the
+    # LLM segment clean and bounded without letting local VAD decide when a
+    # sentence ends.
+    k2_max_segment_sec: float = 30.0
+    k2_preroll_ms: int = 300
+    k2_idle_keep_ms: int = 1500
+
     # ---- ASR: target speaker enrollment ----------------------------------
     # When a target-speaker enrollment is uploaded the primary ASR prompt
     # switches to a two-audio shape (enrollment first, target second). The
@@ -336,6 +354,16 @@ class Config:
             object.__setattr__(
                 self, "pseudo_stream_first_partial_ms", self.min_segment_duration_ms
             )
+        if self.k2_enabled and not self.k2_target.strip():
+            object.__setattr__(self, "k2_enabled", False)
+        if self.k2_sample_rate <= 0:
+            object.__setattr__(self, "k2_sample_rate", SAMPLE_RATE)
+        if self.k2_max_segment_sec < 0:
+            object.__setattr__(self, "k2_max_segment_sec", 0.0)
+        if self.k2_preroll_ms < 0:
+            object.__setattr__(self, "k2_preroll_ms", 0)
+        if self.k2_idle_keep_ms < 0:
+            object.__setattr__(self, "k2_idle_keep_ms", 0)
 
     @property
     def resolved_text_cleanup_api_key(self) -> str:
@@ -725,6 +753,8 @@ def _parse(raw: dict[str, Any]) -> ParsedConfig:
             "enable_dual_asr_fusion=true requires enable_secondary_asr=true; "
             "downgrading fusion to false"
         )
+    if defaults.get("k2_enabled") and not str(defaults.get("k2_target", "")).strip():
+        logger.warning("k2_enabled=true requires k2_target; downgrading k2 to false")
 
     base = _project_base(
         upstreams=upstreams,

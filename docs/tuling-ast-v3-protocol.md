@@ -104,6 +104,8 @@ Client                                      Server
 
 可覆写字段与 `/transcribe-streaming` 的 `start.config` 共用同一白名单（`backend/config.py` 的 `CLIENT_OVERRIDABLE_FIELDS`）。下面按类别逐字段说明语义：默认列为服务端 `config.yaml` 当前生效值，本端点列标注该字段在 AST v3 是否产生可观察效果（本端点恒为 primary-only，副模型与融合相关字段即使传入也不生效）。
 
+当服务端启用 `k2_enabled=true` 时，本端点的 `Progressive` 中间结果来自外部 k2 流式 ASR，`sentence` 终稿仍由本服务 LLM ASR 产生。k2 只做纯识别，不接热词、不接 `header.resIdList` 目标说话人、不返回 token timestamps；热词召回、目标说话人过滤、ITN 与车牌规范化只作用于 sentence。此时切段权威是 k2 endpoint，VAD 与伪流式间隔类覆写仍会被接受但不再决定切点或首字时机；`enable_pseudo_stream=false` 仍会抑制 Progressive 下发。
+
 VAD / 分段（凡按帧计的字段，其帧时长由 VAD 后端 hop 决定：ten-vad 约 16 ms/帧，能量兜底约 10 ms/帧）：
 
 | 字段 | 类型 | 默认 | 含义 | 本端点 |

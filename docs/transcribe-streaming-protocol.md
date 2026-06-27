@@ -184,6 +184,8 @@ Client                                      Server
 
 `start.config` 仅对当前连接生效、不落盘，只接受扁平字段名。覆写字段受服务端白名单（`backend/config.py` 的 `CLIENT_OVERRIDABLE_FIELDS`）约束：白名单外字段（如模型地址 `*_vllm_base_url`、密钥、连接池/队列等基础设施项）、未知字段与非法值都会被忽略并保持服务端默认，不会中断连接。完整白名单与 `/tuling/ast/v3` 的 `parameter.asr_config` 共用，按类别速览见 [API 总览](api-reference.md) 的“临时配置覆写”。
 
+当服务端启用 `k2_enabled=true` 时，本端点的 partial 来自外部 k2 流式 ASR，final 仍由本服务 LLM ASR 产生。k2 只做纯识别，不接热词、不接目标说话人、不返回 token timestamps；热词召回、目标说话人过滤与文本规范化只作用于 final。此时切段权威是 k2 endpoint，VAD 与伪流式间隔类覆写仍会被接受但不再决定切点或首字时机；`enable_pseudo_stream=false` 仍会抑制 partial 下发。
+
 对本端点有效的常用字段：
 
 | 字段 | 类型 | 说明 |
