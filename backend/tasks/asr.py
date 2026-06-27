@@ -54,7 +54,7 @@ class AsrTaskEngine(BaseTaskEngine):
         # we save one vLLM call per segment by running primary-only.
         if cfg.enable_dual_asr_fusion:
             secondary_res, primary_res = await self._dual_asr(
-                wav_b64, hw_snapshot, ctx
+                wav_b64, hw_snapshot, ctx, audio_pcm=segment
             )
             if secondary_res is None and primary_res is None:
                 return False
@@ -64,11 +64,14 @@ class AsrTaskEngine(BaseTaskEngine):
                     wav_b64,
                     hotwords=hw_snapshot,
                     src_lang=ctx.src_lang,
+                    audio_pcm=segment,
+                    audio_sample_rate=SAMPLE_RATE,
                     enrollment_wav_base64=ctx.enrollment_b64,
                     base_url=cfg.vllm_base_url,
                     model_name=cfg.vllm_model_name,
                     prompt_template=cfg.vllm_prompt_template,
                     timeout=cfg.asr_request_timeout,
+                    runtime_config=cfg,
                 ),
                 timeout=cfg.primary_asr_timeout,
             )
@@ -139,23 +142,25 @@ class AsrTaskEngine(BaseTaskEngine):
         primary_res: object = None
         secondary_res: object = None
 
-        if cfg.enable_secondary_asr and cfg.enable_primary_asr:
-            secondary_res, primary_res = await self._dual_asr(
-                wav_b64, hw_snapshot, ctx
-            )
-            if secondary_res is None and primary_res is None:
-                return
-        elif cfg.enable_primary_asr:
+        # Pseudo-streaming is intentionally primary-only when the primary is
+        # online: it should be pure vLLM raw-audio inference, without hotword
+        # recall/bypass and without the secondary noise gate suppressing short
+        # early snapshots. The secondary remains a fallback for deployments that
+        # turn the primary off.
+        if cfg.enable_primary_asr:
             primary_res = await asyncio.wait_for(
                 query_audio_model(
                     wav_b64,
-                    hotwords=hw_snapshot,
+                    hotwords=[],
                     src_lang=ctx.src_lang,
+                    audio_pcm=None,
+                    audio_sample_rate=SAMPLE_RATE,
                     enrollment_wav_base64=ctx.enrollment_b64,
                     base_url=cfg.vllm_base_url,
                     model_name=cfg.vllm_model_name,
                     prompt_template=cfg.vllm_prompt_template,
                     timeout=cfg.asr_request_timeout,
+                    runtime_config=cfg,
                 ),
                 timeout=cfg.primary_asr_timeout,
             )
@@ -178,8 +183,8 @@ class AsrTaskEngine(BaseTaskEngine):
         if primary_result is None and secondary_result is None:
             return
 
-        # Noise gate: if secondary is enabled and produced empty text, skip.
-        if cfg.enable_secondary_asr:
+        # Noise gate only applies when secondary is the actual partial source.
+        if secondary_result is not None and primary_result is None:
             sec_text = str(
                 (secondary_result or {}).get("transcription") or ""
             ).strip()
@@ -188,7 +193,7 @@ class AsrTaskEngine(BaseTaskEngine):
                 return
 
         text, _ = self._select_text(
-            primary_result, secondary_result, hw_snapshot, ctx
+            primary_result, secondary_result, [], ctx
         )
 
         elapsed = time.monotonic() - t0
@@ -240,6 +245,8 @@ class AsrTaskEngine(BaseTaskEngine):
         wav_b64: str,
         hw_snapshot: list[str],
         ctx: SessionContext,
+        *,
+        audio_pcm=None,
     ) -> tuple:
         cfg = ctx.cfg
         secondary_task = asyncio.create_task(
@@ -257,13 +264,16 @@ class AsrTaskEngine(BaseTaskEngine):
                 asyncio.wait_for(
                     query_audio_model(
                         wav_b64,
-                        hotwords=hw_snapshot,
+                        hotwords=hw_snapshot if audio_pcm is not None else [],
                         src_lang=ctx.src_lang,
+                        audio_pcm=audio_pcm,
+                        audio_sample_rate=SAMPLE_RATE,
                         enrollment_wav_base64=ctx.enrollment_b64,
                         base_url=cfg.vllm_base_url,
                         model_name=cfg.vllm_model_name,
                         prompt_template=cfg.vllm_prompt_template,
                         timeout=cfg.asr_request_timeout,
+                        runtime_config=cfg,
                     ),
                     timeout=cfg.primary_asr_timeout,
                 )
@@ -318,10 +328,11 @@ class AsrTaskEngine(BaseTaskEngine):
         elif secondary_result and not primary_result:
             text = str(secondary_result.get("transcription") or "").strip()
         else:
+            fusion_hotwords = self._fusion_hotwords(primary_result, hw_snapshot)
             fused = choose_fused_result(
                 primary_result,
                 secondary_result,
-                hotwords=hw_snapshot,
+                hotwords=fusion_hotwords,
                 similarity_threshold=cfg.fusion_similarity_threshold,
                 min_primary_score=cfg.fusion_min_primary_score,
                 max_repetition_ratio=cfg.fusion_max_repetition_ratio,
@@ -334,3 +345,11 @@ class AsrTaskEngine(BaseTaskEngine):
                 detected_lang = primary_result["detected_language"]
 
         return text, detected_lang
+
+    @staticmethod
+    def _fusion_hotwords(primary_result, fallback: list[str]) -> list[str]:
+        if primary_result:
+            reported = primary_result.get("reported_hotwords") or []
+            if reported:
+                return [str(word) for word in reported]
+        return fallback

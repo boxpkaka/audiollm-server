@@ -4,8 +4,18 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import numpy as np
 import websockets
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import (
+    Body,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.types import Receive, Scope, Send
@@ -16,7 +26,18 @@ from .asr.enrollment import (
     get_enrollment_store,
 )
 from .asr.jobs import get_transcription_job_store
+from .asr.k2.client import close_k2_channels
 from .asr.oneshot import OneshotAsrError, run_oneshot_asr
+from .asr.recall import (
+    add_hotwords as add_recall_hotwords,
+)
+from .asr.recall import (
+    delete_hotwords as delete_recall_hotwords,
+)
+from .asr.recall import (
+    list_hotword_pool,
+    reload_hotword_pool,
+)
 from .asr.transcribe import float_pcm_to_i16_bytes
 from .audio.utils import wav_base64_to_pcm_16k_mono, wav_bytes_to_pcm_16k_mono
 from .config import SAMPLE_RATE, load_config, load_transcribe_config
@@ -26,7 +47,12 @@ from .emotion.service import EmotionDecodeError, decode_wav_capped
 from .emotion_spec.jobs import get_emotion_spec_job_store
 from .http_client import close_client
 from .session import AudioSession
-from .streaming import AstV3Protocol, StreamingSession, VadSegmentedStream
+from .streaming import (
+    AstV3Protocol,
+    K2SegmentedStream,
+    StreamingSession,
+    VadSegmentedStream,
+)
 from .tasks import AsrTaskEngine, EmotionTaskEngine
 from .text_cleanup import clean_asr_text
 from .text_cleanup.client import TextCleanupConfigError
@@ -40,6 +66,7 @@ FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
+    await close_k2_channels()
     await close_client()
 
 
@@ -61,9 +88,10 @@ async def audio_ws(websocket: WebSocket):
 async def transcribe_streaming_ws(websocket: WebSocket, language: str = ""):
     await websocket.accept()
     logger.info("Transcribe-streaming connected (language=%s)", language)
+    cfg = load_config()
     session = StreamingSession(
         websocket,
-        stream=VadSegmentedStream(),
+        stream=K2SegmentedStream() if cfg.k2_enabled else VadSegmentedStream(),
         engine=AsrTaskEngine(),
         language=language,
     )
@@ -105,7 +133,7 @@ async def tuling_ast_v3_ws(websocket: WebSocket):
         astv3_overrides["vllm_prompt_template"] = cfg.astv3_vllm_prompt_template
     session = StreamingSession(
         websocket,
-        stream=VadSegmentedStream(),
+        stream=K2SegmentedStream() if cfg.k2_enabled else VadSegmentedStream(),
         engine=AsrTaskEngine(emit_timing=True),
         protocol=AstV3Protocol(),
         config_overrides=astv3_overrides,
@@ -272,11 +300,11 @@ async def _read_audio_bytes(
     return raw
 
 
-def _wav_to_pcm_capped(raw: bytes, max_seconds: float) -> tuple[bytes, float]:
+def _wav_to_pcm_capped(raw: bytes, max_seconds: float) -> tuple[bytes, np.ndarray, float]:
     """Decode a WAV blob to 16 kHz mono and tail-trim to ``max_seconds``.
 
-    Returns (re_encoded_wav_bytes, duration_sec). When no trim is needed the
-    re-encoded WAV is byte-equivalent to ``pcm_to_wav_base64(pcm)``.
+    Returns (re_encoded_wav_bytes, pcm_16k_mono, duration_sec). When no trim is
+    needed the re-encoded WAV is byte-equivalent to ``pcm_to_wav_base64(pcm)``.
     """
     import io
     import wave
@@ -307,7 +335,7 @@ def _wav_to_pcm_capped(raw: bytes, max_seconds: float) -> tuple[bytes, float]:
     # Sanity: re-encoded WAV should still parse.
     with wave.open(io.BytesIO(new_bytes), "rb") as wf:
         assert wf.getframerate() == SAMPLE_RATE
-    return new_bytes, duration
+    return new_bytes, pcm.astype(np.float32, copy=False), duration
 
 
 def _emotion_result_payload(
@@ -364,6 +392,7 @@ async def _run_dual_asr_upload(
     cfg,
     hotwords: list[str],
     language: str,
+    audio_pcm: np.ndarray,
     enrollment_b64: str | None = None,
 ) -> dict:
     """Route-facing wrapper over :func:`run_oneshot_asr`.
@@ -377,6 +406,7 @@ async def _run_dual_asr_upload(
             cfg=cfg,
             hotwords=hotwords,
             language=language,
+            audio_pcm=audio_pcm,
             enrollment_b64=enrollment_b64,
         )
     except OneshotAsrError as exc:
@@ -432,6 +462,83 @@ async def asr_enrollment_delete(enrollment_id: str):
     return JSONResponse(status_code=204, content=None)
 
 
+def _hotword_pool_payload(body: dict) -> list[str]:
+    values = body.get("hotwords", body.get("words", []))
+    if not isinstance(values, list):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_hotwords",
+                "message": "hotwords must be a JSON array of strings",
+            },
+        )
+    words = [str(item).strip() for item in values if str(item).strip()]
+    if not words:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "empty_hotwords",
+                "message": "hotwords must contain at least one non-empty string",
+            },
+        )
+    return words
+
+
+def _recall_error(exc: Exception) -> HTTPException:
+    return HTTPException(
+        status_code=502,
+        detail={
+            "code": "triton_recall_unavailable",
+            "message": "Triton hotword recall service request failed",
+            "detail": str(exc),
+        },
+    )
+
+
+@app.get("/api/asr/hotword-pool")
+async def asr_hotword_pool_list(
+    query: str = "",
+    limit: int = 50,
+    offset: int = 0,
+):
+    try:
+        return await list_hotword_pool(
+            query=query or None,
+            limit=max(0, min(int(limit), 1000)),
+            offset=max(0, int(offset)),
+        )
+    except Exception as exc:  # noqa: BLE001 - route maps upstream failures
+        raise _recall_error(exc) from exc
+
+
+@app.post("/api/asr/hotword-pool")
+async def asr_hotword_pool_add(body: dict = Body(...)):
+    try:
+        return await add_recall_hotwords(_hotword_pool_payload(body))
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise _recall_error(exc) from exc
+
+
+@app.delete("/api/asr/hotword-pool")
+async def asr_hotword_pool_delete(body: dict = Body(...)):
+    try:
+        return await delete_recall_hotwords(_hotword_pool_payload(body))
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise _recall_error(exc) from exc
+
+
+@app.post("/api/asr/hotword-pool/reload")
+async def asr_hotword_pool_reload():
+    try:
+        return await reload_hotword_pool()
+    except Exception as exc:  # noqa: BLE001
+        raise _recall_error(exc) from exc
+
+
 @app.post("/api/asr/upload")
 async def asr_upload(
     audio: UploadFile = File(...),
@@ -451,7 +558,7 @@ async def asr_upload(
     stale id from a long-running tab does not break uploads.
     """
     raw = await _read_audio_bytes(audio)
-    wav_bytes, duration_sec = _wav_to_pcm_capped(raw, _ASR_MAX_SECONDS)
+    wav_bytes, audio_pcm, duration_sec = _wav_to_pcm_capped(raw, _ASR_MAX_SECONDS)
     wav_b64 = base64.b64encode(wav_bytes).decode("ascii")
     cfg = load_config()
     hw_list = _parse_csv(hotwords)
@@ -461,6 +568,7 @@ async def asr_upload(
         cfg=cfg,
         hotwords=hw_list,
         language=language,
+        audio_pcm=audio_pcm,
         enrollment_b64=enrollment_b64,
     )
 
@@ -686,11 +794,11 @@ async def audio_analyze(
     hw_list = _parse_csv(hotwords)
     enrollment_b64 = _resolve_enrollment_b64(enrollment_id)
 
-    asr_wav_bytes, duration_sec = _wav_to_pcm_capped(raw, _ASR_MAX_SECONDS)
+    asr_wav_bytes, asr_pcm, duration_sec = _wav_to_pcm_capped(raw, _ASR_MAX_SECONDS)
     asr_wav_b64 = base64.b64encode(asr_wav_bytes).decode("ascii")
 
     emotion_cap = float(getattr(cfg, "emotion_max_audio_seconds", 0.0))
-    emotion_wav_bytes, emotion_duration_sec = _wav_to_pcm_capped(raw, emotion_cap)
+    emotion_wav_bytes, _, emotion_duration_sec = _wav_to_pcm_capped(raw, emotion_cap)
     emotion_wav_b64 = base64.b64encode(emotion_wav_bytes).decode("ascii")
 
     asr_task = asyncio.create_task(
@@ -699,6 +807,7 @@ async def audio_analyze(
             cfg=cfg,
             hotwords=hw_list,
             language=language,
+            audio_pcm=asr_pcm,
             enrollment_b64=enrollment_b64,
         )
     )

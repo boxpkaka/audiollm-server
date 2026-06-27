@@ -1,8 +1,79 @@
 # /tuling/ast/v3 多并发性能与极限压测报告
 
-日期：2026-06-10
+日期：2026-06-10；补测：2026-06-25、2026-06-26
 测试脚本：`scripts/bench_tuling_ttft.py`（支持 lhotse manifests / 单 wav 数据源、RTF、尾部时延、并发梯度、错峰起跑）
-原始数据：`bench_results/tuling_astv3_*.json`
+原始数据：`bench_results/tuling_astv3_*.json`、`bench_results/tuling_astv3_123wav_recall_bypass_realtime_c*.json`、`bench_results/tuling_astv3_k2_kespeech_*.json`
+
+## 0. 2026-06-26 k2 流式 partial 极限补测
+
+本节验证 k2 接入后 `/tuling/ast/v3` 的同相位 worst-case 并发上限。测试前将 `config.yaml` 中 `k2.k2_enabled=true`，重启 `audiollm-demo`；此时 partial 与 endpoint 由 k2 gRPC 流产生，final 仍由本服务 LLM ASR 产生。
+
+| 项目 | 值 |
+|---|---|
+| 端点 | ws://127.0.0.1:8080/tuling/ast/v3，同机回环 |
+| k2 服务 | localhost:50051，plain recognition，未启用 token timestamps |
+| 被测主模型 | AmphionASR-1.7B，vLLM，localhost:8009 |
+| 端点策略 | k2 partial/endpoint；LLM ASR final；hotword/enrollment 等质量特性仍只作用于 final |
+| 公共配置 | k2_enabled=true、k2_target=localhost:50051、k2_max_segment_sec=30、k2_preroll_ms=300、k2_idle_keep_ms=1500、primary_asr_timeout=4.0s |
+| 测试音频 | `/home/ubuntu/data/testdata/base_v2_kespeech_gpu1/wavs/zh/zh_kespeech_1025458_license_plate_v2_1_ref1.wav`，5.60 s |
+| 发送参数 | realtime 模式，chunk 128 ms，每路独立 WebSocket，同相位起跑，单条音频复制 N 路 |
+| 过载后健康检查 | 160 路失败后单路 smoke 正常，未发现后端进入持续拒绝服务状态 |
+
+| 并发 | 成功率 | 首字-体感 p50/p90 (ms) | 首字-协议 p50/p90 (ms) | 首段终稿 p50/p90 (ms) | 尾字 p50/p90 (ms) | 会话收尾 p50/p90 (ms) | 有效吞吐 | wall |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 1/1 | 1015/1015 | 1455/1455 | 5671/5671 | 124/124 | 124/124 | 0.98x | 5.7s |
+| 16 | 16/16 | 1089/1167 | 1529/1607 | 6384/6501 | 824/937 | 824/937 | 13.08x | 6.8s |
+| 32 | 32/32 | 1199/1228 | 1639/1668 | 7179/7283 | 1622/1718 | 1637/1719 | 22.63x | 7.9s |
+| 64 | 64/64 | 1284/1311 | 1724/1751 | 9141/9786 | 3569/4210 | 3569/4210 | 31.94x | 11.2s |
+| 96 | 96/96 | 1418/1425 | 1858/1865 | 10704/11719 | 5119/6141 | 5119/6141 | 38.78x | 13.9s |
+| 128 | 128/128 | 1849/1869 | 2289/2309 | 12798/13109 | 7223/7532 | 7241/7543 | 45.36x | 15.8s |
+| 160 | 80/160 | 2219/2263 | 2659/2703 | 13527/14188 | 7934/8574 | 7934/8574 | 25.42x | 17.6s |
+
+结论：
+
+- 本轮同相位 worst-case 最高稳定并发为 128 路：128/128 成功，无 error 帧；160 路仅 80/160 成功。
+- k2 接入后，首字由 k2 partial 决定，1-96 路首字 p50 从 1.45 s 增至 1.86 s；128 路首字 p50 为 2.29 s，开始出现明显排队但仍可用。
+- 尾字由 LLM final burst 决定，随并发线性增大更明显：32 路 p50 约 1.62 s，64 路约 3.57 s，96 路约 5.12 s，128 路约 7.22 s。
+- 160 路失败根因在 k2 服务侧，不在本服务 LLM final：首个错误为 `StatusCode.INTERNAL`，k2 onnxruntime `BFCArena::AllocateRawInternal` 申请约 19 MB buffer 失败（`/downsample_1/ReduceSum`）。
+- 因 160 路已触发 k2 内存分配失败，后续 192/256 路上探结果不作为容量数据。过载后单路 smoke 仍正常，说明本服务没有复现历史 128 路后的持续拒绝服务问题。
+
+容量建议：
+
+| 场景 | 建议水位 | 实测边界 | 说明 |
+|---|---|---|---|
+| k2 模式同相位 worst-case | 96 路以内 | 128 路稳定，160 路失败 | 96 路尾字 p90 已约 6.14 s；128 路虽稳定但尾字 p50 约 7.22 s |
+| k2 模式正常错峰流量 | 需要另测 | 未测 | 本轮为所有路同一时刻切段和 final burst 的防御性下界 |
+
+## 0.1 2026-06-25 热词召回与 encoder bypass 补测
+
+本节使用 `/home/ubuntu/123.wav` 对 `/tuling/ast/v3` 做同相位多路实时压测，用于验证 Triton 热词召回与 encoder bypass 接入后的当前链路。压测前发现 systemd 旧进程未加载 recall 配置字段，已重启 `audiollm-demo` 后重测；下表只记录重启后的有效数据。
+
+| 项目 | 值 |
+|---|---|
+| 端点 | ws://127.0.0.1:8080/tuling/ast/v3，同机回环 |
+| 被测主模型 | AmphionASR-1.7B，vLLM，localhost:8009 |
+| 热词链路 | enable_hotword_recall=true、recall_top_k=50、enable_encoder_bypass=true |
+| Triton 召回服务 | http://localhost:10001，rag_asr_retrieve |
+| 端点策略 | /tuling/ast/v3 primary-only；partial 纯 vLLM raw audio；final 段启用 Triton recall 与 encoder bypass |
+| 公共配置 | primary_asr_timeout=4.0s、http_pool.max_connections=32、silence_duration_ms=1000、pseudo_stream_interval_ms=800 |
+| 测试音频 | /home/ubuntu/123.wav，24 kHz mono WAV，64.63 s；客户端按脚本重采样到 16 kHz mono s16le PCM |
+| 发送参数 | realtime 模式，chunk 128 ms，每路独立 WebSocket，同相位起跑 |
+| 日志检查 | 当前后端 PID 在压测窗口内无 ERROR、Timeout、Traceback、fallback、Unknown defaults |
+
+| 并发 | 成功率 | 首字-体感 p50/p90 (ms) | 首字-协议 p50/p90 (ms) | 首段终稿 p50/p90 (ms) | 尾字 p50/p90 (ms) | 会话收尾 p50/p90 (ms) | 有效吞吐 | wall |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 1/1 | 1829/1829 | 1879/1879 | 3212/3212 | 201/201 | 202/202 | 0.99x | 65.2s |
+| 4 | 4/4 | 1792/1793 | 1842/1843 | 3023/3036 | 236/268 | 236/268 | 3.94x | 65.6s |
+| 8 | 8/8 | 1813/1814 | 1863/1864 | 3065/3115 | 388/460 | 388/460 | 7.85x | 65.8s |
+| 16 | 16/16 | 1839/1841 | 1889/1891 | 3110/3203 | 481/633 | 482/633 | 15.61x | 66.2s |
+| 32 | 32/32 | 1944/1948 | 1994/1998 | 3207/3434 | 1059/1308 | 1060/1308 | 30.76x | 67.2s |
+
+结论：
+
+- 1-32 路同相位实时推流全部成功，无 error 帧、无 final 超时、无 recall/bypass fallback 日志。
+- partial 首字由纯 vLLM raw-audio 路径产生，1-16 路基本稳定在约 1.84-1.89 s；32 路上升到约 1.99 s，退化约 115 ms。
+- final 段启用 recall+bypass 后，尾字时延随同步 final burst 增长：1 路约 201 ms，16 路约 481 ms，32 路约 1.06 s；32 路 p90 约 1.31 s，属于可见但可控的尾部排队。
+- 本轮未继续压到失败边界；容量结论仅覆盖 `/home/ubuntu/123.wav` 同相位 32 路以内，不替代第 5-7 节历史极限压测结论。
 
 ## 1. 测试环境
 
@@ -159,6 +230,25 @@ uv run python scripts/bench_tuling_ttft.py \
 
 # 长音频错峰 N 路（typical case）：加 --stagger-ms 1500
 # 注意：>56 路的档位会触发会话失败风暴，风暴后服务可能需要重启才能恢复
+
+# 2026-06-25 /home/ubuntu/123.wav + Triton recall/bypass 补测
+uv run python scripts/bench_tuling_ttft.py \
+  --url ws://127.0.0.1:8080/tuling/ast/v3 \
+  --wav /home/ubuntu/123.wav \
+  --limit 32 --warmup 0 --send-mode realtime --chunk-ms 128 --concurrency 32 \
+  --final-timeout 120 \
+  --output bench_results/tuling_astv3_123wav_recall_bypass_realtime_c32.json
+
+# 2026-06-26 k2 partial/endpoint 同相位 worst-case 补测
+# 先确认 config.yaml: k2.k2_enabled=true，并重启 audiollm-demo。
+for c in 1 16 32 64 96 128 160; do
+  uv run python scripts/bench_tuling_ttft.py \
+    --url ws://127.0.0.1:8080/tuling/ast/v3 \
+    --wav /home/ubuntu/data/testdata/base_v2_kespeech_gpu1/wavs/zh/zh_kespeech_1025458_license_plate_v2_1_ref1.wav \
+    --limit "$c" --warmup 1 --send-mode realtime --chunk-ms 128 --concurrency "$c" \
+    --final-timeout 120 \
+    --output "bench_results/tuling_astv3_k2_kespeech_worstcase_c${c}.json"
+done
 ```
 
 ## 10. 数据文件索引
@@ -173,3 +263,6 @@ uv run python scripts/bench_tuling_ttft.py \
 | tuling_astv3_120call_c64_stagger.json | 64 路错峰（口径 B） |
 | tuling_astv3_120call_c96_stagger.json | 96 路错峰（口径 B） |
 | tuling_astv3_120call_c128_stagger.json | 128 路错峰，全失败（口径 B） |
+| tuling_astv3_123wav_recall_bypass_realtime_c1/c4/c8/c16/c32.json | 2026-06-25 /home/ubuntu/123.wav 同相位 realtime 补测，热词召回与 encoder bypass 生效 |
+| tuling_astv3_k2_kespeech_worstcase_c1/c16/c32/c64/c96/c128/c160.json | 2026-06-26 k2 partial/endpoint 同相位 worst-case 补测；128 路稳定，160 路 k2 内存分配失败 |
+| tuling_astv3_k2_kespeech_post_overload_smoke.json | 2026-06-26 160 路过载后的单路健康检查 |

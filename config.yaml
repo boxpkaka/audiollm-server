@@ -47,6 +47,10 @@ upstreams:
     model_name: ${HOTWORD_MODEL}
     api_key: ${HOTWORD_API_KEY}
     timeout: 30
+  triton_recall:
+    base_url: http://localhost:10001
+    model_name: rag_asr_retrieve
+    timeout: 30
 
 # 全局默认 tuning; 端点的 policy 可逐项软覆盖, lock 可硬锁定。
 # 注: base_url/model/timeout 属 upstreams, 不在此; 这里只放纯调参。
@@ -63,6 +67,16 @@ defaults:
     enable_pseudo_stream: true
     pseudo_stream_interval_ms: 800
     pseudo_stream_first_partial_ms: 200   # 不变量: <= min_segment_duration_ms
+  k2:
+    k2_enabled: false
+    k2_target: localhost:50051
+    k2_sample_rate: 16000
+    k2_include_token_timestamps: false    # k2 只做纯识别:不取 token timestamps
+    k2_connect_timeout_sec: 5.0
+    k2_fallback_to_local: true
+    k2_max_segment_sec: 30.0              # k2 长时间不出 endpoint 时本地强切兜底
+    k2_preroll_ms: 300                    # 送 LLM final 前 TenVad 修剪的起音预滚
+    k2_idle_keep_ms: 1500                 # 未见 k2 partial 前静音缓冲只保留最近窗口
   asr:
     enable_primary_asr: true
     enable_secondary_asr: true            # 端点未绑 secondary 上游时, 投影强制 false
@@ -76,6 +90,10 @@ defaults:
     fusion_disagreement_threshold: 0.55
     fusion_hotword_boost: 0.12
     fusion_primary_score_margin: 0.08
+  recall:
+    enable_hotword_recall: true
+    recall_top_k: 50
+    enable_encoder_bypass: true
   itn:
     enable_asr_itn: true
     asr_itn_enable_0_to_9: false
@@ -119,6 +137,7 @@ defaults:
 # 全局单例辅助服务: 不随端点变化, 所有端点/REST 共享(工具型外部服务)。
 services:
   hotword: hotword_llm
+  recall: triton_recall
   text_cleanup: dashscope_cleanup
 
 # REST/HTTP 路由的上游绑定: upstreams 是所有 REST 接口的共享默认,

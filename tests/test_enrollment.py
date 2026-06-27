@@ -165,10 +165,35 @@ def test_amphion_asr_17b_task2_asr_hotwords():
     assert msgs[1]["content"][0]["input_audio"]["data"] == "TARGET_B64"
 
 
+def test_amphion_asr_17b_audio_embeds_bypass():
+    msgs = build_primary_messages(
+        "TARGET_B64",
+        hotwords=["江门"],
+        audio_embeds_b64="EMBEDS_B64",
+        audio_embeds_uuid="triton-audio-1234",
+        template="amphion_asr_1.7b",
+    )
+    assert msgs == [
+        {"role": "system", "content": "Hotwords: 江门"},
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "audio_embeds",
+                    "audio_embeds": "EMBEDS_B64",
+                    "uuid": "triton-audio-1234",
+                }
+            ],
+        },
+    ]
+
+
 def test_amphion_asr_17b_task5_tsasr():
     msgs = build_primary_messages(
         "TARGET_B64",
         enrollment_wav_base64="ENROLL_B64",
+        audio_embeds_b64="EMBEDS_B64",
+        audio_embeds_uuid="triton-audio-1234",
         template="amphion_asr_1.7b",
     )
     assert msgs == [

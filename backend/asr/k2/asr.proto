@@ -1,0 +1,147 @@
+syntax = "proto3";
+
+package asr.v1;
+
+service AsrService {
+  rpc Recognize(stream PcmRequest) returns (stream AsrEvent);
+  rpc Healthz(HealthzRequest) returns (HealthzResponse);
+  rpc ServerInfo(ServerInfoRequest) returns (ServerInfoResponse);
+}
+
+message PcmRequest {
+  oneof payload {
+    SessionConfig session_config = 1;
+    AudioChunk audio_chunk = 2;
+    EndOfStream end_of_stream = 3;
+    UpdateHotwordsRequest update_hotwords = 4;
+  }
+}
+
+message SessionConfig {
+  string trace_id = 1;
+  string client_app = 2;
+  string client_user_hash = 3;
+  AudioFormat audio_format = 10;
+  Decoding decoding = 11;
+  HotwordSpec hotwords = 12;
+  bool enable_endpoint = 13;
+  bool include_token_timestamps = 14;
+}
+
+message AudioFormat {
+  int32 sample_rate = 1;
+  AudioEncoding encoding = 2;
+  int32 channels = 3;
+}
+
+enum AudioEncoding {
+  AUDIO_ENCODING_UNSPECIFIED = 0;
+  PCM_S16LE = 1;
+  PCM_F32LE = 2;
+}
+
+message Decoding {
+  DecodingMethod method = 1;
+  int32 max_active_paths = 2;
+  HomophoneReplacer hr = 10;
+  ItnConfig itn = 11;
+  LmConfig lm = 12;
+}
+
+enum DecodingMethod {
+  DECODING_METHOD_UNSPECIFIED = 0;
+  GREEDY_SEARCH = 1;
+  MODIFIED_BEAM_SEARCH = 2;
+}
+
+message HotwordSpec {
+  string words_text = 1;
+  float score = 2;
+}
+
+message HomophoneReplacer {
+  bool enable = 1;
+}
+
+message ItnConfig {
+  bool enable = 1;
+  repeated string rule_set = 2;
+}
+
+message LmConfig {
+  bool enable = 1;
+  float scale = 2;
+}
+
+message AudioChunk {
+  bytes data = 1;
+  int64 client_send_us = 2;
+}
+
+message EndOfStream {}
+
+message UpdateHotwordsRequest {
+  HotwordSpec hotwords = 1;
+}
+
+message AsrEvent {
+  int64 server_send_ns = 1;
+  oneof payload {
+    AsrPartial partial = 10;
+    AsrFinal final = 11;
+    AsrEndpoint endpoint = 12;
+    AsrError error = 13;
+    SessionStarted session_started = 14;
+    SessionEnded session_ended = 15;
+  }
+}
+
+message AsrPartial {
+  string text = 1;
+  repeated string tokens = 2;
+  repeated float timestamps = 3;
+  repeated float token_confidences = 4;
+}
+
+message AsrFinal {
+  string text = 1;
+  float confidence = 2;
+  repeated string tokens = 3;
+  repeated float timestamps = 4;
+  repeated float token_confidences = 5;
+}
+
+message AsrEndpoint {}
+
+message AsrError {
+  int32 code = 1;
+  string message = 2;
+}
+
+message SessionStarted {}
+
+message SessionEnded {
+  string trace_id = 1;
+}
+
+message HealthzRequest {}
+
+message HealthzResponse {
+  enum Status {
+    UNKNOWN = 0;
+    SERVING = 1;
+    NOT_SERVING = 2;
+  }
+  Status status = 1;
+  int64 active_sessions = 2;
+  double recent_rtf = 3;
+}
+
+message ServerInfoRequest {}
+
+message ServerInfoResponse {
+  string sdk_version = 1;
+  string sherpa_onnx_version = 2;
+  string model_manifest_json = 3;
+  int64 uptime_seconds = 4;
+}

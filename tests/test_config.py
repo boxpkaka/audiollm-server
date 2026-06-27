@@ -204,6 +204,12 @@ def test_shipped_config_projects_rest_bindings() -> None:
     assert cfg.emotion_task_mode == "ser"
     assert cfg.emotion_spec_task_mode == "sepc"
     assert cfg.enable_asr_repetition_fix is True
+    assert cfg.k2_enabled is False
+    assert cfg.k2_target == "localhost:50051"
+    assert cfg.k2_include_token_timestamps is False
+    assert cfg.k2_max_segment_sec == 30.0
+    assert cfg.k2_preroll_ms == 300
+    assert cfg.k2_idle_keep_ms == 1500
     assert (
         cfg.text_cleanup_base_url
         == "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -381,6 +387,7 @@ def test_resolve_real_ws_audio_binds_emotion_spec() -> None:
 def test_get_service_upstream() -> None:
     assert get_service_upstream("text_cleanup").name == "dashscope_cleanup"
     assert get_service_upstream("hotword").name == "hotword_llm"
+    assert get_service_upstream("recall").name == "triton_recall"
     assert get_service_upstream("nonexistent") is None
 
 
@@ -394,6 +401,16 @@ def test_fusion_requires_secondary_invariant() -> None:
     assert cfg.enable_dual_asr_fusion is False
 
 
+def test_encoder_bypass_requires_recall_invariant() -> None:
+    cfg = Config(enable_hotword_recall=False, enable_encoder_bypass=True)
+    assert cfg.enable_encoder_bypass is False
+
+
+def test_recall_top_k_clamps_to_non_negative() -> None:
+    cfg = Config(recall_top_k=-1)
+    assert cfg.recall_top_k == 0
+
+
 def test_pseudo_stream_first_partial_dataclass_default_is_neutral() -> None:
     cfg = Config()
     assert cfg.pseudo_stream_first_partial_ms == cfg.min_segment_duration_ms == 350
@@ -404,6 +421,22 @@ def test_pseudo_stream_first_partial_clamped_to_min_segment() -> None:
     assert clamped.pseudo_stream_first_partial_ms == 350
     lower = Config(pseudo_stream_first_partial_ms=200, min_segment_duration_ms=350)
     assert lower.pseudo_stream_first_partial_ms == 200
+
+
+def test_k2_requires_target_and_clamps_bounds() -> None:
+    cfg = Config(
+        k2_enabled=True,
+        k2_target="",
+        k2_sample_rate=0,
+        k2_max_segment_sec=-1,
+        k2_preroll_ms=-10,
+        k2_idle_keep_ms=-20,
+    )
+    assert cfg.k2_enabled is False
+    assert cfg.k2_sample_rate == 16000
+    assert cfg.k2_max_segment_sec == 0.0
+    assert cfg.k2_preroll_ms == 0
+    assert cfg.k2_idle_keep_ms == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -439,6 +472,12 @@ def test_pseudo_stream_first_partial_client_overridable() -> None:
     assert "pseudo_stream_first_partial_ms" in CLIENT_OVERRIDABLE_FIELDS
     out = load_config().override_client(pseudo_stream_first_partial_ms=200)
     assert out.pseudo_stream_first_partial_ms == 200
+
+
+def test_recall_knobs_client_overridable() -> None:
+    assert {"enable_hotword_recall", "recall_top_k"} <= CLIENT_OVERRIDABLE_FIELDS
+    out = load_config().override_client(recall_top_k=3)
+    assert out.recall_top_k == 3
 
 
 def test_pseudo_stream_first_partial_clamp_applies_on_override() -> None:
@@ -501,6 +540,10 @@ def test_client_overridable_fields_are_real_and_safe() -> None:
         "http_max_connections",
         "http_max_keepalive_connections",
         "enable_asr_repetition_fix",
+        "enable_encoder_bypass",
+        "k2_target",
+        "k2_enabled",
+        "k2_max_segment_sec",
     }
     assert CLIENT_OVERRIDABLE_FIELDS.isdisjoint(forbidden)
 

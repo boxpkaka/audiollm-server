@@ -165,7 +165,10 @@ class AudioSession:
             now = time.monotonic()
             if now - self._last_partial_time >= self._pseudo_stream_interval:
                 snapshot = self.vad.snapshot_incomplete_speech()
-                if snapshot is not None and len(snapshot) >= MIN_SEGMENT_SAMPLES:
+                partial_min_samples = int(
+                    SAMPLE_RATE * default_config.pseudo_stream_first_partial_ms / 1000
+                )
+                if snapshot is not None and len(snapshot) >= partial_min_samples:
                     if self._partial_task is None or self._partial_task.done():
                         self._last_partial_time = now
                         self._partial_seq += 1
@@ -347,13 +350,10 @@ class AudioSession:
     ) -> None:
         """Emit a rolling partial using whichever decoder(s) are online.
 
-        - Both on  : run in parallel; secondary acts as a noise gate
-                     (primary tends to hallucinate on near-silence), and
-                     the partial text comes from primary so hotwords /
-                     language / target-speaker prompts apply.
-        - Primary only : no noise gate; better to leak an occasional
-                         hallucinated partial than to have the live
-                         caption go completely silent.
+        - Primary on : use primary only. Pseudo-streaming is expected to be
+                       pure vLLM raw-audio inference; using the secondary as
+                       an early-snapshot noise gate suppressed too many short
+                       real speech partials in the browser demo.
         - Secondary only : use the secondary text directly. It is
                            weaker (no hotwords / TS), but still useful
                            as a live caption when primary is offline.
@@ -368,13 +368,16 @@ class AudioSession:
                 primary_task = asyncio.create_task(
                     query_audio_model(
                         wav_b64,
-                        hotwords=list(self.hotwords),
+                        hotwords=[],
                         src_lang=self.src_lang,
+                        audio_pcm=None,
+                        audio_sample_rate=SAMPLE_RATE,
                         enrollment_wav_base64=self.enrollment_b64,
                         prompt_template=default_config.vllm_prompt_template,
+                        runtime_config=default_config,
                     )
                 )
-            if default_config.enable_secondary_asr:
+            elif default_config.enable_secondary_asr:
                 secondary_task = asyncio.create_task(
                     query_audio_model_secondary(wav_b64)
                 )
@@ -385,11 +388,9 @@ class AudioSession:
                 secondary_text = str(
                     (secondary_res or {}).get("transcription") or ""
                 ).strip()
-                # When secondary is the gate (primary present) or the
-                # sole source, an empty result means "silence" — skip.
+                # When secondary is the sole source, an empty result means
+                # "silence" — skip.
                 if not secondary_text:
-                    if primary_task is not None:
-                        primary_task.cancel()
                     return
 
             if primary_task is not None:
@@ -403,22 +404,18 @@ class AudioSession:
             if not text:
                 return
 
-            # Utterance lifecycle gate: _enqueue_segment zeroes out
-            # _utterance_id when the final segment goes into the ASR
-            # queue (and a fresh speech burst would set it to a *new*
-            # id). Either way, an inflight partial whose utterance no
-            # longer matches is racing the final response — letting it
-            # through flips the bubble back to "streaming" on the client
-            # and silently overwrites the finalized text. This is the
-            # only point where we can serialize partial/final because the
-            # async task creation-to-completion interval is not lockable.
+            # _enqueue_segment zeroes out _utterance_id as soon as the final
+            # segment enters the ASR queue, but the final text may still take a
+            # while. Let a racing partial through so short utterances can show
+            # live text during that final wait. The browser now marks finalized
+            # utterances with seq=Infinity, so any truly late partial arriving
+            # after final is dropped client-side instead of regressing the UI.
             if self._utterance_id != utterance_id:
                 logger.debug(
-                    "Drop stale partial for %s seq=%s (utterance finalized)",
+                    "Emit racing partial for %s seq=%s (utterance finalized)",
                     utterance_id,
                     seq,
                 )
-                return
 
             await self._send_json(
                 {
@@ -488,7 +485,7 @@ class AudioSession:
         # the primary alone, saving one vLLM call per segment.
         if default_config.enable_dual_asr_fusion:
             secondary_res, primary_res = await self._dual_asr_pipeline(
-                seg_id, wav_b64, hw_snapshot, lang_snapshot
+                seg_id, wav_b64, hw_snapshot, lang_snapshot, audio_pcm=segment
             )
             if secondary_res is None and primary_res is None:
                 is_silence = True
@@ -499,8 +496,11 @@ class AudioSession:
                         wav_b64,
                         hotwords=hw_snapshot,
                         src_lang=lang_snapshot,
+                        audio_pcm=segment,
+                        audio_sample_rate=SAMPLE_RATE,
                         enrollment_wav_base64=self.enrollment_b64,
                         prompt_template=default_config.vllm_prompt_template,
+                        runtime_config=default_config,
                     ),
                     timeout=default_config.primary_asr_timeout,
                 )
@@ -523,8 +523,9 @@ class AudioSession:
             text = ""
             fused: dict | None = None
         else:
+            fusion_hotwords = self._fusion_hotwords(primary_result, hw_snapshot)
             fused = choose_fused_result(
-                primary_result, secondary_result, hotwords=hw_snapshot
+                primary_result, secondary_result, hotwords=fusion_hotwords
             )
             text = str(fused.get("text") or "").strip()
             if text:
@@ -667,6 +668,8 @@ class AudioSession:
         wav_b64: str,
         hw_snapshot: list[str],
         lang_snapshot: str,
+        *,
+        audio_pcm: np.ndarray | None = None,
     ) -> tuple:
         """Run both ASR models in parallel, wait for both, return results.
 
@@ -682,10 +685,13 @@ class AudioSession:
                 asyncio.wait_for(
                     query_audio_model(
                         wav_b64,
-                        hotwords=hw_snapshot,
+                        hotwords=hw_snapshot if audio_pcm is not None else [],
                         src_lang=lang_snapshot,
+                        audio_pcm=audio_pcm,
+                        audio_sample_rate=SAMPLE_RATE,
                         enrollment_wav_base64=self.enrollment_b64,
                         prompt_template=default_config.vllm_prompt_template,
+                        runtime_config=default_config,
                     ),
                     timeout=default_config.primary_asr_timeout,
                 )
@@ -723,3 +729,11 @@ class AudioSession:
                 primary_res = err
 
         return secondary_res, primary_res
+
+    @staticmethod
+    def _fusion_hotwords(primary_result, fallback: list[str]) -> list[str]:
+        if primary_result:
+            reported = primary_result.get("reported_hotwords") or []
+            if reported:
+                return [str(word) for word in reported]
+        return fallback

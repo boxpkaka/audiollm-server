@@ -7,8 +7,8 @@
  *   microphone recording, decode/resample to 16 kHz mono WAV in the
  *   browser, and ``POST /api/asr/enrollment`` to obtain an opaque
  *   ``enrollment_id``. The caller (app.js) then forwards the id on
- *   every WS ``update_hotwords`` and REST upload so the primary model
- *   prepends the clip into the TS-ASR dual-audio prompt.
+ *   every WS session-control message and REST upload so the primary
+ *   model prepends the clip into the TS-ASR dual-audio prompt.
  * - Gate the buttons so the user can only set/clear enrollment when
  *   the microphone is idle (``must_before_start`` decision) and reset
  *   the UI back to "no enrollment" once cleared.
@@ -23,7 +23,7 @@
  * it in its own file means app.js only needs to know two things:
  *   1. ``Amphion.Enrollment.attach(...)`` to wire up the DOM, and
  *   2. ``ctrl.getEnrollmentId()`` to read the current id when
- *      composing WS ``start`` / ``update_hotwords`` messages.
+ *      composing WS session-control messages.
  */
 (() => {
   'use strict';

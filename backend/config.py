@@ -135,6 +135,17 @@ class Config:
     fusion_hotword_boost: float = 0.12
     fusion_primary_score_margin: float = 0.08
 
+    # ---- ASR: Triton hotword recall + vLLM encoder bypass -----------------
+    # Hotword biasing now uses a process-wide Triton recall pool: each audio
+    # segment retrieves a small top-K list from the global pool, then injects
+    # only those words into the ASR prompt. Encoder bypass additionally sends
+    # Triton's projector frames to vLLM as an ``audio_embeds`` block; it is only
+    # valid for the Amphion 1.7B prompt/checkpoint family and falls back to raw
+    # audio when enrollment or a different prompt template is used.
+    enable_hotword_recall: bool = True
+    recall_top_k: int = 50
+    enable_encoder_bypass: bool = True
+
     # ---- ASR: inverse text normalization (ITN) + license plate -----------
     # The model emits spoken-form text (六五四三八, 二零二四年); for display we
     # normalize finals to written form. Two independent switches (final only —
@@ -154,6 +165,24 @@ class Config:
     asr_request_timeout: float = 120
     enable_pseudo_stream: bool = True
     pseudo_stream_interval_ms: int = 500
+
+    # ---- ASR: k2 streaming recognizer for partials / endpoint authority ----
+    # k2 is an external gRPC streaming ASR service. In this integration it is
+    # deliberately plain recognition only: no hotwords, no target-speaker
+    # enrollment, no token timestamps. Its partial text replaces local
+    # pseudo-streaming, while final text still comes from the LLM ASR pipeline.
+    k2_enabled: bool = False
+    k2_target: str = ""
+    k2_sample_rate: int = SAMPLE_RATE
+    k2_include_token_timestamps: bool = False
+    k2_connect_timeout_sec: float = 5.0
+    k2_fallback_to_local: bool = True
+    # Local assembly guards around the k2 endpoint authority. These keep the
+    # LLM segment clean and bounded without letting local VAD decide when a
+    # sentence ends.
+    k2_max_segment_sec: float = 30.0
+    k2_preroll_ms: int = 300
+    k2_idle_keep_ms: int = 1500
 
     # ---- ASR: target speaker enrollment ----------------------------------
     # When a target-speaker enrollment is uploaded the primary ASR prompt
@@ -314,6 +343,10 @@ class Config:
         # silent to avoid log spam.
         if self.enable_dual_asr_fusion and not self.enable_secondary_asr:
             object.__setattr__(self, "enable_dual_asr_fusion", False)
+        if not self.enable_hotword_recall and self.enable_encoder_bypass:
+            object.__setattr__(self, "enable_encoder_bypass", False)
+        if self.recall_top_k < 0:
+            object.__setattr__(self, "recall_top_k", 0)
         # 首个 partial 门槛若严于 final 段最小时长,partial 就会永远比 final 晚、失去
         # "中间结果"意义;夹到 <= min_segment_duration_ms。和 fusion 不变量一样下沉
         # 到 dataclass,确保 load/override/直接构造(测试)各路径都一致。
@@ -321,6 +354,16 @@ class Config:
             object.__setattr__(
                 self, "pseudo_stream_first_partial_ms", self.min_segment_duration_ms
             )
+        if self.k2_enabled and not self.k2_target.strip():
+            object.__setattr__(self, "k2_enabled", False)
+        if self.k2_sample_rate <= 0:
+            object.__setattr__(self, "k2_sample_rate", SAMPLE_RATE)
+        if self.k2_max_segment_sec < 0:
+            object.__setattr__(self, "k2_max_segment_sec", 0.0)
+        if self.k2_preroll_ms < 0:
+            object.__setattr__(self, "k2_preroll_ms", 0)
+        if self.k2_idle_keep_ms < 0:
+            object.__setattr__(self, "k2_idle_keep_ms", 0)
 
     @property
     def resolved_text_cleanup_api_key(self) -> str:
@@ -403,6 +446,9 @@ CLIENT_OVERRIDABLE_FIELDS: frozenset[str] = frozenset({
     "fusion_disagreement_threshold",
     "fusion_hotword_boost",
     "fusion_primary_score_margin",
+    # Hotword recall behavior
+    "enable_hotword_recall",
+    "recall_top_k",
     # TS-ASR enrollment bounds
     "asr_enrollment_min_sec",
     "asr_enrollment_max_sec",
@@ -707,6 +753,8 @@ def _parse(raw: dict[str, Any]) -> ParsedConfig:
             "enable_dual_asr_fusion=true requires enable_secondary_asr=true; "
             "downgrading fusion to false"
         )
+    if defaults.get("k2_enabled") and not str(defaults.get("k2_target", "")).strip():
+        logger.warning("k2_enabled=true requires k2_target; downgrading k2 to false")
 
     base = _project_base(
         upstreams=upstreams,
