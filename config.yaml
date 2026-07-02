@@ -68,21 +68,23 @@ defaults:
     pseudo_stream_interval_ms: 800
     pseudo_stream_first_partial_ms: 200   # 不变量: <= min_segment_duration_ms
   k2:
-    k2_enabled: false
+    k2_enabled: true
     k2_target: localhost:50051
     k2_sample_rate: 16000
     k2_include_token_timestamps: false    # k2 只做纯识别:不取 token timestamps
     k2_connect_timeout_sec: 5.0
     k2_fallback_to_local: true
-    k2_max_segment_sec: 30.0              # k2 长时间不出 endpoint 时本地强切兜底
-    k2_preroll_ms: 300                    # 送 LLM final 前 TenVad 修剪的起音预滚
-    k2_idle_keep_ms: 1500                 # 未见 k2 partial 前静音缓冲只保留最近窗口
+    k2_max_segment_sec: 30.0              # k2 长时间不出 endpoint 时本地强切兜底，防止缓冲无限增长
+    k2_idle_keep_ms: 1500                 # 未见 k2 起音前，本地缓冲只保留最近窗口
+    k2_voice_gate_enabled: true           # k2 partial/endpoint 放行前需本地确认有人声证据
+    k2_voice_gate_threshold: 0.65         # 只做 accept/drop，不用本地 VAD 裁剪 k2 段边界
+    k2_voice_gate_start_frames: 10        # 约 160ms 连续人声证据，抑制环境音误触发并降低首字额外门控延迟
   asr:
     enable_primary_asr: true
     enable_secondary_asr: true            # 端点未绑 secondary 上游时, 投影强制 false
     enable_dual_asr_fusion: false         # final 是否双模型融合(需 secondary 在线)
     primary_asr_timeout: 4.0              # primary 软降级上限(非 HTTP 超时)
-    debug_show_dual_asr: false            # 出站附带双 ASR 调试视图(主要给 /ws/audio)
+    debug_show_dual_asr: false            # 出站附带双 ASR 调试字段(当前主前端不展示)
   fusion:
     fusion_similarity_threshold: 0.85
     fusion_min_primary_score: 0.55
@@ -93,6 +95,8 @@ defaults:
   recall:
     enable_hotword_recall: true
     recall_top_k: 50
+    recall_user_id: default                  # 未显式传 user_id 时使用的热词池用户
+    recall_custom_hotword_limit: 8           # 每次请求最多追加多少个临时 hotwords 到 prompt；不写入用户池
     enable_encoder_bypass: true
   itn:
     enable_asr_itn: true
@@ -133,6 +137,9 @@ defaults:
     emotion_spec_max_concurrent_jobs: 8
     emotion_spec_job_queue_max: 64
     emotion_spec_job_ttl_sec: 3600
+  debug:                                  # 排查用: 落盘每个 final 段的音频+元信息
+    debug_dump_enabled: false             # 生产环境请置 false(磁盘无限增长); 仅 native /transcribe-streaming 暴露 dump_id
+    debug_dump_dir: debug_dumps           # 相对路径相对项目根; 也可填绝对路径
 
 # 全局单例辅助服务: 不随端点变化, 所有端点/REST 共享(工具型外部服务)。
 services:
@@ -157,8 +164,8 @@ rest:
                                      # (每段 2 个 vLLM 请求, 吞吐约减半, 见 benchmark 文档)
 
 # WS 端点: 每个端点自主声明 协议/任务/上游绑定/策略(不从全局隐式继承)。
-#   protocol: native | astv3   (browser_demo 复用 native wire, 故归在 task)
-#   task:     asr | emotion | browser_demo
+#   protocol: native | astv3
+#   task:     asr | emotion
 #   upstreams: 角色 -> upstream 名 (primary/secondary/emotion/emotion_spec)
 #   policy:   软默认(client_overridable 端点的白名单字段可再覆盖)
 #   lock:     硬锁定(客户端覆盖后强制重施)
@@ -178,8 +185,3 @@ endpoints:
     protocol: native
     task: emotion
     upstreams: { emotion: amphion_emotion }
-  - path: /ws/audio
-    protocol: native
-    task: browser_demo
-    upstreams: { primary: amphion_asr, secondary: qwen_asr, emotion_spec: amphion_spec }
-    input_sample_rate: 48000

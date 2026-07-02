@@ -1,12 +1,12 @@
 /**
- * AudioWorklet processor – forwards raw 48 kHz PCM to the main thread
- * without any client-side downsampling.  The server handles high-quality
- * resampling to 16 kHz using a Kaiser-windowed sinc FIR filter.
+ * AudioWorklet processor - forwards 16 kHz mono PCM chunks to the main thread.
+ * The page creates AudioContext({ sampleRate: 16000 }), so browser resampling
+ * happens before this processor sees the samples.
  */
 class AudioCaptureProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    this._size = 1440; // 30 ms at 48 kHz – divisible by 3 for clean server resample
+    this._size = 1280; // 80 ms at 16 kHz, matching /transcribe-streaming guidance.
     this._buf = new Float32Array(this._size + 128); // room for one extra quantum
     this._pos = 0;
   }

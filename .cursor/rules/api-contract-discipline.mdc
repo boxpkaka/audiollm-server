@@ -41,7 +41,6 @@ alwaysApply: true
 
 | 后端路由 (`backend/main.py`) | 文档 |
 |---|---|
-| `@app.websocket("/ws/audio")` | `docs/api-reference.md`（浏览器 demo 调试接口；外部集成不推荐） |
 | `@app.websocket("/transcribe-streaming")` | `docs/transcribe-streaming-protocol.md` + `docs/api-reference.md` 速览 |
 | `@app.websocket("/tuling/ast/v3")` | `docs/tuling-ast-v3-protocol.md` + `docs/api-reference.md` 速览 |
 | `@app.websocket("/astv3-test-proxy")` | `docs/api-reference.md`（AST v3 测试页同源代理；透明转发，无独立协议） |

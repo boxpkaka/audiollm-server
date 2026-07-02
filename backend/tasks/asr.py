@@ -72,6 +72,7 @@ class AsrTaskEngine(BaseTaskEngine):
                     prompt_template=cfg.vllm_prompt_template,
                     timeout=cfg.asr_request_timeout,
                     runtime_config=cfg,
+                    recall_user_id=ctx.recall_user_id,
                 ),
                 timeout=cfg.primary_asr_timeout,
             )
@@ -105,6 +106,29 @@ class AsrTaskEngine(BaseTaskEngine):
             audio_duration, elapsed, rtf, text[:80],
         )
 
+        # Dump before the empty-text early return: a segment that produced
+        # audio but no text ("audio came in, nothing recognized") is exactly a
+        # case worth inspecting. dump_id only rides the wire when a final is
+        # actually sent (text non-empty), keeping dump_id <-> bubble 1:1.
+        dump_id: str | None = None
+        if ctx.dumper is not None:
+            dump_id = await ctx.dumper.write_final(
+                seg_id=seg.id,
+                pcm=segment,
+                meta=self._segment_dump_meta(
+                    text=text,
+                    detected_lang=detected_lang,
+                    audio_duration=audio_duration,
+                    elapsed=elapsed,
+                    rtf=rtf,
+                    seg=seg,
+                    primary_result=primary_result,
+                    secondary_result=secondary_result,
+                    hw_snapshot=hw_snapshot,
+                    ctx=ctx,
+                ),
+            )
+
         if not text:
             return False
 
@@ -112,7 +136,13 @@ class AsrTaskEngine(BaseTaskEngine):
             "type": "final",
             "text": text,
             "language": detected_lang,
+            "audio_b64": wav_b64,
+            "duration_sec": audio_duration,
         }
+        if dump_id:
+            payload["dump_id"] = dump_id
+        if seg.id:
+            payload["id"] = seg.id
         if self._emit_timing:
             if seg.start_ms is not None:
                 payload["bg_ms"] = seg.start_ms
@@ -161,6 +191,7 @@ class AsrTaskEngine(BaseTaskEngine):
                     prompt_template=cfg.vllm_prompt_template,
                     timeout=cfg.asr_request_timeout,
                     runtime_config=cfg,
+                    recall_user_id=ctx.recall_user_id,
                 ),
                 timeout=cfg.primary_asr_timeout,
             )
@@ -206,11 +237,18 @@ class AsrTaskEngine(BaseTaskEngine):
         if not text:
             return
 
+        # Record the partial history so the segment's dump can show how the
+        # text evolved before the final settled (useful for "dropped word"
+        # triage). Cheap, in-loop; no IO here.
+        if ctx.dumper is not None:
+            ctx.dumper.record_partial(snap.id, text)
+
         await ctx.send_json(
             {
                 "type": "partial",
                 "text": text,
                 "language": ctx.language,
+                **({"id": snap.id} if snap.id else {}),
             }
         )
 
@@ -239,6 +277,83 @@ class AsrTaskEngine(BaseTaskEngine):
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _result_text(result: object) -> str:
+        if isinstance(result, dict):
+            return str(result.get("transcription") or "")
+        return ""
+
+    @staticmethod
+    def _result_raw(result: object) -> str:
+        if isinstance(result, dict):
+            return str(result.get("raw_text") or "")
+        return ""
+
+    def _segment_dump_meta(
+        self,
+        *,
+        text: str,
+        detected_lang: str | None,
+        audio_duration: float,
+        elapsed: float,
+        rtf: float,
+        seg: SegmentReady,
+        primary_result: object,
+        secondary_result: object,
+        hw_snapshot: list[str],
+        ctx: SessionContext,
+    ) -> dict:
+        """Assemble the per-segment dump record (JSON-serializable)."""
+        cfg = ctx.cfg
+        reported = (
+            list(primary_result.get("reported_hotwords") or [])
+            if isinstance(primary_result, dict)
+            else []
+        )
+        return {
+            "text": text,
+            "detected_language": detected_lang,
+            "language": ctx.language,
+            "src_lang": ctx.src_lang,
+            "audio": {
+                "duration_sec": round(audio_duration, 3),
+                "sample_rate": SAMPLE_RATE,
+                "num_samples": int(len(seg.pcm)),
+            },
+            "timing": {
+                "infer_elapsed_sec": round(elapsed, 3),
+                "rtf": round(rtf, 3),
+                "bg_ms": seg.start_ms,
+                "ed_ms": seg.end_ms,
+                "is_stop_flush": seg.is_stop_flush,
+            },
+            "asr": {
+                "primary_text": self._result_text(primary_result),
+                "primary_raw": self._result_raw(primary_result),
+                "secondary_text": self._result_text(secondary_result),
+                "secondary_raw": self._result_raw(secondary_result),
+                "reported_hotwords": reported,
+                "hotwords_snapshot": list(hw_snapshot or []),
+                "recall_user_id": ctx.recall_user_id,
+            },
+            "model": {
+                "vllm_base_url": cfg.vllm_base_url,
+                "vllm_model_name": cfg.vllm_model_name,
+                "vllm_prompt_template": cfg.vllm_prompt_template,
+                "secondary_vllm_base_url": cfg.secondary_vllm_base_url,
+                "secondary_vllm_model_name": cfg.secondary_vllm_model_name,
+            },
+            "flags": {
+                "enable_primary_asr": cfg.enable_primary_asr,
+                "enable_secondary_asr": cfg.enable_secondary_asr,
+                "enable_dual_asr_fusion": cfg.enable_dual_asr_fusion,
+                "enable_hotword_recall": cfg.enable_hotword_recall,
+                "enable_encoder_bypass": cfg.enable_encoder_bypass,
+                "k2_enabled": cfg.k2_enabled,
+                "enable_pseudo_stream": cfg.enable_pseudo_stream,
+            },
+        }
 
     async def _dual_asr(
         self,
@@ -274,6 +389,7 @@ class AsrTaskEngine(BaseTaskEngine):
                         prompt_template=cfg.vllm_prompt_template,
                         timeout=cfg.asr_request_timeout,
                         runtime_config=cfg,
+                        recall_user_id=ctx.recall_user_id,
                     ),
                     timeout=cfg.primary_asr_timeout,
                 )

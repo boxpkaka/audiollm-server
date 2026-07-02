@@ -130,6 +130,7 @@ async def transcribe_pcm_i16(
     cfg: Config,
     language: str = "",
     hotwords: list[str] | None = None,
+    recall_user_id: str | None = None,
     on_segments_planned: Callable[[int], None] | None = None,
     on_segment_done: Callable[[int], None] | None = None,
     release_input: Callable[[], None] | None = None,
@@ -189,6 +190,7 @@ async def transcribe_pcm_i16(
             hotwords=hotwords,
             language=language,
             audio_pcm=pcm,
+            recall_user_id=recall_user_id,
         )
 
     async def run_one(seg: OfflineSegment) -> dict:

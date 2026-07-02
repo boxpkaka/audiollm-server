@@ -12,7 +12,7 @@ import numpy as np
 
 from ..asr.k2 import asr_pb2 as pb
 from ..asr.k2.client import get_k2_stub, validate_k2_server
-from ..audio.vad import VADProcessor
+from ..audio.vad import TenVad, VADProcessor
 from ..config import SAMPLE_RATE, Config
 from .events import PartialText, SegmentReady
 
@@ -21,14 +21,87 @@ logger = logging.getLogger(__name__)
 _BYTES_PER_SAMPLE = 2
 _EVENT_SENTINEL = object()
 _REQUEST_SENTINEL = object()
+_IDLE_SPEECH_RMS = 0.003
+_DIGITAL_SILENCE_RMS = 0.0005
+
+
+class _K2VoiceGate:
+    """Incremental speech-evidence gate for k2 events.
+
+    k2 remains the endpoint authority. This gate only answers whether the
+    current k2 segment has accumulated enough local speech evidence to be
+    forwarded to partial/final consumers; it never trims or re-cuts the audio.
+    """
+
+    def __init__(self, cfg: Config) -> None:
+        self.enabled = bool(cfg.k2_voice_gate_enabled)
+        self.threshold = float(cfg.k2_voice_gate_threshold)
+        self.start_frames = max(1, int(cfg.k2_voice_gate_start_frames))
+        self.smoothing_alpha = min(1.0, max(0.0, float(cfg.vad_smoothing_alpha)))
+        self._processor = VADProcessor(
+            threshold=self.threshold,
+            smoothing_alpha=self.smoothing_alpha,
+            start_frames=self.start_frames,
+            sample_rate=SAMPLE_RATE,
+        )
+        self._carry = np.empty(0, dtype=np.int16)
+        self._smoothed_prob: float | None = None
+        self._speech_count = 0
+        self._has_voice = not self.enabled
+
+    @property
+    def has_voice(self) -> bool:
+        return self._has_voice
+
+    def reset(self) -> None:
+        self._carry = np.empty(0, dtype=np.int16)
+        self._smoothed_prob = None
+        self._speech_count = 0
+        self._has_voice = not self.enabled
+
+    def feed(self, pcm_bytes: bytes) -> None:
+        if not self.enabled or not pcm_bytes:
+            return
+        pcm = np.frombuffer(pcm_bytes, dtype=np.int16)
+        if self._carry.size:
+            pcm = np.concatenate([self._carry, pcm])
+        hop = self._processor.hop_size
+        used = (len(pcm) // hop) * hop
+        self._carry = (
+            pcm[used:].copy() if used < len(pcm) else np.empty(0, dtype=np.int16)
+        )
+        for i in range(0, used, hop):
+            self._process_frame(pcm[i : i + hop])
+
+    def _process_frame(self, frame_i16: np.ndarray) -> None:
+        vad_backend = self._processor.vad
+        if TenVad is not None and isinstance(vad_backend, TenVad):
+            vad_input = frame_i16
+        else:
+            # The energy fallback expects normalized float PCM; callers in the
+            # local VAD path normally provide that already, but k2 receives raw
+            # int16 bytes so we normalize explicitly here.
+            vad_input = frame_i16.astype(np.float32) / 32768.0
+        raw_prob = self._processor._extract_prob(vad_backend.process(vad_input))
+        if self._smoothed_prob is None:
+            self._smoothed_prob = raw_prob
+        else:
+            a = self.smoothing_alpha
+            self._smoothed_prob = (a * self._smoothed_prob) + ((1.0 - a) * raw_prob)
+        if self._smoothed_prob > self.threshold:
+            self._speech_count += 1
+        else:
+            self._speech_count = 0
+        if self._speech_count >= self.start_frames:
+            self._has_voice = True
 
 
 class K2SegmentedStream:
     """k2-backed stream that emits k2 partials and LLM-ready segments.
 
-    k2 owns endpointing. Local VAD is used only after k2 has decided a segment
-    boundary, to trim leading/trailing silence before the LLM final path sees
-    the audio.
+    k2 owns endpointing. This stream keeps a bounded copy of the PCM sent to
+    k2 and emits that same audio for LLM final inference; local VAD must not
+    re-decide segment starts/ends or it can drop soft onsets that k2 heard.
     """
 
     def __init__(self) -> None:
@@ -45,12 +118,14 @@ class K2SegmentedStream:
         self._buffer_start_sample = 0
         self._total_samples = 0
         self._saw_partial = False
-        self._idle_vad = VADProcessor()
+        self._segment_seq = 0
+        self._active_segment_id: str | None = None
         self._idle_seen_speech = False
+        self._voice_gate: _K2VoiceGate | None = None
 
     def configure(self, cfg: Config) -> None:
         self._cfg = cfg
-        self._idle_vad.apply_config(cfg)
+        self._voice_gate = _K2VoiceGate(cfg)
 
     @property
     def cfg(self) -> Config:
@@ -82,6 +157,7 @@ class K2SegmentedStream:
 
         self._append_buffer(pcm_bytes)
         self._update_idle_speech(pcm_bytes)
+        self._update_voice_gate(pcm_bytes)
         req = pb.PcmRequest(
             audio_chunk=pb.AudioChunk(
                 data=pcm_bytes,
@@ -147,6 +223,8 @@ class K2SegmentedStream:
                     encoding=pb.PCM_S16LE,
                     channels=1,
                 ),
+                decoding=pb.Decoding(method=pb.GREEDY_SEARCH),
+                enable_endpoint=True,
                 # k2 is intentionally plain recognition only.
                 include_token_timestamps=False,
             )
@@ -163,9 +241,24 @@ class K2SegmentedStream:
                 which = ev.WhichOneof("payload")
                 if which == "partial":
                     text = ev.partial.text.strip()
+                    is_first_partial = not self._saw_partial
                     self._saw_partial = True
                     if text and self.cfg.enable_pseudo_stream:
-                        await self._event_q.put(PartialText(text=text))
+                        segment_id = self._current_segment_id()
+                        if not self._voice_gate_has_voice():
+                            if is_first_partial:
+                                logger.info(
+                                    "k2 first partial suppressed by voice gate "
+                                    "id=%s text=%r",
+                                    segment_id,
+                                    text,
+                                )
+                            continue
+                        if is_first_partial:
+                            logger.info("k2 first partial id=%s text=%r", segment_id, text)
+                        await self._event_q.put(
+                            PartialText(text=text, id=segment_id)
+                        )
                 elif which in ("endpoint", "final"):
                     self._emit_buffered_segment(is_stop_flush=self._closing)
                 elif which == "error":
@@ -195,9 +288,20 @@ class K2SegmentedStream:
         self._buffer.clear()
         self._buffer_start_sample = self._total_samples
         self._saw_partial = False
-        self._idle_vad = VADProcessor()
-        self._idle_vad.apply_config(self.cfg)
         self._idle_seen_speech = False
+        if self._voice_gate is not None:
+            self._voice_gate.reset()
+
+    def _current_segment_id(self) -> str:
+        if self._active_segment_id is None:
+            self._segment_seq += 1
+            self._active_segment_id = f"seg-{self._segment_seq}"
+        return self._active_segment_id
+
+    def _finish_segment_id(self) -> str:
+        segment_id = self._current_segment_id()
+        self._active_segment_id = None
+        return segment_id
 
     def _trim_idle_buffer_if_needed(self) -> None:
         if self._saw_partial or self._idle_seen_speech:
@@ -216,13 +320,20 @@ class K2SegmentedStream:
         if self._idle_seen_speech:
             return
         pcm = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-        hop = self._idle_vad.hop_size
-        used = (pcm.size // hop) * hop
-        for off in range(0, used, hop):
-            self._idle_vad.process(pcm[off : off + hop])
-            if self._idle_vad.is_speaking:
-                self._idle_seen_speech = True
-                return
+        if pcm.size == 0:
+            return
+        rms = float(np.sqrt(np.mean(np.square(pcm), dtype=np.float32)))
+        if rms >= _IDLE_SPEECH_RMS:
+            self._idle_seen_speech = True
+
+    def _update_voice_gate(self, pcm_bytes: bytes) -> None:
+        if self._voice_gate is not None:
+            self._voice_gate.feed(pcm_bytes)
+
+    def _voice_gate_has_voice(self) -> bool:
+        if self._voice_gate is None:
+            return True
+        return self._voice_gate.has_voice
 
     def _force_cut_if_needed(self) -> None:
         max_samples = int(float(self.cfg.k2_max_segment_sec) * SAMPLE_RATE)
@@ -231,7 +342,7 @@ class K2SegmentedStream:
         buffered_samples = len(self._buffer) // _BYTES_PER_SAMPLE
         if buffered_samples < max_samples:
             return
-        logger.info(
+        logger.warning(
             "Force-cutting k2 segment at %.1fs (cap %.0fs)",
             buffered_samples / SAMPLE_RATE,
             float(self.cfg.k2_max_segment_sec),
@@ -242,76 +353,41 @@ class K2SegmentedStream:
         if not self._buffer:
             self._reset_buffer()
             return
-        trimmed = self._trim_segment(bytes(self._buffer), self._buffer_start_sample)
+        segment_id = self._finish_segment_id()
+        base_sample = self._buffer_start_sample
+        saw_partial = self._saw_partial
+        voice_gate_has_voice = self._voice_gate_has_voice()
+        pcm_i16 = np.frombuffer(bytes(self._buffer), dtype=np.int16)
         self._reset_buffer()
-        if trimmed is None:
+        if pcm_i16.size == 0:
             return
-        pcm, start_sample, end_sample = trimmed
+        pcm = pcm_i16.astype(np.float32) / 32768.0
+        rms = float(np.sqrt(np.mean(np.square(pcm), dtype=np.float32)))
+        if not saw_partial and rms < _DIGITAL_SILENCE_RMS:
+            return
+        if not voice_gate_has_voice:
+            logger.info(
+                "k2 segment dropped by voice gate id=%s audio=%.2fs rms=%.5f",
+                segment_id,
+                pcm.size / SAMPLE_RATE,
+                rms,
+            )
+            return
+        end_sample = base_sample + pcm.size
+        logger.info(
+            "k2 segment ready id=%s audio=%.2fs start=%.0fms end=%.0fms stop_flush=%s",
+            segment_id,
+            pcm.size / SAMPLE_RATE,
+            base_sample * 1000.0 / SAMPLE_RATE,
+            end_sample * 1000.0 / SAMPLE_RATE,
+            is_stop_flush,
+        )
         self._event_q.put_nowait(
             SegmentReady(
                 pcm=pcm,
                 is_stop_flush=is_stop_flush,
-                start_ms=start_sample * 1000.0 / SAMPLE_RATE,
+                id=segment_id,
+                start_ms=base_sample * 1000.0 / SAMPLE_RATE,
                 end_ms=end_sample * 1000.0 / SAMPLE_RATE,
             )
         )
-
-    def _trim_segment(
-        self, pcm_bytes: bytes, base_sample: int
-    ) -> tuple[np.ndarray, int, int] | None:
-        pcm_i16 = np.frombuffer(pcm_bytes, dtype=np.int16)
-        if pcm_i16.size == 0:
-            return None
-        pcm = pcm_i16.astype(np.float32) / 32768.0
-        spans = self._vad_speech_spans(pcm)
-        if not spans:
-            return None
-
-        preroll = int(SAMPLE_RATE * self.cfg.k2_preroll_ms / 1000)
-        tail = int(SAMPLE_RATE * self.cfg.vad_keep_tail_ms / 1000)
-        first_start = min(start for start, _end in spans)
-        last_end = max(end for _start, end in spans)
-        start = max(0, first_start - preroll)
-        end = min(pcm.size, last_end + tail)
-        if end <= start:
-            return None
-
-        min_samples = int(SAMPLE_RATE * self.cfg.min_segment_duration_ms / 1000)
-        voiced_span = sum(max(0, end - start) for start, end in spans)
-        if voiced_span < min_samples:
-            return None
-
-        out = pcm[start:end].astype(np.float32, copy=True)
-        return out, base_sample + start, base_sample + end
-
-    def _vad_speech_spans(self, pcm: np.ndarray) -> list[tuple[int, int]]:
-        """Return speech spans from the existing VAD state machine.
-
-        Unlike a raw per-frame threshold, the state machine includes
-        pre-speech backfill and trims trailing silence the same way the local
-        fallback stream does. Multiple spans inside one k2 endpoint are kept as
-        a single bounding range by the caller so natural pauses are preserved.
-        """
-
-        vad = VADProcessor()
-        vad.apply_config(self.cfg)
-        hop = vad.hop_size
-        n_full = (pcm.size // hop) * hop
-        if n_full <= 0:
-            return []
-
-        spans: list[tuple[int, int]] = []
-        for off in range(0, n_full, hop):
-            frame = pcm[off : off + hop]
-            segment = vad.process(frame)
-            if segment is not None:
-                end = off + hop
-                start = max(0, end - len(segment))
-                spans.append((start, end))
-
-        tail = vad.flush()
-        if tail is not None and len(tail) > 0:
-            end = n_full
-            start = max(0, end - len(tail))
-            spans.append((start, end))
-        return spans

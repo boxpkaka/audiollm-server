@@ -14,7 +14,7 @@
 | k2 服务 | localhost:50051，plain recognition，未启用 token timestamps |
 | 被测主模型 | AmphionASR-1.7B，vLLM，localhost:8009 |
 | 端点策略 | k2 partial/endpoint；LLM ASR final；hotword/enrollment 等质量特性仍只作用于 final |
-| 公共配置 | k2_enabled=true、k2_target=localhost:50051、k2_max_segment_sec=30、k2_preroll_ms=300、k2_idle_keep_ms=1500、primary_asr_timeout=4.0s |
+| 公共配置 | k2_enabled=true、k2_target=localhost:50051、k2_max_segment_sec=30、k2_idle_keep_ms=1500、primary_asr_timeout=4.0s |
 | 测试音频 | `/home/ubuntu/data/testdata/base_v2_kespeech_gpu1/wavs/zh/zh_kespeech_1025458_license_plate_v2_1_ref1.wav`，5.60 s |
 | 发送参数 | realtime 模式，chunk 128 ms，每路独立 WebSocket，同相位起跑，单条音频复制 N 路 |
 | 过载后健康检查 | 160 路失败后单路 smoke 正常，未发现后端进入持续拒绝服务状态 |

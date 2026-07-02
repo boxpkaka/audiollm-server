@@ -66,6 +66,7 @@ async def run_oneshot_asr(
     language: str,
     audio_pcm: np.ndarray | None = None,
     enrollment_b64: str | None = None,
+    recall_user_id: str | None = None,
 ) -> dict:
     """Transcribe one clip with the configured primary/secondary models.
 
@@ -90,6 +91,7 @@ async def run_oneshot_asr(
                     prompt_template=cfg.vllm_prompt_template,
                     timeout=cfg.asr_request_timeout,
                     runtime_config=cfg,
+                    recall_user_id=recall_user_id,
                 ),
                 timeout=cfg.primary_asr_timeout,
             )

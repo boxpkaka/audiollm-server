@@ -29,7 +29,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import backend.tasks.asr as asr_task_mod  # noqa: E402
+from backend.asr.k2 import asr_pb2 as k2_pb  # noqa: E402
 from backend.config import SAMPLE_RATE, load_config  # noqa: E402
+from backend.main import _RevalidateStaticFiles  # noqa: E402
 from backend.streaming.audio_stream import (  # noqa: E402
     VadSegmentedStream,
     WholeUtteranceStream,
@@ -60,9 +62,31 @@ def _silent_pcm_bytes(n_samples: int) -> bytes:
     return np.zeros(n_samples, dtype=np.int16).tobytes()
 
 
-def _tone_pcm_bytes(n_samples: int, freq: float = 440.0, sr: int = 16000) -> bytes:
+@pytest.mark.asyncio
+async def test_static_mount_rejects_unknown_websocket(tmp_path: Path):
+    static = _RevalidateStaticFiles(directory=str(tmp_path), html=True)
+    sent: list[dict] = []
+
+    async def receive() -> dict:
+        return {"type": "websocket.disconnect"}
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    await static(
+        {"type": "websocket", "path": "/ws/audio", "root_path": ""},
+        receive,
+        send,
+    )
+
+    assert sent == [{"type": "websocket.close", "code": 1008}]
+
+
+def _tone_pcm_bytes(
+    n_samples: int, freq: float = 440.0, sr: int = 16000, amp: float = 0.6
+) -> bytes:
     t = np.arange(n_samples, dtype=np.float32) / sr
-    sig = (0.6 * np.sin(2 * np.pi * freq * t))
+    sig = amp * np.sin(2 * np.pi * freq * t)
     return (np.clip(sig, -1, 1) * 32767).astype(np.int16).tobytes()
 
 
@@ -243,28 +267,53 @@ def test_partial_floor_still_blocks_too_short_snapshot():
     assert not any(isinstance(e, PartialSnapshot) for e in events)
 
 
-def test_k2_segment_trim_uses_preroll_and_drops_silence(monkeypatch):
+def test_k2_endpoint_emits_full_buffer_without_local_head_trim():
     stream = K2SegmentedStream()
-    cfg = load_config().override(
-        k2_preroll_ms=100,
-        min_segment_duration_ms=200,
-        vad_keep_tail_ms=40,
-    )
+    cfg = load_config().override(k2_idle_keep_ms=500, k2_max_segment_sec=0)
     stream.configure(cfg)
-    hop = VadSegmentedStream().vad.hop_size
-    monkeypatch.setattr(stream, "_vad_speech_spans", lambda _pcm: [(20 * hop, 60 * hop)])
+    stream._voice_gate = _FakeK2VoiceGate(has_voice=True)
 
-    raw = _silent_pcm_bytes(hop * 80)
-    trimmed = stream._trim_segment(raw, base_sample=1000)
+    leading_silence = int(SAMPLE_RATE * 0.5)
+    soft_onset = int(SAMPLE_RATE * 0.5)
+    stream.feed(_silent_pcm_bytes(leading_silence))
+    # Low-energy speech-like onset: old local TenVad trimming could miss this
+    # and cut the segment head; k2 mode must preserve the buffered audio.
+    stream.feed(_tone_pcm_bytes(soft_onset, amp=0.006))
+    stream._emit_buffered_segment(is_stop_flush=False)
 
-    assert trimmed is not None
-    pcm, start_sample, end_sample = trimmed
-    assert pcm.dtype == np.float32
-    assert start_sample == 1000 + max(0, 20 * hop - int(SAMPLE_RATE * 0.1))
-    assert end_sample <= 1000 + hop * 80
+    ev = stream._event_q.get_nowait()
+    assert isinstance(ev, SegmentReady)
+    assert ev.pcm.dtype == np.float32
+    assert ev.pcm.shape == (leading_silence + soft_onset,)
+    assert np.allclose(ev.pcm[:leading_silence], 0.0)
+    assert np.max(np.abs(ev.pcm[leading_silence:])) > 0.0
+    assert ev.start_ms == 0.0
+    assert ev.end_ms == pytest.approx(1000.0)
 
-    monkeypatch.setattr(stream, "_vad_speech_spans", lambda _pcm: [])
-    assert stream._trim_segment(raw, base_sample=0) is None
+
+class _FakeK2VoiceGate:
+    def __init__(self, *, has_voice: bool) -> None:
+        self.has_voice = has_voice
+        self.feed_calls: list[bytes] = []
+        self.reset_calls = 0
+
+    def feed(self, pcm_bytes: bytes) -> None:
+        self.feed_calls.append(pcm_bytes)
+
+    def reset(self) -> None:
+        self.reset_calls += 1
+
+
+def test_k2_silent_endpoint_without_partial_is_dropped():
+    stream = K2SegmentedStream()
+    stream.configure(load_config().override(k2_idle_keep_ms=500, k2_max_segment_sec=0))
+
+    stream.feed(_silent_pcm_bytes(SAMPLE_RATE))
+    stream._emit_buffered_segment(is_stop_flush=False)
+
+    assert stream._event_q.empty()
+    assert len(stream._buffer) == 0
+    assert stream._buffer_start_sample == SAMPLE_RATE
 
 
 def test_k2_idle_buffer_is_bounded_before_first_partial():
@@ -296,21 +345,128 @@ def test_k2_idle_buffer_preserves_fast_fed_speech():
     assert stream._buffer_start_sample == 0
 
 
-def test_k2_force_cut_emits_segment(monkeypatch):
+def test_k2_noisy_endpoint_without_voice_gate_evidence_is_dropped():
+    stream = K2SegmentedStream()
+    stream.configure(load_config().override(k2_idle_keep_ms=500, k2_max_segment_sec=0))
+    stream._voice_gate = _FakeK2VoiceGate(has_voice=False)
+
+    noise = (np.ones(SAMPLE_RATE, dtype=np.int16) * 1200).tobytes()
+    stream.feed(noise)
+    stream._emit_buffered_segment(is_stop_flush=False)
+
+    assert stream._event_q.empty()
+    assert len(stream._buffer) == 0
+    assert stream._voice_gate.reset_calls == 1
+
+
+def test_k2_force_cut_emits_segment():
     stream = K2SegmentedStream()
     cfg = load_config().override(k2_max_segment_sec=0.01, k2_idle_keep_ms=0)
     stream.configure(cfg)
+    stream._voice_gate = _FakeK2VoiceGate(has_voice=True)
 
-    def fake_trim(_raw, base_sample):
-        return np.ones(160, dtype=np.float32), base_sample, base_sample + 160
-
-    monkeypatch.setattr(stream, "_trim_segment", fake_trim)
-    stream.feed(_silent_pcm_bytes(320))
+    stream.feed(_tone_pcm_bytes(320))
 
     ev = stream._event_q.get_nowait()
     assert isinstance(ev, SegmentReady)
-    assert ev.pcm.shape == (160,)
+    assert ev.pcm.shape == (320,)
     assert len(stream._buffer) == 0
+
+
+def test_k2_voice_gate_can_be_disabled_for_legacy_behavior():
+    stream = K2SegmentedStream()
+    cfg = load_config().override(
+        k2_max_segment_sec=0.01,
+        k2_idle_keep_ms=0,
+        k2_voice_gate_enabled=False,
+    )
+    stream.configure(cfg)
+
+    stream.feed(_tone_pcm_bytes(320))
+
+    ev = stream._event_q.get_nowait()
+    assert isinstance(ev, SegmentReady)
+    assert ev.pcm.shape == (320,)
+
+
+class _FakeK2Partial:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class _FakeK2Event:
+    def __init__(self, payload: str, *, text: str = "") -> None:
+        self._payload = payload
+        self.partial = _FakeK2Partial(text)
+
+    def WhichOneof(self, _name: str) -> str:
+        return self._payload
+
+
+class _FakeK2Call:
+    def __init__(self, events: list[_FakeK2Event]) -> None:
+        self._events = events
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._events:
+            raise StopAsyncIteration
+        return self._events.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_k2_partial_is_suppressed_until_voice_gate_passes():
+    stream = K2SegmentedStream()
+    stream.configure(load_config())
+    stream._voice_gate = _FakeK2VoiceGate(has_voice=False)
+    stream._call = _FakeK2Call([
+        _FakeK2Event("partial", text="豪"),
+        _FakeK2Event("session_ended"),
+    ])
+
+    await stream._recv_loop()
+
+    queued = list(stream._event_q._queue)
+    assert not any(isinstance(item, PartialText) for item in queued)
+
+
+@pytest.mark.asyncio
+async def test_k2_partial_passes_after_voice_gate_evidence():
+    stream = K2SegmentedStream()
+    stream.configure(load_config())
+    stream._voice_gate = _FakeK2VoiceGate(has_voice=True)
+    stream._call = _FakeK2Call([
+        _FakeK2Event("partial", text="你好"),
+        _FakeK2Event("session_ended"),
+    ])
+
+    await stream._recv_loop()
+
+    queued = list(stream._event_q._queue)
+    partials = [item for item in queued if isinstance(item, PartialText)]
+    assert len(partials) == 1
+    assert partials[0].text == "你好"
+    assert partials[0].id == "seg-1"
+
+
+@pytest.mark.asyncio
+async def test_k2_request_config_matches_server_streaming_defaults():
+    stream = K2SegmentedStream()
+    stream.configure(load_config())
+
+    req_iter = stream._request_iter()
+    first = await req_iter.__anext__()
+    await req_iter.aclose()
+
+    cfg = first.session_config
+    assert cfg.audio_format.sample_rate == SAMPLE_RATE
+    assert cfg.audio_format.encoding == k2_pb.PCM_S16LE
+    assert cfg.audio_format.channels == 1
+    assert cfg.decoding.method == k2_pb.GREEDY_SEARCH
+    assert cfg.enable_endpoint is True
+    assert cfg.include_token_timestamps is False
 
 
 # ---------------------------------------------------------------------------
@@ -334,7 +490,10 @@ class _RecorderEngine(BaseTaskEngine):
     async def handle_segment(self, seg, ctx):
         self.segments.append(seg)
         if self.respond:
-            return await ctx.send_json({"type": "ack", "n": len(seg.pcm)})
+            payload = {"type": "ack", "n": len(seg.pcm)}
+            if seg.id:
+                payload["id"] = seg.id
+            return await ctx.send_json(payload)
         return False
 
     async def handle_partial(self, snap, ctx):
@@ -385,10 +544,11 @@ class _AsyncScriptedStream:
 
     def feed(self, pcm_bytes):
         self.feed_calls.append(pcm_bytes)
-        self._events.put_nowait(PartialText(text="k2 partial"))
+        self._events.put_nowait(PartialText(text="k2 partial", id="seg-k2-1"))
         self._events.put_nowait(
             SegmentReady(
                 pcm=np.ones(400, dtype=np.float32) * 0.1,
+                id="seg-k2-1",
                 start_ms=10.0,
                 end_ms=35.0,
             )
@@ -417,7 +577,7 @@ async def test_session_dispatches_start_pcm_segment_and_stop():
     stream = _ScriptedStream(feed_events=[[seg]], flush_events=[])
     engine = _RecorderEngine()
     ws = FakeWebSocket([
-        {"text": '{"type":"start","format":"pcm_s16le","sample_rate_hz":16000,"channels":1,"language":"zh","hotwords":["a","b"]}'},
+        {"text": '{"type":"start","format":"pcm_s16le","sample_rate_hz":16000,"channels":1,"language":"zh","user_id":"tenant-a","hotwords":["a","b"]}'},
         {"bytes": _silent_pcm_bytes(160)},
         {"text": '{"type":"stop"}'},
     ])
@@ -431,6 +591,7 @@ async def test_session_dispatches_start_pcm_segment_and_stop():
     assert "ack" in sent_types
 
     assert engine.starts and engine.starts[0]["type"] == "start"
+    assert session.ctx.recall_user_id == "tenant-a"
     assert len(engine.segments) == 1
     assert engine.segments[0].pcm.shape == (800,)
     assert engine.stop_calls == [(True, True)]
@@ -453,8 +614,11 @@ async def test_session_dispatches_async_partial_text_and_segment():
 
     assert stream.started is True
     assert stream.flush_calls and stream.flush_calls[-1] is True
-    assert any(m == {"type": "partial", "text": "k2 partial", "language": ""} for m in ws.sent)
-    assert any(m.get("type") == "ack" for m in ws.sent)
+    assert any(
+        m == {"type": "partial", "text": "k2 partial", "language": "", "id": "seg-k2-1"}
+        for m in ws.sent
+    )
+    assert any(m.get("type") == "ack" and m.get("id") == "seg-k2-1" for m in ws.sent)
     assert len(engine.segments) == 1
     assert engine.partials == []  # PartialText must not call handle_partial/vLLM.
 
@@ -745,6 +909,49 @@ async def test_asr_engine_on_stop_silent_on_disconnect():
 
 
 @pytest.mark.asyncio
+async def test_asr_final_preserves_segment_id(monkeypatch):
+    async def fake_query_audio_model(*_args, **_kwargs):
+        return {
+            "transcription": "分句结果",
+            "detected_language": "zh",
+        }
+
+    async def fail_secondary(*_args, **_kwargs):
+        raise AssertionError("secondary should be disabled")
+
+    monkeypatch.setattr(asr_task_mod, "query_audio_model", fake_query_audio_model)
+    monkeypatch.setattr(asr_task_mod, "query_audio_model_secondary", fail_secondary)
+
+    sent: list[dict] = []
+
+    async def _send_json(payload):
+        sent.append(payload)
+        return True
+
+    cfg = load_config().override(
+        enable_primary_asr=True,
+        enable_secondary_asr=False,
+        enable_dual_asr_fusion=False,
+    )
+    ctx = SessionContext(cfg=cfg, language="zh", src_lang="Chinese", send_json=_send_json)
+    engine = AsrTaskEngine()
+
+    ok = await engine.handle_segment(
+        SegmentReady(pcm=np.ones(1600, dtype=np.float32) * 0.05, id="seg-k2-2"),
+        ctx,
+    )
+
+    assert ok is True
+    assert len(sent) == 1
+    assert sent[0]["type"] == "final"
+    assert sent[0]["text"] == "分句结果"
+    assert sent[0]["language"] == "zh"
+    assert sent[0]["id"] == "seg-k2-2"
+    assert sent[0]["duration_sec"] == pytest.approx(0.1)
+    assert isinstance(sent[0]["audio_b64"], str) and sent[0]["audio_b64"]
+
+
+@pytest.mark.asyncio
 async def test_asr_partial_uses_pure_vllm_without_recall_or_hotwords(monkeypatch):
     calls: list[dict] = []
 
@@ -966,6 +1173,7 @@ def test_ast_v3_asr_config_injects_config_and_language():
             parameter={
                 "asr_config": {
                     "language": "en",
+                    "user_id": "tenant-a",
                     "vad_threshold": 0.3,
                     "enable_pseudo_stream": False,
                 }
@@ -975,6 +1183,7 @@ def test_ast_v3_asr_config_injects_config_and_language():
     ctrl = acts[0].ctrl
     assert ctrl["type"] == "start"
     assert ctrl["language"] == "en"
+    assert ctrl["user_id"] == "tenant-a"
     assert ctrl["config"] == {"vad_threshold": 0.3, "enable_pseudo_stream": False}
 
 
@@ -1233,6 +1442,7 @@ async def test_session_ast_v3_asr_config_overrides_and_whitelist():
                 header={"status": 0},
                 parameter={
                     "asr_config": {
+                        "user_id": "tenant-a",
                         "vad_threshold": 0.37,
                         "vllm_base_url": "http://evil:1",
                     }
@@ -1251,6 +1461,7 @@ async def test_session_ast_v3_asr_config_overrides_and_whitelist():
 
     assert session.cfg.vad_threshold == 0.37  # whitelisted -> applied
     assert session.cfg.vllm_base_url == base_url_before  # infra field dropped
+    assert session.ctx.recall_user_id == "tenant-a"
     assert stream.cfg.vad_threshold == 0.37  # stream reconfigured with new cfg
 
 

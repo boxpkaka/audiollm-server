@@ -49,6 +49,7 @@ __all__ = [
 class TranscriptionJob(BaseJob):
     language: str = ""
     hotwords: list[str] = field(default_factory=list)
+    recall_user_id: str = ""
     pcm_i16: bytes = field(default=b"", repr=False)
     duration_sec: float = 0.0
     segments_total: int | None = None
@@ -94,6 +95,7 @@ class TranscriptionJobStore(JobStore[TranscriptionJob]):
         duration_sec: float,
         language: str = "",
         hotwords: list[str] | None = None,
+        recall_user_id: str = "",
         cfg: Config | None = None,
     ) -> TranscriptionJob:
         if cfg is not None:
@@ -109,6 +111,7 @@ class TranscriptionJobStore(JobStore[TranscriptionJob]):
             updated_at=now,
             language=language,
             hotwords=list(hotwords or []),
+            recall_user_id=recall_user_id,
             pcm_i16=pcm_i16,
             duration_sec=duration_sec,
         )
@@ -130,6 +133,7 @@ class TranscriptionJobStore(JobStore[TranscriptionJob]):
             cfg=self._cfg,
             language=job.language,
             hotwords=job.hotwords,
+            recall_user_id=job.recall_user_id,
             on_segments_planned=on_planned,
             on_segment_done=on_done,
             # Segments hold their own PCM copies once cut; drop the full

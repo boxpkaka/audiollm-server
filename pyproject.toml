@@ -42,6 +42,10 @@ Repository = "https://github.com/open-mmlab/Amphion"
 target-version = "py310"
 line-length = 100
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["manual_tests"]
+
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
 

@@ -57,6 +57,7 @@ Client                                      Server
   "sample_rate_hz": 16000,
   "channels": 1,
   "language": "zh",
+  "user_id": "tenant-a",
   "hotwords": ["挚音科技", "张硕"],
   "enrollment_id": "ule8QilVjZql30Q9oy9kiQ",
   "config": {
@@ -72,19 +73,21 @@ Client                                      Server
 | `sample_rate_hz` | integer | 是 | 固定为 `16000` |
 | `channels` | integer | 是 | 固定为 `1` |
 | `language` | string | 否 | 语言代码；与 query 参数二选一即可 |
-| `hotwords` | string[] | 否 | 兼容旧客户端字段；当前不再驱动 ASR 偏置 |
+| `user_id` | string | 否 | Triton 热词池隔离 ID，默认 `default`；只召回和管理该用户池 |
+| `hotwords` | string[] | 否 | 临时请求热词；final 段会把去重后的前 `recall_custom_hotword_limit` 个追加到 Triton 召回结果后进入 prompt，不写入用户池 |
 | `enrollment_id` | string | 否 | 由 `POST /api/asr/enrollment` 返回的目标说话人 id；传 `null` 或省略表示普通 ASR |
 | `config` | object | 否 | 当前连接的服务端配置覆写，仅白名单字段生效（见“可覆写配置”） |
 
 ### update_hotwords
 
-兼容旧客户端的控制消息。`hotwords` 字段会被接收但不再驱动 ASR 偏置；ASR 热词来自 Triton 全局池对每段音频的召回结果。该消息仍可用于切换/清除目标说话人。
+兼容旧客户端的控制消息。`hotwords` 字段会被接收为后续 final 段的临时请求热词：服务端会把去重后的前 `recall_custom_hotword_limit` 个追加到当前 `user_id` 的 Triton 用户池召回结果后进入 prompt，但不会写入用户池。该消息仍可用于切换/清除目标说话人，也可用 `user_id` 切换热词池。
 
 ```json
 {
   "type": "update_hotwords",
   "hotwords": ["产品名", "人名"],
   "src_lang": "zh",
+  "user_id": "tenant-a",
   "enrollment_id": "ule8QilVjZql30Q9oy9kiQ"
 }
 ```
@@ -92,8 +95,9 @@ Client                                      Server
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `type` | string | 是 | 固定为 `update_hotwords` |
-| `hotwords` | string[] | 是 | 兼容字段；空数组或任意列表都不会改变 Triton 全局池 |
+| `hotwords` | string[] | 是 | 临时请求热词；空数组表示清空后续 final 段的临时热词，不会改变 Triton 用户池 |
 | `src_lang` | string | 否 | 语言代码或语言名称 |
+| `user_id` | string | 否 | 切换后续 final 段使用的 Triton 用户热词池；非法值会返回 `invalid_user_id` 错误并保持原用户 |
 | `enrollment_id` | string \| null | 否 | 切换或清除目标说话人；缺省字段则保持原状，显式传 `null` 表示清除 |
 
 ### 二进制音频帧
@@ -124,6 +128,17 @@ Client                                      Server
 {"type":"ready"}
 ```
 
+当服务端 `debug_dump_enabled=true` 时，`ready` 额外带两个调试字段（默认部署不带，契约不变）：
+
+```json
+{"type":"ready","session_id":"260629-150812-3f9a","dump_dir":"/abs/path/debug_dumps/260629-150812-3f9a"}
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `session_id` | string | 本连接唯一 ID；仅 `debug_dump_enabled=true` 时出现 |
+| `dump_dir` | string | 本会话落盘目录绝对路径；仅 `debug_dump_enabled=true` 时出现 |
+
 ### partial / partial_asr
 
 ```json
@@ -150,7 +165,9 @@ Client                                      Server
   "id": "seg-001",
   "text": "你好，欢迎使用语音识别服务。",
   "language": "zh",
-  "duration_sec": 3.42
+  "duration_sec": 3.42,
+  "audio_b64": "UklGR...",
+  "dump_id": "260629-150812-3f9a/seg-001"
 }
 ```
 
@@ -161,6 +178,8 @@ Client                                      Server
 | `text` | string | 最终转写文本，默认已做逆文本规范化（ITN）与车牌规范化，见下方说明 |
 | `language` | string | 检测或传入的语言 |
 | `duration_sec` | number | 本次推理使用的音频时长；部分流式消息可能不带 |
+| `audio_b64` | string | 当前分段音频的 WAV base64，用于前端回放；为空 final 不带。k2 模式下它与送入 LLM ASR 的音频同源，来自 k2 endpoint 对应的本地缓冲，不再经过本地 VAD 段首/段尾二次裁剪 |
+| `dump_id` | string | 仅 `debug_dump_enabled=true` 且本段有 final 文本时出现；值为 `<session_id>/<seg_id>`，同时是落盘文件相对路径 stem（`<dump_dir>/../<dump_id>.wav` 与 `.json`） |
 
 文本规范化（仅 final）：服务端默认对 final 文本做两类本地后处理，partial 不变：
 
@@ -180,11 +199,27 @@ Client                                      Server
 
 客户端收到 `error` 后应记录完整 payload，并根据业务需要停止发送音频或关闭连接。
 
+## 调试落盘 (debug dump)
+
+运维级开关（不在客户端可覆写白名单内），用于排查“回放/最终结果对不上”一类问题。`config.yaml` 的 `defaults.debug` 分组：
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `debug_dump_enabled` | boolean | false | 开启后每个 final 段落盘音频+元信息；生产建议关闭（磁盘无限增长） |
+| `debug_dump_dir` | string | debug_dumps | 落盘根目录；相对路径相对项目根，也可填绝对路径 |
+
+开启后：`ready` 带 `session_id` / `dump_dir`，`final` 带 `dump_id`；每个 final 段写两份文件到 `<dump_dir>/<session_id>/<seg_id>.{wav,json}`。
+
+- `<seg_id>.wav`：送入推理的那段 PCM（与该 final 的 `audio_b64`、即前端回放音频同源同字节）。
+- `<seg_id>.json`：final 文本、该段的 partial 历史、主/副模型原始输出、模型与开关快照、时长/时延等。
+
+前端在每个气泡的元信息处显示可点击复制的 `dump_id`，复制后即可直接定位上述文件。该能力只作用于 native `/transcribe-streaming`：AST v3 不下发 `ready`、其 final 也只编码协议字段，故不受影响。
+
 ## 可覆写配置
 
 `start.config` 仅对当前连接生效、不落盘，只接受扁平字段名。覆写字段受服务端白名单（`backend/config.py` 的 `CLIENT_OVERRIDABLE_FIELDS`）约束：白名单外字段（如模型地址 `*_vllm_base_url`、密钥、连接池/队列等基础设施项）、未知字段与非法值都会被忽略并保持服务端默认，不会中断连接。完整白名单与 `/tuling/ast/v3` 的 `parameter.asr_config` 共用，按类别速览见 [API 总览](api-reference.md) 的“临时配置覆写”。
 
-当服务端启用 `k2_enabled=true` 时，本端点的 partial 来自外部 k2 流式 ASR，final 仍由本服务 LLM ASR 产生。k2 只做纯识别，不接热词、不接目标说话人、不返回 token timestamps；热词召回、目标说话人过滤与文本规范化只作用于 final。此时切段权威是 k2 endpoint，VAD 与伪流式间隔类覆写仍会被接受但不再决定切点或首字时机；`enable_pseudo_stream=false` 仍会抑制 partial 下发。
+当服务端启用 `k2_enabled=true` 时，本端点的 partial 来自外部 k2 流式 ASR，final 仍由本服务 LLM ASR 产生。k2 只做纯识别，不接热词、不接目标说话人、不返回 token timestamps；热词召回、目标说话人过滤与文本规范化只作用于 final。此时切段权威是 k2 endpoint，本服务只保留有界缓冲，并在 partial/final 进入下游前用 `k2_voice_gate_*` 确认有人声证据；voice gate 只做放行/丢弃，不裁剪段首/段尾。VAD 与伪流式间隔类覆写仍会被接受但不再决定切点或首字时机；`enable_pseudo_stream=false` 仍会抑制 partial 下发。
 
 对本端点有效的常用字段：
 
@@ -226,7 +261,7 @@ python docs/examples/ws_transcribe.py sample.wav \
 |---|---|---|---|
 | `audio` | file | 是 | WAV 音频文件 |
 | `language` | string | 否 | 语言代码 |
-| `hotwords` | string | 否 | 兼容旧客户端字段；当前不再驱动 ASR 偏置 |
+| `hotwords` | string | 否 | 临时请求热词；去重限量后追加到 Triton 召回结果后进入 prompt，不写入用户池 |
 | `enrollment_id` | string | 否 | 由 `POST /api/asr/enrollment` 返回的目标说话人 id；不传或失效时静默回退到普通 ASR |
 
 ### 响应
@@ -350,7 +385,7 @@ print(r.json())
 
 ## ASR Prompt 模板
 
-后端按主模型 upstream 的 `prompt_template` 选择 prompt 结构。客户端协议仍兼容 `hotwords` 与 `enrollment_id`，但热词偏置来自 Triton 全局池召回的 top-K 结果，不再来自会话上传的 `hotwords`。模板选择是服务端模型配置，不可客户端覆写。两套模板都支持普通 ASR、召回热词、TS-ASR、TS-ASR + 召回热词。
+后端按主模型 upstream 的 `prompt_template` 选择 prompt 结构。热词偏置来自当前 `user_id` 的 Triton 用户池召回 top-K 结果，并追加少量请求临时 `hotwords`（默认最多 8 个，去重后不写入用户池）。模板选择是服务端模型配置，不可客户端覆写。两套模板都支持普通 ASR、召回热词、TS-ASR、TS-ASR + 召回热词。
 
 ### `amphion_asr`（Amphion 4B）
 
@@ -454,7 +489,7 @@ TS-ASR + 热词的实际 `messages` 示例：
 ]
 ```
 
-final 段 prompt 中实际注入的是 Triton 召回 top-K（默认 `recall_top_k=50`）热词，格式仍为半角逗号 `,` 分隔无空格。伪流式 partial 不执行召回、不注入热词、也不走 encoder bypass，只使用纯 vLLM raw-audio 推理。`Language:` 行不会出现在 ASR prompt 中；1.7B 若输出 `language Chinese<asr_text>...` 前缀，服务端会剥离前缀并记录模型自检语种。服务端还会折叠超过 20 次的退化重复输出，避免解码 loop 污染 partial / final 文本。
+final 段 prompt 中实际注入的是 Triton 召回 top-K（默认 `recall_top_k=50`）热词，再按顺序追加去重后的临时 `hotwords`（默认最多 `recall_custom_hotword_limit=8` 个），格式仍为半角逗号 `,` 分隔无空格。伪流式 partial 不执行召回、不注入热词、也不走 encoder bypass，只使用纯 vLLM raw-audio 推理。`Language:` 行不会出现在 ASR prompt 中；1.7B 若输出 `language Chinese<asr_text>...` 前缀，服务端会剥离前缀并记录模型自检语种。服务端还会折叠超过 20 次的退化重复输出，避免解码 loop 污染 partial / final 文本。
 
 ## 相关文档
 

@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 import numpy as np
 
 from ..config import Config, Upstream, get_service_upstream
+from ..recall_user import DEFAULT_RECALL_USER_ID, normalize_recall_user_id
 
 DEFAULT_RECALL_MODEL = "rag_asr_retrieve"
 SAMPLE_RATE = 16000
@@ -86,17 +87,20 @@ def _infer_sync(
     sample_rate: int,
     top_k: int,
     want_audio_embeds: bool,
+    user_id: str,
 ) -> RecallResult:
     upstream = _recall_upstream()
     httpclient, client = _client_for(upstream)
     wav = np.asarray(pcm, dtype=np.float32).reshape(-1)
+    wav_input = httpclient.InferInput("WAV", wav.shape, "FP32")
     inputs = [
         _string_input(httpclient, "ACTION", "infer"),
-        httpclient.InferInput("WAV", wav.shape, "FP32"),
+        _string_input(httpclient, "USER_ID", user_id),
+        wav_input,
         _int_input(httpclient, "SAMPLE_RATE", sample_rate),
         _int_input(httpclient, "TOP_K", top_k),
     ]
-    inputs[1].set_data_from_numpy(wav)
+    wav_input.set_data_from_numpy(wav)
 
     outputs = [
         httpclient.InferRequestedOutput("WORD_LIST"),
@@ -125,9 +129,11 @@ async def recall_audio(
     *,
     sample_rate: int = SAMPLE_RATE,
     want_audio_embeds: bool = True,
+    user_id: str | None = None,
 ) -> RecallResult:
     """Recall hotwords for one audio segment."""
     top_k = max(int(cfg.recall_top_k), 0)
+    resolved_user_id = normalize_recall_user_id(user_id, default=cfg.recall_user_id)
     if top_k == 0:
         return RecallResult(
             words=[],
@@ -141,6 +147,7 @@ async def recall_audio(
         sample_rate=sample_rate,
         top_k=top_k,
         want_audio_embeds=want_audio_embeds,
+        user_id=resolved_user_id,
     )
 
 
@@ -151,10 +158,18 @@ def _management_sync(
     query: str | None = None,
     limit: int | None = None,
     offset: int = 0,
+    user_id: str | None = None,
 ) -> dict[str, object]:
     upstream = _recall_upstream()
     httpclient, client = _client_for(upstream)
-    inputs = [_string_input(httpclient, "ACTION", action)]
+    resolved_user_id = normalize_recall_user_id(
+        user_id,
+        default=DEFAULT_RECALL_USER_ID,
+    )
+    inputs = [
+        _string_input(httpclient, "ACTION", action),
+        _string_input(httpclient, "USER_ID", resolved_user_id),
+    ]
     if hotwords is not None:
         inputs.append(
             _string_input(
@@ -195,6 +210,7 @@ async def list_hotword_pool(
     query: str | None = None,
     limit: int | None = None,
     offset: int = 0,
+    user_id: str | None = None,
 ) -> dict[str, object]:
     return await asyncio.to_thread(
         _management_sync,
@@ -202,16 +218,35 @@ async def list_hotword_pool(
         query=query,
         limit=limit,
         offset=offset,
+        user_id=user_id,
     )
 
 
-async def add_hotwords(words: list[str]) -> dict[str, object]:
-    return await asyncio.to_thread(_management_sync, "add", hotwords=words)
+async def add_hotwords(
+    words: list[str],
+    *,
+    user_id: str | None = None,
+) -> dict[str, object]:
+    return await asyncio.to_thread(
+        _management_sync,
+        "add",
+        hotwords=words,
+        user_id=user_id,
+    )
 
 
-async def delete_hotwords(words: list[str]) -> dict[str, object]:
-    return await asyncio.to_thread(_management_sync, "delete", hotwords=words)
+async def delete_hotwords(
+    words: list[str],
+    *,
+    user_id: str | None = None,
+) -> dict[str, object]:
+    return await asyncio.to_thread(
+        _management_sync,
+        "delete",
+        hotwords=words,
+        user_id=user_id,
+    )
 
 
-async def reload_hotword_pool() -> dict[str, object]:
-    return await asyncio.to_thread(_management_sync, "reload")
+async def reload_hotword_pool(*, user_id: str | None = None) -> dict[str, object]:
+    return await asyncio.to_thread(_management_sync, "reload", user_id=user_id)

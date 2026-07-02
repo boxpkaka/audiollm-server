@@ -5,8 +5,8 @@
   //
   // UI mirrors the realtime ASR page (frontend/app.js) but the transport is
   // the iFlytek Tuling AST v3 envelope protocol (docs/tuling-ast-v3-protocol.md)
-  // against a hard-coded remote backend, instead of the browser-demo /ws/audio
-  // protocol. The differences that drive this rewrite:
+  // against a hard-coded remote backend, instead of the native
+  // /transcribe-streaming protocol. The differences that drive this rewrite:
   //
   //   * Audio is 16 kHz mono s16le PCM, base64-encoded inside a JSON envelope
   //     (payload.audio.audio), not a raw 48 kHz binary frame.
@@ -64,8 +64,8 @@
 
     const SYNC_PILL_BASE = 'status-pill';
     const HOTWORD_POOL_LIMIT = 1000;
+    const HOTWORD_USER_STORAGE_KEY = 'asr_hotword_user_id';
     const UI_TO_API_LANG = {
-      auto: 'N/A',
       chinese: 'Chinese',
       english: 'English',
       indonesian: 'Indonesian',
@@ -76,8 +76,9 @@
       return UI_TO_API_LANG[langForUi] || 'N/A';
     }
 
-    let srcLangUi = localStorage.getItem('asr_src_lang') || 'auto';
-    if (!Object.prototype.hasOwnProperty.call(UI_TO_API_LANG, srcLangUi)) srcLangUi = 'auto';
+    let srcLangUi = localStorage.getItem('asr_src_lang') || 'chinese';
+    if (!Object.prototype.hasOwnProperty.call(UI_TO_API_LANG, srcLangUi)) srcLangUi = 'chinese';
+    let hotwordUserId = (localStorage.getItem(HOTWORD_USER_STORAGE_KEY) || 'default').trim() || 'default';
 
     // --- DOM refs ---
     const micBtn = document.getElementById('mic-btn');
@@ -92,6 +93,7 @@
     const hotwordReloadBtn = document.getElementById('hotword-reload-btn');
     const hotwordEnabledInput = document.getElementById('hotword-enabled');
     const hotwordSyncStatus = document.getElementById('hotword-sync-status');
+    const hotwordUserInput = document.getElementById('hotword-user-id');
     const hotwordCount = document.getElementById('hotword-count');
     const hotwordTextarea = document.getElementById('hotword-textarea');
     const hotwordExtractBtn = document.getElementById('hotword-extract-btn');
@@ -129,6 +131,24 @@
         }
         el.textContent = t(key, vars || undefined);
       });
+    }
+
+    function currentHotwordUserId() {
+      const value = String(
+        (hotwordUserInput && hotwordUserInput.value) || hotwordUserId || 'default'
+      ).trim() || 'default';
+      hotwordUserId = value;
+      localStorage.setItem(HOTWORD_USER_STORAGE_KEY, value);
+      if (hotwordUserInput && hotwordUserInput.value !== value) {
+        hotwordUserInput.value = value;
+      }
+      return value;
+    }
+
+    function hotwordPoolQuery(params) {
+      const query = new URLSearchParams(params || {});
+      query.set('user_id', currentHotwordUserId());
+      return query.toString();
     }
 
     // --- Hotword management ---
@@ -192,7 +212,9 @@
         hotwordSyncStatus.dataset.state = 'waiting';
       }
       try {
-        const resp = await fetch(`/api/asr/hotword-pool?limit=${HOTWORD_POOL_LIMIT}`);
+        const resp = await fetch(
+          `/api/asr/hotword-pool?${hotwordPoolQuery({ limit: HOTWORD_POOL_LIMIT })}`
+        );
         const payload = await readJsonResponse(resp);
         hotwords = sanitizeHotwords(payload.hotwords || []);
         hotwordPoolTotal = Number(payload.total_count || hotwords.length);
@@ -221,7 +243,7 @@
         const resp = await fetch('/api/asr/hotword-pool', {
           method,
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ hotwords: clean }),
+          body: JSON.stringify({ hotwords: clean, user_id: currentHotwordUserId() }),
         });
         await readJsonResponse(resp);
         await loadHotwordPool();
@@ -233,7 +255,10 @@
     async function reloadHotwordPool() {
       setHotwordPoolBusy(true);
       try {
-        const resp = await fetch('/api/asr/hotword-pool/reload', { method: 'POST' });
+        const resp = await fetch(
+          `/api/asr/hotword-pool/reload?${hotwordPoolQuery()}`,
+          { method: 'POST' }
+        );
         await readJsonResponse(resp);
         await loadHotwordPool();
         if (hotwordExtractStatus) {
@@ -325,6 +350,21 @@
         localStorage.setItem('asr_src_lang', srcLangUi);
       });
     }
+    if (hotwordUserInput) {
+      hotwordUserInput.value = hotwordUserId;
+      const applyHotwordUser = () => {
+        currentHotwordUserId();
+        void loadHotwordPool();
+      };
+      hotwordUserInput.addEventListener('change', applyHotwordUser);
+      hotwordUserInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          hotwordUserInput.blur();
+          applyHotwordUser();
+        }
+      });
+    }
 
     renderHotwords();
     void loadHotwordPool();
@@ -389,6 +429,7 @@
         parameter: {
           asr_config: {
             language: apiLangFromUi(srcLangUi),
+            user_id: currentHotwordUserId(),
             vad_start_frames: 10,
             pseudo_stream_first_partial_ms: 100,
           },
