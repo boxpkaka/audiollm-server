@@ -204,12 +204,16 @@ def test_shipped_config_projects_rest_bindings() -> None:
     assert cfg.emotion_task_mode == "ser"
     assert cfg.emotion_spec_task_mode == "sepc"
     assert cfg.enable_asr_repetition_fix is True
-    assert cfg.k2_enabled is False
+    assert cfg.k2_enabled is True
     assert cfg.k2_target == "localhost:50051"
     assert cfg.k2_include_token_timestamps is False
     assert cfg.k2_max_segment_sec == 30.0
-    assert cfg.k2_preroll_ms == 300
     assert cfg.k2_idle_keep_ms == 1500
+    assert cfg.k2_voice_gate_enabled is True
+    assert cfg.k2_voice_gate_threshold == 0.65
+    assert cfg.k2_voice_gate_start_frames == 10
+    assert cfg.debug_dump_enabled is False
+    assert cfg.debug_dump_dir == "debug_dumps"
     assert (
         cfg.text_cleanup_base_url
         == "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -228,13 +232,10 @@ def test_real_endpoints_parsed() -> None:
         "/transcribe-streaming",
         "/tuling/ast/v3",
         "/emotion-segmented-streaming",
-        "/ws/audio",
     } <= paths
     tuling = next(e for e in ENDPOINTS if e.path == "/tuling/ast/v3")
     assert tuling.protocol == "astv3" and tuling.task == "asr"
     assert tuling.lock == {"enable_secondary_asr": False}
-    ws = next(e for e in ENDPOINTS if e.path == "/ws/audio")
-    assert ws.task == "browser_demo" and ws.input_sample_rate == 48000
     ts = next(e for e in ENDPOINTS if e.path == "/transcribe-streaming")
     assert ts.client_overridable is True
 
@@ -242,7 +243,6 @@ def test_real_endpoints_parsed() -> None:
 def test_valid_combinations_constant() -> None:
     assert ("native", "asr") in VALID_ENDPOINT_COMBINATIONS
     assert ("astv3", "asr") in VALID_ENDPOINT_COMBINATIONS
-    assert ("native", "browser_demo") in VALID_ENDPOINT_COMBINATIONS
     assert ("astv3", "browser_demo") not in VALID_ENDPOINT_COMBINATIONS
 
 
@@ -377,13 +377,6 @@ def test_resolve_real_tuling_primary_only() -> None:
     assert cfg.enable_dual_asr_fusion is False
 
 
-def test_resolve_real_ws_audio_binds_emotion_spec() -> None:
-    spec = next(e for e in ENDPOINTS if e.path == "/ws/audio")
-    cfg = resolve_endpoint(spec)
-    assert cfg.emotion_spec_vllm_base_url == "http://localhost:9001"
-    assert cfg.enable_secondary_asr is True  # secondary bound
-
-
 def test_get_service_upstream() -> None:
     assert get_service_upstream("text_cleanup").name == "dashscope_cleanup"
     assert get_service_upstream("hotword").name == "hotword_llm"
@@ -411,6 +404,12 @@ def test_recall_top_k_clamps_to_non_negative() -> None:
     assert cfg.recall_top_k == 0
 
 
+def test_recall_custom_hotword_limit_is_server_side_and_non_negative() -> None:
+    cfg = Config(recall_custom_hotword_limit=-1)
+    assert cfg.recall_custom_hotword_limit == 0
+    assert "recall_custom_hotword_limit" not in CLIENT_OVERRIDABLE_FIELDS
+
+
 def test_pseudo_stream_first_partial_dataclass_default_is_neutral() -> None:
     cfg = Config()
     assert cfg.pseudo_stream_first_partial_ms == cfg.min_segment_duration_ms == 350
@@ -423,20 +422,42 @@ def test_pseudo_stream_first_partial_clamped_to_min_segment() -> None:
     assert lower.pseudo_stream_first_partial_ms == 200
 
 
+def test_debug_dump_dataclass_defaults_off() -> None:
+    cfg = Config()
+    assert cfg.debug_dump_enabled is False
+    assert cfg.debug_dump_dir == "debug_dumps"
+
+
+def test_debug_dump_empty_dir_falls_back_to_default() -> None:
+    assert Config(debug_dump_dir="   ").debug_dump_dir == "debug_dumps"
+
+
+def test_debug_dump_not_client_overridable() -> None:
+    # A client must not be able to turn on disk writes; override_client drops it.
+    cfg = Config(debug_dump_enabled=False)
+    overridden = cfg.override_client(
+        debug_dump_enabled=True, debug_dump_dir="/tmp/evil"
+    )
+    assert overridden.debug_dump_enabled is False
+    assert overridden.debug_dump_dir == "debug_dumps"
+
+
 def test_k2_requires_target_and_clamps_bounds() -> None:
     cfg = Config(
         k2_enabled=True,
         k2_target="",
         k2_sample_rate=0,
         k2_max_segment_sec=-1,
-        k2_preroll_ms=-10,
         k2_idle_keep_ms=-20,
+        k2_voice_gate_threshold=2.0,
+        k2_voice_gate_start_frames=0,
     )
     assert cfg.k2_enabled is False
     assert cfg.k2_sample_rate == 16000
     assert cfg.k2_max_segment_sec == 0.0
-    assert cfg.k2_preroll_ms == 0
     assert cfg.k2_idle_keep_ms == 0
+    assert cfg.k2_voice_gate_threshold == 1.0
+    assert cfg.k2_voice_gate_start_frames == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -478,6 +499,14 @@ def test_recall_knobs_client_overridable() -> None:
     assert {"enable_hotword_recall", "recall_top_k"} <= CLIENT_OVERRIDABLE_FIELDS
     out = load_config().override_client(recall_top_k=3)
     assert out.recall_top_k == 3
+
+
+def test_recall_user_id_default_and_validation() -> None:
+    cfg = load_config()
+    assert cfg.recall_user_id == "default"
+    assert cfg.override(recall_user_id="tenant-a").recall_user_id == "tenant-a"
+    with pytest.raises(ValueError, match="USER_ID"):
+        cfg.override(recall_user_id="../escape")
 
 
 def test_pseudo_stream_first_partial_clamp_applies_on_override() -> None:

@@ -36,6 +36,9 @@ ENV/
 # Benchmark artifacts (reproducible from scripts/bench_*.py; keep out of VCS)
 bench_results/
 
+# Debug dumps (per-session audio + metadata written when debug_dump_enabled)
+debug_dumps/
+
 # Testing & coverage
 .pytest_cache/
 .mypy_cache/

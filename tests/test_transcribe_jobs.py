@@ -319,6 +319,7 @@ def _wav_upload_bytes(*parts: np.ndarray) -> bytes:
 
 def test_transcription_http_create_poll_succeeds(fake_vad, monkeypatch):
     async def fake_asr(wav_b64, **kwargs):
+        assert kwargs["recall_user_id"] == "tenant-a"
         return {"text": "会议第一句", "language": "zh"}
 
     monkeypatch.setattr(transcribe_mod, "run_oneshot_asr", fake_asr)
@@ -333,7 +334,7 @@ def test_transcription_http_create_poll_succeeds(fake_vad, monkeypatch):
         create = client.post(
             "/api/asr/transcriptions",
             files={"audio": ("meeting.wav", wav, "audio/wav")},
-            data={"language": "zh", "hotwords": "挚音科技"},
+            data={"language": "zh", "hotwords": "挚音科技", "user_id": "tenant-a"},
         )
         assert create.status_code == 202
         body = create.json()

@@ -84,6 +84,40 @@ def _parse_language_field(value: str) -> str | None:
     return v
 
 
+def merge_recalled_and_custom_hotwords(
+    recalled: list[str] | None,
+    custom: list[str] | None,
+    *,
+    custom_limit: int,
+) -> list[str]:
+    """Append a small request-local hotword list after recalled pool hits."""
+    merged: list[str] = []
+    seen: set[str] = set()
+
+    def add_word(raw: object) -> bool:
+        word = str(raw or "").strip()
+        if not word or word in seen:
+            return False
+        seen.add(word)
+        merged.append(word)
+        return True
+
+    for word in recalled or []:
+        add_word(word)
+
+    remaining = max(int(custom_limit), 0)
+    if remaining == 0:
+        return merged
+    for word in custom or []:
+        before = len(merged)
+        add_word(word)
+        if len(merged) > before:
+            remaining -= 1
+            if remaining <= 0:
+                break
+    return merged
+
+
 def _postprocess_asr_text(text: str) -> str:
     """Normalize provider-specific wrappers to plain transcription text."""
     cleaned = str(text or "").strip()
@@ -264,6 +298,7 @@ async def query_audio_model(
     prompt_template: str | None = None,
     timeout: float | None = None,
     runtime_config: Config | None = None,
+    recall_user_id: str | None = None,
 ) -> ASRResult:
     """Primary ASR call.
 
@@ -275,14 +310,20 @@ async def query_audio_model(
     _ = src_lang  # noqa: F841 — preserved for compatibility, see docstring
     cfg = runtime_config or default_config
     template = prompt_template or cfg.vllm_prompt_template
-    effective_hotwords = list(hotwords or [])
+    request_hotwords = list(hotwords or [])
+    effective_hotwords = request_hotwords
     audio_embeds_b64: str | None = None
     audio_embeds_uuid: str | None = None
 
     if cfg.enable_hotword_recall and audio_pcm is not None:
-        # The deployed recall service owns the global hotword pool; per-session
-        # hotword lists are no longer a prompt-sized candidate pool.
-        effective_hotwords = []
+        # The recall service owns the large per-user pool. Request-local
+        # hotwords are still useful for one-off biasing, but must stay bounded
+        # so clients cannot accidentally paste a huge pool into every prompt.
+        effective_hotwords = merge_recalled_and_custom_hotwords(
+            [],
+            request_hotwords,
+            custom_limit=cfg.recall_custom_hotword_limit,
+        )
         want_bypass = (
             cfg.enable_encoder_bypass
             and template == "amphion_asr_1.7b"
@@ -294,14 +335,18 @@ async def query_audio_model(
                 cfg,
                 sample_rate=audio_sample_rate,
                 want_audio_embeds=want_bypass,
+                user_id=recall_user_id,
             )
-            effective_hotwords = recalled.words
+            effective_hotwords = merge_recalled_and_custom_hotwords(
+                recalled.words,
+                request_hotwords,
+                custom_limit=cfg.recall_custom_hotword_limit,
+            )
             if want_bypass and recalled.audio_embeds_b64:
                 audio_embeds_b64 = recalled.audio_embeds_b64
                 audio_embeds_uuid = recalled.uuid
         except Exception as exc:
             logger.warning("Triton hotword recall failed; using raw ASR audio: %s", exc)
-            effective_hotwords = []
 
     messages = build_primary_messages(
         audio_wav_base64,

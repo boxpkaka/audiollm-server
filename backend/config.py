@@ -9,6 +9,8 @@ from typing import Any
 
 import yaml
 
+from .recall_user import DEFAULT_RECALL_USER_ID, normalize_recall_user_id
+
 logger = logging.getLogger(__name__)
 
 # 配置真源: 项目根 config.yaml; CONFIG_PATH 环境变量可覆盖(测试 / 多部署)。
@@ -136,14 +138,17 @@ class Config:
     fusion_primary_score_margin: float = 0.08
 
     # ---- ASR: Triton hotword recall + vLLM encoder bypass -----------------
-    # Hotword biasing now uses a process-wide Triton recall pool: each audio
-    # segment retrieves a small top-K list from the global pool, then injects
-    # only those words into the ASR prompt. Encoder bypass additionally sends
-    # Triton's projector frames to vLLM as an ``audio_embeds`` block; it is only
-    # valid for the Amphion 1.7B prompt/checkpoint family and falls back to raw
-    # audio when enrollment or a different prompt template is used.
+    # Hotword biasing uses a per-user Triton recall pool: each audio segment
+    # retrieves a small top-K list from that pool, then appends a bounded number
+    # of per-request hotwords before building the ASR prompt. Encoder bypass
+    # additionally sends Triton's projector frames to vLLM as an
+    # ``audio_embeds`` block; it is only valid for the Amphion 1.7B
+    # prompt/checkpoint family and falls back to raw audio when enrollment or a
+    # different prompt template is used.
     enable_hotword_recall: bool = True
     recall_top_k: int = 50
+    recall_user_id: str = DEFAULT_RECALL_USER_ID
+    recall_custom_hotword_limit: int = 8
     enable_encoder_bypass: bool = True
 
     # ---- ASR: inverse text normalization (ITN) + license plate -----------
@@ -177,12 +182,17 @@ class Config:
     k2_include_token_timestamps: bool = False
     k2_connect_timeout_sec: float = 5.0
     k2_fallback_to_local: bool = True
-    # Local assembly guards around the k2 endpoint authority. These keep the
-    # LLM segment clean and bounded without letting local VAD decide when a
-    # sentence ends.
+    # Local assembly guards around the k2 endpoint authority. k2 owns the
+    # segment boundary; these only bound pre-speech idle audio and pathological
+    # no-endpoint sessions without trimming the speech that k2 heard.
     k2_max_segment_sec: float = 30.0
-    k2_preroll_ms: int = 300
     k2_idle_keep_ms: int = 1500
+    # k2 may hallucinate partials/endpoints on steady environmental noise. This
+    # local gate only checks for enough continuous speech evidence before k2
+    # partials/final segments are forwarded; it never re-cuts or trims k2 audio.
+    k2_voice_gate_enabled: bool = True
+    k2_voice_gate_threshold: float = 0.65
+    k2_voice_gate_start_frames: int = 10
 
     # ---- ASR: target speaker enrollment ----------------------------------
     # When a target-speaker enrollment is uploaded the primary ASR prompt
@@ -319,6 +329,18 @@ class Config:
     text_cleanup_timeout: float = 30.0
     text_cleanup_max_tokens: int = 1024
 
+    # ---- Debug: per-segment audio + metadata dump ------------------------
+    # Operator-only diagnostics (intentionally NOT client-overridable: a
+    # client must not be able to turn on disk writes). When enabled, every
+    # final ASR segment writes <debug_dump_dir>/<session_id>/<seg_id>.{wav,json}
+    # — the exact PCM that fed inference (== the client's replay audio) plus
+    # the final text, partial history, primary/secondary output, the model +
+    # feature-flag snapshot and timing. Off by default; the dump grows
+    # unbounded, so keep it off in production. A relative dir resolves against
+    # the project root.
+    debug_dump_enabled: bool = False
+    debug_dump_dir: str = "debug_dumps"
+
     def __post_init__(self) -> None:
         if self.vllm_prompt_template not in VALID_PRIMARY_PROMPT_TEMPLATES:
             raise ValueError(
@@ -347,6 +369,13 @@ class Config:
             object.__setattr__(self, "enable_encoder_bypass", False)
         if self.recall_top_k < 0:
             object.__setattr__(self, "recall_top_k", 0)
+        if self.recall_custom_hotword_limit < 0:
+            object.__setattr__(self, "recall_custom_hotword_limit", 0)
+        object.__setattr__(
+            self,
+            "recall_user_id",
+            normalize_recall_user_id(self.recall_user_id),
+        )
         # 首个 partial 门槛若严于 final 段最小时长,partial 就会永远比 final 晚、失去
         # "中间结果"意义;夹到 <= min_segment_duration_ms。和 fusion 不变量一样下沉
         # 到 dataclass,确保 load/override/直接构造(测试)各路径都一致。
@@ -360,10 +389,18 @@ class Config:
             object.__setattr__(self, "k2_sample_rate", SAMPLE_RATE)
         if self.k2_max_segment_sec < 0:
             object.__setattr__(self, "k2_max_segment_sec", 0.0)
-        if self.k2_preroll_ms < 0:
-            object.__setattr__(self, "k2_preroll_ms", 0)
         if self.k2_idle_keep_ms < 0:
             object.__setattr__(self, "k2_idle_keep_ms", 0)
+        if self.k2_voice_gate_threshold < 0:
+            object.__setattr__(self, "k2_voice_gate_threshold", 0.0)
+        elif self.k2_voice_gate_threshold > 1:
+            object.__setattr__(self, "k2_voice_gate_threshold", 1.0)
+        if self.k2_voice_gate_start_frames < 1:
+            object.__setattr__(self, "k2_voice_gate_start_frames", 1)
+        # An empty dump dir would write into the project root; fall back to the
+        # documented default so the invariant holds on every construction path.
+        if not str(self.debug_dump_dir).strip():
+            object.__setattr__(self, "debug_dump_dir", "debug_dumps")
 
     @property
     def resolved_text_cleanup_api_key(self) -> str:
@@ -472,13 +509,12 @@ if _unknown_overridable:
     )
 
 
-# 合法的 (protocol, task) 组合白名单。其余组合(如 astv3 × browser_demo)在解析期
-# fail-fast, 避免注册出无意义的端点。browser_demo 复用 native wire, 不是独立协议。
+# 合法的 (protocol, task) 组合白名单。其余组合在解析期 fail-fast,
+# 避免注册出无意义的端点。
 VALID_ENDPOINT_COMBINATIONS: frozenset[tuple[str, str]] = frozenset({
     ("native", "asr"),
     ("astv3", "asr"),
     ("native", "emotion"),
-    ("native", "browser_demo"),
 })
 
 # upstream 角色: 决定一个 upstream 投影到哪些扁平 Config 字段。

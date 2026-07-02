@@ -29,18 +29,26 @@
 
     // --- State ---
     let ws = null;
+  let wsReady = false;
+  let streamStarted = false;
+  let pendingStop = false;
+  let stopCloseTimer = null;
+  let recordingSeq = 0;
+  let currentRecordingSeq = 0;
   let audioCtx = null;
   let workletNode = null;
   let mediaStream = null;
   let isRecording = false;
   let hotwords = [];
   let hotwordPoolTotal = 0;
-  let emotionEnabled = localStorage.getItem('asr_emotion_enabled') === '1';
+  let emotionEnabled = false;
   let extractRequestId = null;
   let activeReplayAudio = null;
   const segmentAudio = new Map();
+  const TRANSCRIBE_SAMPLE_RATE = 16000;
   const MAX_EXTRACTED_HOTWORD_LENGTH = 10;
   const HOTWORD_POOL_LIMIT = 1000;
+  const HOTWORD_USER_STORAGE_KEY = 'asr_hotword_user_id';
   const partialSeqMap = new Map(); // utterance_id -> highest seq seen
 
   // Last-known UI states so we can re-render strings after a language switch.
@@ -48,7 +56,6 @@
   let currentExtractDyn = { key: 'asr.extract.idle', vars: null };
 
   const UI_TO_API_LANG = {
-    auto: 'N/A',
     chinese: 'Chinese',
     english: 'English',
     indonesian: 'Indonesian',
@@ -59,8 +66,9 @@
     return UI_TO_API_LANG[langForUi] || 'N/A';
   }
 
-  let srcLangUi = localStorage.getItem('asr_src_lang') || 'auto';
-  if (!Object.prototype.hasOwnProperty.call(UI_TO_API_LANG, srcLangUi)) srcLangUi = 'auto';
+  let srcLangUi = localStorage.getItem('asr_src_lang') || 'chinese';
+  if (!Object.prototype.hasOwnProperty.call(UI_TO_API_LANG, srcLangUi)) srcLangUi = 'chinese';
+  let hotwordUserId = (localStorage.getItem(HOTWORD_USER_STORAGE_KEY) || 'default').trim() || 'default';
 
   function b64ToWavBlobUrl(b64) {
     const bin = atob(b64);
@@ -77,6 +85,34 @@
   const micStatus = document.getElementById('mic-status');
   const pulseRings = document.querySelectorAll('.pulse-ring');
   const chatArea = document.getElementById('chat-area');
+  // Debug-dump session context, populated from the ``ready`` frame only when
+  // the backend has debug_dump_enabled. Empty otherwise.
+  let sessionId = '';
+  let sessionDumpDir = '';
+  // One delegated handler copies a bubble's dump id to the clipboard. The chip
+  // is re-rendered on every final via outerHTML, so per-chip listeners would
+  // leak; delegation on the stable chatArea container avoids that.
+  if (chatArea) {
+    chatArea.addEventListener('click', (e) => {
+      const chip = e.target.closest && e.target.closest('.dump-id-chip');
+      if (!chip) return;
+      e.stopPropagation();
+      const val = chip.getAttribute('data-copy') || '';
+      if (!val) return;
+      const original = chip.textContent;
+      const flash = () => {
+        chip.textContent = t('asr.debug.copied', { defaultValue: 'copied' });
+        setTimeout(() => {
+          chip.textContent = original;
+        }, 900);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(val).then(flash).catch(flash);
+      } else {
+        flash();
+      }
+    });
+  }
   const hotwordInput = document.getElementById('hotword-input');
   const hotwordAddBtn = document.getElementById('hotword-add-btn');
   const hotwordList = document.getElementById('hotword-list');
@@ -84,6 +120,7 @@
   const hotwordReloadBtn = document.getElementById('hotword-reload-btn');
   const hotwordEnabledInput = document.getElementById('hotword-enabled');
   const hotwordSyncStatus = document.getElementById('hotword-sync-status');
+  const hotwordUserInput = document.getElementById('hotword-user-id');
   const hotwordCount = document.getElementById('hotword-count');
   const hotwordTextarea = document.getElementById('hotword-textarea');
   const hotwordExtractBtn = document.getElementById('hotword-extract-btn');
@@ -143,7 +180,25 @@
     });
   }
 
-  // --- Global hotword pool management ---
+  function currentHotwordUserId() {
+    const value = String(
+      (hotwordUserInput && hotwordUserInput.value) || hotwordUserId || 'default'
+    ).trim() || 'default';
+    hotwordUserId = value;
+    localStorage.setItem(HOTWORD_USER_STORAGE_KEY, value);
+    if (hotwordUserInput && hotwordUserInput.value !== value) {
+      hotwordUserInput.value = value;
+    }
+    return value;
+  }
+
+  function hotwordPoolQuery(params) {
+    const query = new URLSearchParams(params || {});
+    query.set('user_id', currentHotwordUserId());
+    return query.toString();
+  }
+
+  // --- User hotword pool management ---
   function sanitizeHotwords(sourceWords) {
     const result = [];
     (Array.isArray(sourceWords) ? sourceWords : []).forEach((item) => {
@@ -216,7 +271,9 @@
   async function loadHotwordPool() {
     setHotwordSyncStatus('waiting');
     try {
-      const resp = await fetch(`/api/asr/hotword-pool?limit=${HOTWORD_POOL_LIMIT}`);
+      const resp = await fetch(
+        `/api/asr/hotword-pool?${hotwordPoolQuery({ limit: HOTWORD_POOL_LIMIT })}`
+      );
       const payload = await readJsonResponse(resp);
       hotwords = sanitizeHotwords(payload.hotwords || []);
       hotwordPoolTotal = Number(payload.total_count || hotwords.length);
@@ -237,7 +294,7 @@
       const resp = await fetch('/api/asr/hotword-pool', {
         method,
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ hotwords: clean }),
+        body: JSON.stringify({ hotwords: clean, user_id: currentHotwordUserId() }),
       });
       await readJsonResponse(resp);
       await loadHotwordPool();
@@ -251,7 +308,10 @@
     setHotwordPoolBusy(true);
     setHotwordSyncStatus('saving');
     try {
-      const resp = await fetch('/api/asr/hotword-pool/reload', { method: 'POST' });
+      const resp = await fetch(
+        `/api/asr/hotword-pool/reload?${hotwordPoolQuery()}`,
+        { method: 'POST' }
+      );
       await readJsonResponse(resp);
       await loadHotwordPool();
       setExtractStatus('success', 'asr.hotword.reloaded');
@@ -264,16 +324,16 @@
   }
 
   function syncSessionControls() {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      // Keep using the legacy control frame for enrollment/emotion state, but
-      // do not send session-level hotwords: the ASR biasing source is now the
+    if (ws && ws.readyState === WebSocket.OPEN && wsReady) {
+      // Keep using the compatibility control frame for enrollment/lang state,
+      // but do not send session-level hotwords: ASR biasing comes from the
       // Triton global hotword pool managed through REST.
       ws.send(
         JSON.stringify({
           type: 'update_hotwords',
           hotwords: [],
           src_lang: apiLangFromUi(srcLangUi),
-          enable_emotion: emotionEnabled,
+          user_id: currentHotwordUserId(),
           enrollment_id: enrollmentCtrl ? enrollmentCtrl.getEnrollmentId() : null,
         })
       );
@@ -281,14 +341,8 @@
   }
 
   function syncEmotionToggle() {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(
-        JSON.stringify({
-          type: 'update_emotion',
-          enabled: emotionEnabled,
-        })
-      );
-    }
+    // /transcribe-streaming is ASR-only. The old /ws/audio emotion side-channel
+    // was removed with the legacy browser-demo endpoint.
   }
 
   function refreshEmotionToggleLabel() {
@@ -436,13 +490,13 @@
   hotwordEnabledInput.closest('label')?.setAttribute('title', t('asr.hotword.poolManaged'));
 
   if (emotionToggle) {
-    emotionToggle.checked = emotionEnabled;
+    emotionToggle.checked = false;
+    emotionToggle.disabled = true;
     refreshEmotionToggleLabel();
     emotionToggle.addEventListener('change', () => {
-      emotionEnabled = emotionToggle.checked;
-      localStorage.setItem('asr_emotion_enabled', emotionEnabled ? '1' : '0');
+      emotionEnabled = false;
+      emotionToggle.checked = false;
       refreshEmotionToggleLabel();
-      syncEmotionToggle();
     });
   }
 
@@ -454,6 +508,22 @@
       srcLangUi = next;
       localStorage.setItem('asr_src_lang', srcLangUi);
       syncSessionControls();
+    });
+  }
+  if (hotwordUserInput) {
+    hotwordUserInput.value = hotwordUserId;
+    const applyHotwordUser = () => {
+      currentHotwordUserId();
+      void loadHotwordPool();
+      syncSessionControls();
+    };
+    hotwordUserInput.addEventListener('change', applyHotwordUser);
+    hotwordUserInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        hotwordUserInput.blur();
+        applyHotwordUser();
+      }
     });
   }
 
@@ -476,25 +546,33 @@
 
   // --- WebSocket ---
   function connectWS() {
+    if (isDisposed) return;
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(`${proto}//${location.host}/ws/audio`);
+    wsReady = false;
+    streamStarted = false;
+    pendingStop = false;
+    ws = new WebSocket(`${proto}//${location.host}/transcribe-streaming`);
     ws.binaryType = 'arraybuffer';
 
     ws.onopen = () => {
-      setConnected(true);
-      syncSessionControls();
+      // Wait for the protocol-level ready frame before sending controls/audio.
     };
 
     ws.onclose = () => {
+      wsReady = false;
+      streamStarted = false;
+      pendingStop = false;
       setConnected(false);
       if (extractRequestId) {
         extractRequestId = null;
         setExtractBusy(false);
         setExtractStatus('error', 'asr.extract.connClosed');
       }
-      // The upload path is REST and not bound to the WS lifecycle, so
-      // there is nothing to clean up here for it.
-      stopRecording();
+      // The upload path is REST and not bound to the WS lifecycle.
+      stopRecording({ sendStop: false });
       if (!isDisposed) {
         reconnectTimer = setTimeout(connectWS, 2000);
       }
@@ -519,64 +597,123 @@
     };
   }
 
+  function closeTranscribeWSSoon(delayMs) {
+    if (stopCloseTimer) clearTimeout(stopCloseTimer);
+    stopCloseTimer = setTimeout(() => {
+      stopCloseTimer = null;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try { ws.close(); } catch { /* noop */ }
+      }
+    }, delayMs);
+  }
+
+  function sendStartFrame() {
+    if (!ws || ws.readyState !== WebSocket.OPEN || !wsReady || streamStarted) return false;
+    ws.send(
+      JSON.stringify({
+        type: 'start',
+        format: 'pcm_s16le',
+        sample_rate_hz: TRANSCRIBE_SAMPLE_RATE,
+        channels: 1,
+        language: apiLangFromUi(srcLangUi),
+        hotwords: [],
+        user_id: currentHotwordUserId(),
+        enrollment_id: (enrollmentCtrl && enrollmentCtrl.getEnrollmentId()) || null,
+        config: {
+          vad_start_frames: 10,
+          pseudo_stream_first_partial_ms: 100,
+        },
+      })
+    );
+    streamStarted = true;
+    pendingStop = false;
+    return true;
+  }
+
+  function floatToPcm16Bytes(float32) {
+    const buf = new ArrayBuffer(float32.length * 2);
+    const view = new DataView(buf);
+    for (let i = 0; i < float32.length; i++) {
+      const s = Math.max(-1, Math.min(1, float32[i]));
+      view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    }
+    return buf;
+  }
+
+  function segmentIdFromMessage(data) {
+    const raw = String((data && data.id) || '').trim();
+    if (raw) return raw;
+    return `rec-${currentRecordingSeq || recordingSeq || 1}`;
+  }
+
   function handleServerMessage(data) {
     switch (data.type) {
-      case 'partial_transcript': {
-        // Pseudo-streaming partial. We only need a single AI bubble per
-        // utterance — the right-side user bubble was removed so the
-        // realtime page mirrors the target-speaker page (one column of
-        // assistant bubbles, replay control lives inside).
-        const uid = data.utterance_id;
-        if (!uid) break;
-        const prevSeq = partialSeqMap.get(uid) || 0;
-        if (typeof data.seq === 'number' && data.seq <= prevSeq) break;
-        partialSeqMap.set(uid, data.seq || 0);
-
+      case 'ready':
+        wsReady = true;
+        sessionId = data.session_id || '';
+        sessionDumpDir = data.dump_dir || '';
+        if (sessionId) {
+          console.info(`[debug-dump] session=${sessionId} dir=${sessionDumpDir}`);
+        }
+        setConnected(true);
+        syncSessionControls();
+        break;
+      case 'partial':
+      case 'partial_asr': {
+        const uid = segmentIdFromMessage(data);
+        if (partialSeqMap.get(uid) === Infinity) break;
         if (!document.getElementById(`ai-${uid}`)) {
           addAIBubble(uid);
         }
         updateAIBubble(uid, data.text, 'streaming');
         break;
       }
-      case 'vad_event':
-        if (data.event === 'segment_detected') {
-          // Stash the segment audio for later replay — the actual replay
-          // button is mounted in the bubble when the final response
-          // arrives (see updateAIBubble 'done' branch). Mounting it
-          // earlier would clutter the bubble while it's still visibly
-          // streaming.
-          if (data.audio_b64) {
-            segmentAudio.set(data.id, b64ToWavBlobUrl(data.audio_b64));
+      case 'final':
+      case 'final_asr': {
+        const uid = segmentIdFromMessage(data);
+        const hasRenderableFinal =
+          String(data.text || '').trim() ||
+          data.audio_b64 ||
+          data.dump_id ||
+          data.emotion;
+        if (!hasRenderableFinal) {
+          partialSeqMap.set(uid, Infinity);
+          if (pendingStop) {
+            pendingStop = false;
+            streamStarted = false;
+            closeTranscribeWSSoon(500);
           }
-          if (!document.getElementById(`ai-${data.id}`)) {
-            addAIBubble(data.id);
-          }
+          break;
+        }
+        partialSeqMap.set(uid, Infinity);
+        if (!document.getElementById(`ai-${uid}`)) {
+          addAIBubble(uid);
+        }
+        if (data.audio_b64) {
+          const prev = segmentAudio.get(uid);
+          if (prev) URL.revokeObjectURL(prev);
+          segmentAudio.set(uid, b64ToWavBlobUrl(data.audio_b64));
+        }
+        updateAIBubble(uid, data.text, 'done', data.model_hotwords, {
+          emotion: data.emotion,
+          dumpId: data.dump_id,
+        });
+        if (pendingStop) {
+          pendingStop = false;
+          streamStarted = false;
+          closeTranscribeWSSoon(500);
         }
         break;
-      case 'status':
-        updateAIBubble(data.id, null, 'processing');
-        break;
-      case 'response':
-        // utterance 进入终态：把 seq 设成 Infinity，让所有迟到的 partial
-        // （后端 _emit_partial 已有 lifecycle 检查作根因防御；前端这一层
-        // 是冗余保险，确保即便后端漏发了 gate 也不会被 streaming 状态覆盖
-        // final 文本）自然走 seq 比较的 break 分支。
-        partialSeqMap.set(data.id, Infinity);
-        updateAIBubble(data.id, data.text, 'done', data.model_hotwords, {
-          textPrimary: data.text_primary,
-          textSecondary: data.text_secondary,
-          fusionMeta: data.fusion_meta,
-          srcLangDetected: data.src_lang_detected,
-          emotion: data.emotion,
-        });
-        break;
-      case 'discard':
-        partialSeqMap.set(data.id, Infinity);
-        removeSegmentBubbles(data.id);
-        break;
+      }
       case 'error':
-        partialSeqMap.set(data.id, Infinity);
-        updateAIBubble(data.id, data.message || '', 'error');
+        {
+          const uid = segmentIdFromMessage(data);
+          partialSeqMap.set(uid, Infinity);
+          if (!document.getElementById(`ai-${uid}`)) {
+            addAIBubble(uid);
+          }
+          updateAIBubble(uid, data.message || '', 'error');
+        }
         break;
       case 'extract_hotwords_result':
         if (!extractRequestId || data.request_id !== extractRequestId) {
@@ -780,6 +917,26 @@
     `;
   }
 
+  // Copyable dump-id chip. Rendered only when the backend dumped this segment
+  // (debug_dump_enabled). The id is ``<session>/<seg>`` which doubles as the
+  // relative path stem of the dumped ``<session>/<seg>.{wav,json}``, so it can
+  // be pasted straight into a file lookup. Copy is handled by the single
+  // delegated listener on chatArea.
+  function renderTraceChip(dumpId) {
+    const id = String(dumpId || '').trim();
+    if (!id) return '';
+    const safe = escapeHtml(id);
+    const label = escapeHtml(t('asr.debug.dumpId', { defaultValue: 'Dump ID' }));
+    const title = escapeHtml(t('asr.debug.copyId', { defaultValue: 'Copy dump id' }));
+    return `
+      <div class="text-[11px] mt-1 flex items-center gap-1" style="color:var(--ink-mute)">
+        <span class="text-faint" data-dyn-key="asr.debug.dumpId">${label}</span>
+        <button type="button" class="dump-id-chip font-mono" data-copy="${safe}" title="${title}"
+                style="border:1px solid var(--line); background:var(--paper-sunk); border-radius:4px; padding:0 4px; cursor:pointer; color:var(--ink)">${safe}</button>
+      </div>
+    `;
+  }
+
   // Route every text mutation through the diff helper. Fallback to plain
   // textContent guards against the script tag failing to load.
   function setBubbleText(textEl, text) {
@@ -905,11 +1062,7 @@
           String(emotionInfo.sepc_label || '').trim());
 
       // Hotword feedback is now exclusively the inline <mark> highlight
-      // applied by applyHotwordHighlights (which rewrites the current
-      // text-frame's innerHTML once the final text has settled). The
-      // previous "Hotword hits: N" line and the session-wide running
-      // counter were redundant once the glyphs themselves are tinted,
-      // so the bubble's meta block only carries lang/duration.
+      // applied by applyHotwordHighlights once the final text has settled.
       const wordsForHighlight = Array.from(
         new Set([
           ...((Array.isArray(modelHotwords) ? modelHotwords : [])
@@ -933,24 +1086,12 @@
         applyHotwordHighlights(textEl, finalText, wordsForHighlight);
       }
 
-      const detectedRaw =
-        debugInfo && debugInfo.srcLangDetected
-          ? String(debugInfo.srcLangDetected).trim()
-          : '';
-      const langDetectedMeta =
-        detectedRaw && srcLangUi === 'auto'
-          ? (() => {
-              const vars = { lang: langDisplayName(detectedRaw) };
-              return `<div class="text-[11px]" style="color:var(--info)"
-                          data-dyn-key="asr.debug.langDetected"
-                          data-dyn-vars='${escapeHtml(JSON.stringify({ lang: detectedRaw }))}'>${escapeHtml(t('asr.debug.langDetected', vars))}</div>`;
-            })()
-          : '';
+      const traceBlock = renderTraceChip(debugInfo && debugInfo.dumpId);
       const debugBlock = renderDualAsrDebug(debugInfo);
       const emotionBlock = renderEmotionMeta(debugInfo && debugInfo.emotion);
       applyMeta(
         content,
-        langDetectedMeta + emotionBlock + debugBlock,
+        traceBlock + emotionBlock + debugBlock,
       );
       applyReplayButton(content, segId);
     } else if (status === 'error') {
@@ -979,12 +1120,21 @@
   // --- Audio capture ---
   async function startRecording() {
     if (isRecording) return;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      alert(t('asrtest.mic.insecure'));
+      return;
+    }
+    if (!ws || ws.readyState !== WebSocket.OPEN || !wsReady) {
+      connectWS();
+      alert(t('asr.extract.wsOffline'));
+      return;
+    }
 
     try {
       mediaStream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
-          sampleRate: { ideal: 48000 },
+          sampleRate: { ideal: TRANSCRIBE_SAMPLE_RATE },
           echoCancellation: true,
           noiseSuppression: true,
         },
@@ -994,21 +1144,24 @@
       return;
     }
 
-    audioCtx = new AudioContext({ sampleRate: 48000 });
+    recordingSeq += 1;
+    currentRecordingSeq = recordingSeq;
+    if (!sendStartFrame()) {
+      mediaStream.getTracks().forEach((tr) => tr.stop());
+      mediaStream = null;
+      alert(t('asr.extract.wsOffline'));
+      return;
+    }
+
+    audioCtx = new AudioContext({ sampleRate: TRANSCRIBE_SAMPLE_RATE });
     await audioCtx.audioWorklet.addModule('audio-processor.js?v=' + Date.now());
 
     const source = audioCtx.createMediaStreamSource(mediaStream);
     workletNode = new AudioWorkletNode(audioCtx, 'audio-capture-processor');
 
     workletNode.port.onmessage = (evt) => {
-      if (evt.data.type === 'audio' && ws && ws.readyState === WebSocket.OPEN) {
-        const float32 = evt.data.samples;
-        const int16 = new Int16Array(float32.length);
-        for (let i = 0; i < float32.length; i++) {
-          const s = Math.max(-1, Math.min(1, float32[i]));
-          int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-        }
-        ws.send(int16.buffer);
+      if (evt.data.type === 'audio' && ws && ws.readyState === WebSocket.OPEN && streamStarted) {
+        ws.send(floatToPcm16Bytes(evt.data.samples));
       }
     };
 
@@ -1023,7 +1176,8 @@
     if (enrollmentCtrl) enrollmentCtrl.refresh();
   }
 
-  function stopRecording() {
+  function stopRecording(opts) {
+    const sendStop = !opts || opts.sendStop !== false;
     if (!isRecording) return;
 
     // Detach the worklet's message port BEFORE we send the flush control
@@ -1034,14 +1188,13 @@
       workletNode.disconnect();
       workletNode = null;
     }
-    // Tell the backend "no more audio coming, drain whatever you're
-    // holding". Without this the trailing in-progress utterance sits in
-    // VAD's buffer until the WebSocket actually closes, so the user
-    // never sees a final bubble (and replay button) for the last thing
-    // they said before clicking stop. See backend/session.py
-    // _handle_control_message for the ``flush`` protocol.
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      try { ws.send(JSON.stringify({ type: 'flush' })); } catch { /* noop */ }
+    // Tell /transcribe-streaming no more audio is coming. The server flushes
+    // the trailing segment and emits final; handleServerMessage closes this
+    // one-shot stream after that final arrives, with a fallback timeout below.
+    if (sendStop && ws && ws.readyState === WebSocket.OPEN && streamStarted) {
+      pendingStop = true;
+      try { ws.send(JSON.stringify({ type: 'stop' })); } catch { /* noop */ }
+      closeTranscribeWSSoon(8000);
     }
     if (audioCtx) {
       audioCtx.close();
@@ -1184,6 +1337,7 @@
         wavBytes,
         {
           language: apiLangFromUi(srcLangUi) || '',
+          user_id: currentHotwordUserId(),
           enrollment_id: (enrollmentCtrl && enrollmentCtrl.getEnrollmentId()) || '',
         },
         { signal: uploadController.signal, fileName: file.name || 'upload.wav' }
@@ -1204,9 +1358,7 @@
     uploadController = null;
 
     const text = (result && result.text) || '';
-    updateAIBubble(segId, text, 'done', undefined, {
-      srcLangDetected: result && result.language,
-    });
+    updateAIBubble(segId, text, 'done');
 
     const elapsed = ((performance.now() - startedAt) / 1000).toFixed(1);
     setUploadBusy(false);

@@ -17,17 +17,19 @@ import backend.main as main_mod  # noqa: E402
 async def test_hotword_pool_add_proxies_to_recall(monkeypatch):
     seen: dict[str, object] = {}
 
-    async def fake_add(words):
+    async def fake_add(words, *, user_id=None):
         seen["words"] = words
+        seen["user_id"] = user_id
         return {"status": "ok", "added": len(words), "total_count": 2}
 
     monkeypatch.setattr(main_mod, "add_recall_hotwords", fake_add)
 
     result = await main_mod.asr_hotword_pool_add(
-        {"hotwords": [" 挚音科技 ", "", "张硕"]}
+        {"user_id": "tenant-a", "hotwords": [" 挚音科技 ", "", "张硕"]}
     )
 
     assert seen["words"] == ["挚音科技", "张硕"]
+    assert seen["user_id"] == "tenant-a"
     assert result == {"status": "ok", "added": 2, "total_count": 2}
 
 
@@ -37,3 +39,13 @@ async def test_hotword_pool_rejects_empty_payload():
         await main_mod.asr_hotword_pool_add({"hotwords": []})
     assert exc.value.status_code == 400
     assert exc.value.detail["code"] == "empty_hotwords"
+
+
+@pytest.mark.asyncio
+async def test_hotword_pool_rejects_invalid_user_id():
+    with pytest.raises(HTTPException) as exc:
+        await main_mod.asr_hotword_pool_add(
+            {"user_id": "../escape", "hotwords": ["挚音科技"]}
+        )
+    assert exc.value.status_code == 400
+    assert exc.value.detail["code"] == "invalid_user_id"

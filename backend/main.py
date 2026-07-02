@@ -46,7 +46,7 @@ from .emotion.jobs import JobQueueFullError, get_emotion_job_store
 from .emotion.service import EmotionDecodeError, decode_wav_capped
 from .emotion_spec.jobs import get_emotion_spec_job_store
 from .http_client import close_client
-from .session import AudioSession
+from .recall_user import RecallUserIdError, normalize_recall_user_id
 from .streaming import (
     AstV3Protocol,
     K2SegmentedStream,
@@ -71,17 +71,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="AudioLLM Server", lifespan=lifespan)
-
-
-@app.websocket("/ws/audio")
-async def audio_ws(websocket: WebSocket):
-    await websocket.accept()
-    logger.info("WebSocket connected (/ws/audio)")
-    session = AudioSession(websocket)
-    try:
-        await session.run()
-    finally:
-        await session.cleanup()
 
 
 @app.websocket("/transcribe-streaming")
@@ -394,6 +383,7 @@ async def _run_dual_asr_upload(
     language: str,
     audio_pcm: np.ndarray,
     enrollment_b64: str | None = None,
+    recall_user_id: str | None = None,
 ) -> dict:
     """Route-facing wrapper over :func:`run_oneshot_asr`.
 
@@ -408,6 +398,7 @@ async def _run_dual_asr_upload(
             language=language,
             audio_pcm=audio_pcm,
             enrollment_b64=enrollment_b64,
+            recall_user_id=recall_user_id,
         )
     except OneshotAsrError as exc:
         raise HTTPException(status_code=502, detail=exc.to_detail()) from exc
@@ -484,6 +475,19 @@ def _hotword_pool_payload(body: dict) -> list[str]:
     return words
 
 
+def _resolve_recall_user_id(raw_user_id: object | None, cfg) -> str:
+    try:
+        return normalize_recall_user_id(raw_user_id, default=cfg.recall_user_id)
+    except RecallUserIdError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_user_id",
+                "message": str(exc),
+            },
+        ) from exc
+
+
 def _recall_error(exc: Exception) -> HTTPException:
     return HTTPException(
         status_code=502,
@@ -500,12 +504,16 @@ async def asr_hotword_pool_list(
     query: str = "",
     limit: int = 50,
     offset: int = 0,
+    user_id: str = "",
 ):
+    cfg = load_config()
+    resolved_user_id = _resolve_recall_user_id(user_id, cfg)
     try:
         return await list_hotword_pool(
             query=query or None,
             limit=max(0, min(int(limit), 1000)),
             offset=max(0, int(offset)),
+            user_id=resolved_user_id,
         )
     except Exception as exc:  # noqa: BLE001 - route maps upstream failures
         raise _recall_error(exc) from exc
@@ -513,8 +521,13 @@ async def asr_hotword_pool_list(
 
 @app.post("/api/asr/hotword-pool")
 async def asr_hotword_pool_add(body: dict = Body(...)):
+    cfg = load_config()
+    resolved_user_id = _resolve_recall_user_id(body.get("user_id"), cfg)
     try:
-        return await add_recall_hotwords(_hotword_pool_payload(body))
+        return await add_recall_hotwords(
+            _hotword_pool_payload(body),
+            user_id=resolved_user_id,
+        )
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -523,8 +536,13 @@ async def asr_hotword_pool_add(body: dict = Body(...)):
 
 @app.delete("/api/asr/hotword-pool")
 async def asr_hotword_pool_delete(body: dict = Body(...)):
+    cfg = load_config()
+    resolved_user_id = _resolve_recall_user_id(body.get("user_id"), cfg)
     try:
-        return await delete_recall_hotwords(_hotword_pool_payload(body))
+        return await delete_recall_hotwords(
+            _hotword_pool_payload(body),
+            user_id=resolved_user_id,
+        )
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -532,9 +550,11 @@ async def asr_hotword_pool_delete(body: dict = Body(...)):
 
 
 @app.post("/api/asr/hotword-pool/reload")
-async def asr_hotword_pool_reload():
+async def asr_hotword_pool_reload(user_id: str = ""):
+    cfg = load_config()
+    resolved_user_id = _resolve_recall_user_id(user_id, cfg)
     try:
-        return await reload_hotword_pool()
+        return await reload_hotword_pool(user_id=resolved_user_id)
     except Exception as exc:  # noqa: BLE001
         raise _recall_error(exc) from exc
 
@@ -545,6 +565,7 @@ async def asr_upload(
     language: str = Form(""),
     hotwords: str = Form(""),
     enrollment_id: str = Form(""),
+    user_id: str = Form(""),
 ):
     """One-shot ASR over an uploaded clip.
 
@@ -561,6 +582,7 @@ async def asr_upload(
     wav_bytes, audio_pcm, duration_sec = _wav_to_pcm_capped(raw, _ASR_MAX_SECONDS)
     wav_b64 = base64.b64encode(wav_bytes).decode("ascii")
     cfg = load_config()
+    recall_user_id = _resolve_recall_user_id(user_id, cfg)
     hw_list = _parse_csv(hotwords)
     enrollment_b64 = _resolve_enrollment_b64(enrollment_id)
     asr_result = await _run_dual_asr_upload(
@@ -570,6 +592,7 @@ async def asr_upload(
         language=language,
         audio_pcm=audio_pcm,
         enrollment_b64=enrollment_b64,
+        recall_user_id=recall_user_id,
     )
 
     return {
@@ -586,6 +609,7 @@ async def asr_transcription_create(
     audio: UploadFile = File(...),
     language: str = Form(""),
     hotwords: str = Form(""),
+    user_id: str = Form(""),
 ):
     """Enqueue offline transcription of a long recording (meeting minutes).
 
@@ -607,6 +631,7 @@ async def asr_transcription_create(
     # Transcription-specific view: rest.routes.transcribe bindings (model
     # choice, fusion switch) layered over the shared REST defaults.
     cfg = load_transcribe_config()
+    recall_user_id = _resolve_recall_user_id(user_id, cfg)
     raw = await _read_audio_bytes(audio, max_bytes=cfg.transcribe_max_upload_bytes)
     try:
         pcm = wav_bytes_to_pcm_16k_mono(raw)
@@ -640,6 +665,7 @@ async def asr_transcription_create(
             duration_sec=duration_sec,
             language=language,
             hotwords=_parse_csv(hotwords),
+            recall_user_id=recall_user_id,
             cfg=cfg,
         )
     except JobQueueFullError as exc:
@@ -787,10 +813,12 @@ async def audio_analyze(
     hotwords: str = Form(""),
     emotion_mode: str = Form("both"),
     enrollment_id: str = Form(""),
+    user_id: str = Form(""),
 ):
     """One-shot audio analysis: ASR raw output + cleaned text + emotion."""
     raw = await _read_audio_bytes(audio)
     cfg = load_config()
+    recall_user_id = _resolve_recall_user_id(user_id, cfg)
     hw_list = _parse_csv(hotwords)
     enrollment_b64 = _resolve_enrollment_b64(enrollment_id)
 
@@ -809,6 +837,7 @@ async def audio_analyze(
             language=language,
             audio_pcm=asr_pcm,
             enrollment_b64=enrollment_b64,
+            recall_user_id=recall_user_id,
         )
     )
     emotion_ser_task = asyncio.create_task(
@@ -927,6 +956,10 @@ class _RevalidateStaticFiles(StaticFiles):
         return b"no-cache"
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope.get("type") == "websocket":
+            await send({"type": "websocket.close", "code": 1008})
+            return
+
         cache_header = self._cache_header_for((scope.get("path") or "").lower())
 
         async def send_with_cache(message: dict) -> None:

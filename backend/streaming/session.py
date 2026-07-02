@@ -24,6 +24,8 @@ from fastapi import WebSocket, WebSocketDisconnect
 from ..asr.enrollment import get_enrollment_store
 from ..asr.hotword import query_text_hotwords, sanitize_hotwords
 from ..config import Config, load_config
+from ..debug_dump import SessionDumper, new_session_id
+from ..recall_user import RecallUserIdError, normalize_recall_user_id
 from .audio_stream import AudioStream, VadSegmentedStream
 from .events import (
     PartialSnapshot,
@@ -74,12 +76,18 @@ class SessionContext:
     language: str = ""
     src_lang: str = "N/A"
     hotwords: list[str] = field(default_factory=list)
+    recall_user_id: str = "default"
     # Optional cached target-speaker enrollment (base64 WAV). The session
     # resolves the opaque ``enrollment_id`` once at start / on every
     # ``update_hotwords`` and stores the WAV inline so per-segment
     # inference doesn't re-hit the in-memory store on every call.
     enrollment_id: str | None = None
     enrollment_b64: str | None = None
+    # Per-connection debug context. ``session_id`` is unique per WebSocket;
+    # ``dumper`` is non-None only when ``debug_dump_enabled`` so engines can
+    # cheaply skip the dump path otherwise.
+    session_id: str = ""
+    dumper: SessionDumper | None = None
     send_json: Callable[[dict[str, Any]], Awaitable[bool]] = None  # type: ignore[assignment]
 
     def snapshot(self) -> "SessionContext":
@@ -124,11 +132,31 @@ class StreamingSession:
             self.cfg = self.cfg.override(**config_overrides)
         self.stream.configure(self.cfg)
 
+        # Debug dump is an operator-only knob (not client-overridable), so it
+        # is resolved once here from the endpoint-effective config and never
+        # changes for the life of the connection.
+        self.session_id = new_session_id()
+        self._dumper: SessionDumper | None = (
+            SessionDumper(
+                self.cfg.debug_dump_dir,
+                self.session_id,
+                engine=self.engine.name,
+            )
+            if self.cfg.debug_dump_enabled
+            else None
+        )
+
         self.ctx = SessionContext(
             cfg=self.cfg,
             language=language,
             src_lang=map_language(language),
             hotwords=[],
+            recall_user_id=normalize_recall_user_id(
+                None,
+                default=self.cfg.recall_user_id,
+            ),
+            session_id=self.session_id,
+            dumper=self._dumper,
             send_json=self._send_json,
         )
 
@@ -149,7 +177,14 @@ class StreamingSession:
     # ------------------------------------------------------------------
 
     async def run(self) -> None:
-        sent_ready = await self._send_json({"type": "ready"})
+        # ``session_id`` / ``dump_dir`` ride the ``ready`` frame only when
+        # dumping is on, so default deployments keep the bare {type:"ready"}
+        # contract. AST v3 suppresses ``ready`` entirely, so this is native-only.
+        ready: dict[str, Any] = {"type": "ready"}
+        if self._dumper is not None:
+            ready["session_id"] = self.session_id
+            ready["dump_dir"] = self._dumper.base_dir
+        sent_ready = await self._send_json(ready)
         if sent_ready:
             logger.info(
                 "%s ready (language=%s)",
@@ -278,7 +313,7 @@ class StreamingSession:
             await self._handle_stop()
             return True
         if msg_type == "update_hotwords":
-            self._handle_update_hotwords(ctrl)
+            await self._handle_update_hotwords(ctrl)
             return False
         if msg_type == "extract_hotwords":
             self._handle_extract_hotwords(ctrl)
@@ -294,7 +329,6 @@ class StreamingSession:
         if self._started:
             logger.warning("Duplicate start message, ignoring")
             return
-        self._started = True
 
         client_config = ctrl.get("config")
         if isinstance(client_config, dict) and client_config:
@@ -312,6 +346,27 @@ class StreamingSession:
                 self.ctx.cfg = self.cfg
                 self.stream.configure(self.cfg)
 
+        if "user_id" in ctrl:
+            try:
+                self.ctx.recall_user_id = normalize_recall_user_id(
+                    ctrl.get("user_id"),
+                    default=self.cfg.recall_user_id,
+                )
+            except RecallUserIdError as exc:
+                await self._send_json(
+                    {
+                        "type": "error",
+                        "code": "invalid_user_id",
+                        "message": str(exc),
+                    }
+                )
+                return
+        else:
+            self.ctx.recall_user_id = normalize_recall_user_id(
+                None,
+                default=self.cfg.recall_user_id,
+            )
+
         lang_val = str(ctrl.get("language", "")).strip()
         if lang_val:
             self.ctx.language = lang_val
@@ -325,12 +380,14 @@ class StreamingSession:
         if "enrollment_id" in ctrl:
             self._apply_enrollment(ctrl.get("enrollment_id"))
 
+        self._started = True
         fmt = ctrl.get("format", "pcm_s16le")
         sr = ctrl.get("sample_rate_hz", 16000)
         ch = ctrl.get("channels", 1)
         logger.info(
-            "Start[%s] mode=%s format=%s sr=%s ch=%s language=%s",
-            self.engine.name, ctrl.get("mode"), fmt, sr, ch, self.ctx.language,
+            "Start[%s] mode=%s format=%s sr=%s ch=%s language=%s user_id=%s",
+            self.engine.name, ctrl.get("mode"), fmt, sr, ch,
+            self.ctx.language, self.ctx.recall_user_id,
         )
 
         try:
@@ -338,8 +395,23 @@ class StreamingSession:
         except Exception:
             logger.exception("engine.on_start failed")
 
-    def _handle_update_hotwords(self, ctrl: dict) -> None:
+    async def _handle_update_hotwords(self, ctrl: dict) -> None:
         self.ctx.hotwords = sanitize_hotwords(ctrl.get("hotwords", []))
+        if "user_id" in ctrl:
+            try:
+                self.ctx.recall_user_id = normalize_recall_user_id(
+                    ctrl.get("user_id"),
+                    default=self.cfg.recall_user_id,
+                )
+            except RecallUserIdError as exc:
+                await self._send_json(
+                    {
+                        "type": "error",
+                        "code": "invalid_user_id",
+                        "message": str(exc),
+                    }
+                )
+                return
         if "src_lang" in ctrl:
             lang_val = str(ctrl.get("src_lang", "")).strip()
             if lang_val:
@@ -348,8 +420,11 @@ class StreamingSession:
         if "enrollment_id" in ctrl:
             self._apply_enrollment(ctrl.get("enrollment_id"))
         logger.info(
-            "Hotwords updated: %s (src_lang=%s, enrollment=%s)",
-            self.ctx.hotwords, self.ctx.src_lang, self.ctx.enrollment_id,
+            "Hotwords updated: %s (src_lang=%s, enrollment=%s, user_id=%s)",
+            self.ctx.hotwords,
+            self.ctx.src_lang,
+            self.ctx.enrollment_id,
+            self.ctx.recall_user_id,
         )
 
     def _apply_enrollment(self, raw_id: object) -> None:
@@ -476,13 +551,14 @@ class StreamingSession:
         if not text:
             return
         try:
-            await self._send_json(
-                {
-                    "type": "partial",
-                    "text": text,
-                    "language": part.language or self.ctx.language,
-                }
-            )
+            payload = {
+                "type": "partial",
+                "text": text,
+                "language": part.language or self.ctx.language,
+            }
+            if part.id:
+                payload["id"] = part.id
+            await self._send_json(payload)
         except WebSocketDisconnect:
             self._ws_closed = True
         except Exception:

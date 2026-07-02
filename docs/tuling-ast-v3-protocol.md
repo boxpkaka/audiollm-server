@@ -2,7 +2,7 @@
 
 `/tuling/ast/v3` 以讯飞图灵 AST v3 信封协议对外提供实时语音转写。它复用与 `/transcribe-streaming` 相同的 VAD 分段流水线，但按端点策略恒为 primary-only：只调用主模型（由 `astv3_vllm_*` 指定，当前留空，回退全局 primary `vllm_base_url`），不启用本地副模型、partial 静音门与双模型融合。另一处区别在线上协议：音频以 base64 编码放在 JSON 帧的 `payload.audio.audio` 中，`header.status`（0/1/2）驱动开始/中间/结束状态机，结果按 `payload.result` 词图结构返回。
 
-该端点与现有 `/transcribe-streaming`、`/ws/audio` 并存，互不影响。客户端可使用讯飞 `tuling-ast-sdk`（Java）或任意 WebSocket 客户端按本协议对接。
+该端点与现有 `/transcribe-streaming` 并存，互不影响。客户端可使用讯飞 `tuling-ast-sdk`（Java）或任意 WebSocket 客户端按本协议对接。
 
 ## 接口信息
 
@@ -75,20 +75,20 @@ Client                                      Server
 | 字段 | 类型 | 必传 | 说明 |
 |---|---|---|---|
 | engine | Map | 否 | 引擎透传参数，仅记录日志，当前不映射到任何行为（见已知限制）。兼容 SDK 使用的 parameter.service |
-| asr_config | Map | 否 | 本服务扩展的 per-connection 配置覆写，仅首帧（status=0）读取，仅当前连接生效、不落盘。详见“配置覆写”章节 |
+| asr_config | Map | 否 | 本服务扩展的 per-connection 配置覆写与 `user_id` 承载槽，仅首帧（status=0）读取，仅当前连接生效、不落盘。详见“配置覆写”章节 |
 
 ### payload
 
 | 字段 | 类型 | 必传 | 说明 |
 |---|---|---|---|
 | payload.audio.audio | String | 是 | base64 编码的 PCM 音频分片 |
-| payload.text.text | String | 否 | 兼容旧客户端的文本类型热词字段；当前不再驱动 ASR 偏置 |
+| payload.text.text | String | 否 | 兼容旧客户端的文本类型热词字段；会被解析为临时请求热词，final 段去重限量后追加到 Triton 召回结果后进入 prompt，不写入用户池 |
 
 ### 状态机与音频
 
 | status | 含义 | 服务端处理 |
 |---|---|---|
-| 0 | 首帧 | 建立会话、捕获 traceId、生成 sid；兼容读取旧热词字段但不用于 ASR 偏置；若本帧带音频则同时送入 VAD |
+| 0 | 首帧 | 建立会话、捕获 traceId、生成 sid；兼容读取旧热词字段作为临时请求热词；若本帧带音频则同时送入 VAD |
 | 1 | 中间帧 | 解码音频送入 VAD |
 | 2 | 尾帧 | 先送本帧音频，再 flush 残余音频结束会话 |
 
@@ -96,15 +96,15 @@ Client                                      Server
 
 ## 配置覆写（parameter.asr_config）
 
-`parameter.asr_config` 是本服务在 AST v3 信封上的扩展槽位，用于按连接临时调参，与讯飞 `parameter.engine`（仅记录日志、不映射行为）并列、互不影响。仅在首帧（status=0）读取，仅对当前连接生效、不落盘；新连接或服务重启都回到服务端默认。
+`parameter.asr_config` 是本服务在 AST v3 信封上的扩展槽位，用于按连接临时调参，也承载 Triton 用户热词池隔离 ID `user_id`；它与讯飞 `parameter.engine`（仅记录日志、不映射行为）并列、互不影响。仅在首帧（status=0）读取，仅对当前连接生效、不落盘；新连接或服务重启都回到服务端默认。
 
 取值优先级（后者覆盖前者）：`backend/config.py` 内置默认 → `config.yaml` 服务端默认 → `parameter.asr_config` 客户端临时覆写。
 
-只接受白名单内的扁平字段名；未知字段、受限字段（模型地址、密钥、连接池/队列等基础设施项）以及非法值会被忽略并保持服务端默认，不会中断连接。`language` 是特例：它不是配置字段，会被用作本次会话语言（等价于 `/transcribe-streaming` 的 `start.language`）。
+只接受白名单内的扁平字段名；未知字段、受限字段（模型地址、密钥、连接池/队列等基础设施项）以及非法值会被忽略并保持服务端默认，不会中断连接。`language` 和 `user_id` 是特例：`language` 会被用作本次会话语言（等价于 `/transcribe-streaming` 的 `start.language`），`user_id` 会被用作 Triton 热词池隔离 ID（默认 `default`），不会进入配置覆写白名单。
 
 可覆写字段与 `/transcribe-streaming` 的 `start.config` 共用同一白名单（`backend/config.py` 的 `CLIENT_OVERRIDABLE_FIELDS`）。下面按类别逐字段说明语义：默认列为服务端 `config.yaml` 当前生效值，本端点列标注该字段在 AST v3 是否产生可观察效果（本端点恒为 primary-only，副模型与融合相关字段即使传入也不生效）。
 
-当服务端启用 `k2_enabled=true` 时，本端点的 `Progressive` 中间结果来自外部 k2 流式 ASR，`sentence` 终稿仍由本服务 LLM ASR 产生。k2 只做纯识别，不接热词、不接 `header.resIdList` 目标说话人、不返回 token timestamps；热词召回、目标说话人过滤、ITN 与车牌规范化只作用于 sentence。此时切段权威是 k2 endpoint，VAD 与伪流式间隔类覆写仍会被接受但不再决定切点或首字时机；`enable_pseudo_stream=false` 仍会抑制 Progressive 下发。
+当服务端启用 `k2_enabled=true` 时，本端点的 `Progressive` 中间结果来自外部 k2 流式 ASR，`sentence` 终稿仍由本服务 LLM ASR 产生。k2 只做纯识别，不接热词、不接 `header.resIdList` 目标说话人、不返回 token timestamps；热词召回、目标说话人过滤、ITN 与车牌规范化只作用于 sentence。此时切段权威是 k2 endpoint，本服务只保留有界缓冲，并在 Progressive/sentence 进入下游前用 `k2_voice_gate_*` 确认有人声证据；voice gate 只做放行/丢弃，不裁剪段首/段尾，`bg` / `ed` 仍反映该 k2 段缓冲边界。VAD 与伪流式间隔类覆写仍会被接受但不再决定切点或首字时机；`enable_pseudo_stream=false` 仍会抑制 Progressive 下发。
 
 VAD / 分段（凡按帧计的字段，其帧时长由 VAD 后端 hop 决定：ten-vad 约 16 ms/帧，能量兜底约 10 ms/帧）：
 

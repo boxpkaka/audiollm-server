@@ -100,6 +100,8 @@ Client                                      Server
 {"type":"ready"}
 ```
 
+服务端 `debug_dump_enabled=true` 时，`ready` 会额外带 `session_id` / `dump_dir`（与 [实时转写协议](transcribe-streaming-protocol.md) 一致，由共享会话层注入）。但本端点的情感任务不落盘、`final_emotion` 也不带 `dump_id`；这两个字段对情感流仅作连接标识，可忽略。
+
 ### final_emotion
 
 payload 与整段情感接口一致：

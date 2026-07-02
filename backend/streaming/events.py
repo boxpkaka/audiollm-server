@@ -25,6 +25,7 @@ class SegmentReady:
 
     pcm: np.ndarray
     is_stop_flush: bool = False
+    id: str | None = None
     start_ms: float | None = None
     end_ms: float | None = None
 
@@ -39,6 +40,7 @@ class PartialSnapshot:
     """
 
     pcm: np.ndarray
+    id: str | None = None
 
 
 @dataclass
@@ -50,6 +52,7 @@ class PartialText:
     """
 
     text: str
+    id: str | None = None
     language: str | None = None
 
 
