@@ -15,14 +15,54 @@ import backend.asr.client as client_mod  # noqa: E402
 from backend.config import Config  # noqa: E402
 
 
-def test_merge_recalled_and_custom_hotwords_dedupes_and_limits_custom():
+def test_merge_recalled_and_custom_hotwords_prefers_and_limits_custom():
     out = client_mod.merge_recalled_and_custom_hotwords(
         ["召回A", "上灯板"],
         [" 上灯板 ", "临时一", "临时二", "临时三"],
         custom_limit=2,
     )
 
-    assert out == ["召回A", "上灯板", "临时一", "临时二"]
+    assert out == ["上灯板", "临时一", "召回A"]
+
+
+def test_merge_recalled_and_custom_hotwords_removes_homophone_recalls():
+    out = client_mod.merge_recalled_and_custom_hotwords(
+        ["章硕", "张烁", "挚音科技", "张硕科技"],
+        ["张硕"],
+        custom_limit=8,
+    )
+
+    assert out == ["张硕", "挚音科技", "张硕科技"]
+
+
+def test_merge_recalled_and_custom_hotwords_ignores_tone_for_homophones():
+    out = client_mod.merge_recalled_and_custom_hotwords(
+        ["妈", "麻辣"],
+        ["马"],
+        custom_limit=8,
+    )
+
+    assert out == ["马", "麻辣"]
+
+
+def test_merge_recalled_and_custom_hotwords_does_not_filter_when_custom_limit_zero():
+    out = client_mod.merge_recalled_and_custom_hotwords(
+        ["章硕", "挚音科技"],
+        ["张硕"],
+        custom_limit=0,
+    )
+
+    assert out == ["章硕", "挚音科技"]
+
+
+def test_merge_recalled_and_custom_hotwords_keeps_mixed_words_exact_only():
+    out = client_mod.merge_recalled_and_custom_hotwords(
+        ["阿股", "AI", "A股"],
+        ["A股", "爱"],
+        custom_limit=8,
+    )
+
+    assert out == ["A股", "爱", "阿股", "AI"]
 
 
 @pytest.mark.asyncio
@@ -60,8 +100,8 @@ async def test_query_audio_model_merges_recalled_and_custom_hotwords(monkeypatch
         ),
     )
 
-    assert result["reported_hotwords"] == ["召回A", "上灯板", "临时一", "临时二"]
+    assert result["reported_hotwords"] == ["上灯板", "临时一", "召回A"]
     messages = captured["messages"]
     assert isinstance(messages, list)
     content = messages[0]["content"]
-    assert content[0]["text"] == "Transcribe the following audio.\nHotwords: 召回A,上灯板,临时一,临时二"
+    assert content[0]["text"] == "Transcribe the following audio.\nHotwords: 上灯板,临时一,召回A"

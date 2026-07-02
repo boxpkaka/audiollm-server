@@ -19,6 +19,7 @@ dependencies = [
     "numpy",
     "protobuf",
     "python-multipart",
+    "pypinyin>=0.54.0",
     "pyyaml",
     "ten-vad",
     "tritonclient[http]>=2.69.0",

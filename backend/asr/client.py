@@ -3,6 +3,7 @@ import re
 from typing import Any, TypedDict
 
 import numpy as np
+from pypinyin import Style, lazy_pinyin
 
 from ..config import SAMPLE_RATE, Config, default_config
 from ..http_client import get_client
@@ -11,6 +12,8 @@ from .prompt_templates import build_primary_messages as _build_primary_messages
 from .recall import recall_audio
 
 logger = logging.getLogger(__name__)
+
+_CHINESE_WORD_RE = re.compile(r"^[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+$")
 
 
 class ASRResult(TypedDict):
@@ -84,15 +87,31 @@ def _parse_language_field(value: str) -> str | None:
     return v
 
 
+def _hotword_pronunciation_key(word: str) -> tuple[str, ...] | None:
+    """Return a whole-word pinyin key for pure Chinese hotwords."""
+    if not _CHINESE_WORD_RE.fullmatch(word):
+        return None
+    syllables = lazy_pinyin(
+        word,
+        style=Style.NORMAL,
+        errors="ignore",
+        strict=False,
+    )
+    if len(syllables) != len(word) or not all(syllables):
+        return None
+    return tuple(syllables)
+
+
 def merge_recalled_and_custom_hotwords(
     recalled: list[str] | None,
     custom: list[str] | None,
     *,
     custom_limit: int,
 ) -> list[str]:
-    """Append a small request-local hotword list after recalled pool hits."""
+    """Prefer request-local hotwords and suppress same-pronunciation recalls."""
     merged: list[str] = []
     seen: set[str] = set()
+    custom_pronunciations: set[tuple[str, ...]] = set()
 
     def add_word(raw: object) -> bool:
         word = str(raw or "").strip()
@@ -102,19 +121,24 @@ def merge_recalled_and_custom_hotwords(
         merged.append(word)
         return True
 
-    for word in recalled or []:
-        add_word(word)
-
     remaining = max(int(custom_limit), 0)
-    if remaining == 0:
-        return merged
-    for word in custom or []:
-        before = len(merged)
-        add_word(word)
-        if len(merged) > before:
-            remaining -= 1
-            if remaining <= 0:
-                break
+    if remaining > 0:
+        for word in custom or []:
+            before = len(merged)
+            add_word(word)
+            if len(merged) > before:
+                key = _hotword_pronunciation_key(merged[-1])
+                if key is not None:
+                    custom_pronunciations.add(key)
+                remaining -= 1
+                if remaining <= 0:
+                    break
+    for word in recalled or []:
+        normalized = str(word or "").strip()
+        key = _hotword_pronunciation_key(normalized)
+        if key is not None and key in custom_pronunciations:
+            continue
+        add_word(normalized)
     return merged
 
 

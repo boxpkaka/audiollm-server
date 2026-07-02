@@ -28,7 +28,7 @@
 
 `/transcribe-streaming` 的 `final` / `final_asr` 消息除文本外会带当前语音分段的 `audio_b64`（WAV base64）和 `duration_sec`，主前端用它做分段音频回放。k2 模式下该音频是同一段送入 LLM ASR 的 k2 段缓冲，不再经过本地 VAD 段首/段尾二次裁剪；完整字段见 [实时转写 WebSocket 协议](transcribe-streaming-protocol.md)。服务端开启 `debug_dump_enabled`（`defaults.debug`，运维级、不在客户端覆写白名单）后，`ready` 带 `session_id`/`dump_dir`、`final` 带 `dump_id`，并把每段音频+元信息落盘到 `<dump_dir>/<session_id>/<seg_id>.{wav,json}`，前端在气泡上显示可复制的 `dump_id`，用于回放/最终结果对账，详见协议文档“调试落盘”小节。
 
-`/tuling/ast/v3` 与上面两个任务接口的线上协议不同：音频以 base64 放在 JSON 帧，`header.status`（0/1/2）驱动状态机，无 `ready`/`start`/`stop`，结果为词图结构。模型组合上也不同：本端点恒为 primary-only（强制关闭副模型/本地 Qwen/融合，客户端无法经 `parameter.asr_config` 重开），主模型由 `astv3_vllm_*` 指定（当前留空，回退全局 primary `vllm_base_url`），而 `/transcribe-streaming` 仍按 `config.yaml` 走双模型。它兼容旧热词字段（`payload.text.text`，作为临时请求热词限量追加到召回结果后）、用户热词池隔离（首帧 `parameter.asr_config.user_id`，默认 `default`）、目标说话人（先经 `POST /api/asr/enrollment` 注册，再把 id 放进首帧 `header.resIdList[0]`）与配置覆写（首帧 `parameter.asr_config`，等价于其他端点的 `start.config`）。它不遵循下文“WebSocket 调用流程”，详见 [实时转写 AST v3 WebSocket](tuling-ast-v3-protocol.md)。
+`/tuling/ast/v3` 与上面两个任务接口的线上协议不同：音频以 base64 放在 JSON 帧，`header.status`（0/1/2）驱动状态机，无 `ready`/`start`/`stop`，结果为词图结构。模型组合上也不同：本端点恒为 primary-only（强制关闭副模型/本地 Qwen/融合，客户端无法经 `parameter.asr_config` 重开），主模型由 `astv3_vllm_*` 指定（当前留空，回退全局 primary `vllm_base_url`），而 `/transcribe-streaming` 仍按 `config.yaml` 走双模型。它兼容旧热词字段（`payload.text.text`，作为临时请求热词限量优先注入 prompt，并覆盖精确重复或整词同音的召回词）、用户热词池隔离（首帧 `parameter.asr_config.user_id`，默认 `default`）、目标说话人（先经 `POST /api/asr/enrollment` 注册，再把 id 放进首帧 `header.resIdList[0]`）与配置覆写（首帧 `parameter.asr_config`，等价于其他端点的 `start.config`）。它不遵循下文“WebSocket 调用流程”，详见 [实时转写 AST v3 WebSocket](tuling-ast-v3-protocol.md)。
 
 `/astv3-test-proxy` 是为「实时语音识别（测试用）」前端页面临时搭的同源 WebSocket 代理。该页经 HTTPS 提供，浏览器 mixed-content 策略禁止它直接打开明文 `ws://` 的远程 AST v3 后端；由后端在同源 `wss://`（经反向代理）接入后，把每一帧原样双向转发到写死的上游 `ws://159.138.9.106:18082/tuling/ast/v3`。它不解析 AST v3 信封，线上协议与 `/tuling/ast/v3` 完全一致（见 [实时转写 AST v3 WebSocket](tuling-ast-v3-protocol.md)）；上游连接失败时服务端以 close code 1011 关闭连接。临时测试设施：上游地址写死、前端不暴露任何可选项，外部集成请直接使用 `/tuling/ast/v3`。
 
@@ -281,7 +281,7 @@ curl -X POST http://172.16.0.3:8080/api/asr/enrollment \
 
 ### Triton 用户热词池
 
-ASR 热词偏置主要由 Triton 服务按 `user_id` 维护用户热词池。final 段先在当前用户池内召回 `recall_top_k` 个相关热词，再追加少量请求临时 `hotwords`（默认 `recall_custom_hotword_limit=8`，去重、不写入用户池），最后注入主 ASR prompt；伪流式 partial 不执行召回、不注入热词、也不走 encoder bypass，只使用纯 vLLM raw-audio 推理。池管理接口只代理 Triton 的 `list/add/delete/reload` 操作，不在 demo 进程内复制热词状态。未传 `user_id` 时使用 `config.yaml` 的 `recall_user_id`，默认 `default`。
+ASR 热词偏置主要由 Triton 服务按 `user_id` 维护用户热词池。final 段先在当前用户池内召回 `recall_top_k` 个相关热词，再让少量请求临时 `hotwords`（默认 `recall_custom_hotword_limit=8`，去重、不写入用户池）优先进入主 ASR prompt，并过滤与请求热词精确重复或整词同音（忽略声调）的召回词；伪流式 partial 不执行召回、不注入热词、也不走 encoder bypass，只使用纯 vLLM raw-audio 推理。池管理接口只代理 Triton 的 `list/add/delete/reload` 操作，不在 demo 进程内复制热词状态。未传 `user_id` 时使用 `config.yaml` 的 `recall_user_id`，默认 `default`。
 
 ```bash
 curl 'http://172.16.0.3:8080/api/asr/hotword-pool?user_id=tenant-a&limit=20'
