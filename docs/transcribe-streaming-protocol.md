@@ -74,13 +74,13 @@ Client                                      Server
 | `channels` | integer | 是 | 固定为 `1` |
 | `language` | string | 否 | 语言代码；与 query 参数二选一即可 |
 | `user_id` | string | 否 | Triton 热词池隔离 ID，默认 `default`；只召回和管理该用户池 |
-| `hotwords` | string[] | 否 | 临时请求热词；final 段会把去重后的前 `recall_custom_hotword_limit` 个追加到 Triton 召回结果后进入 prompt，不写入用户池 |
+| `hotwords` | string[] | 否 | 临时请求热词；final 段会把去重后的前 `recall_custom_hotword_limit` 个优先注入 prompt，并覆盖精确重复或整词同音（忽略声调）的 Triton 召回热词，不写入用户池 |
 | `enrollment_id` | string | 否 | 由 `POST /api/asr/enrollment` 返回的目标说话人 id；传 `null` 或省略表示普通 ASR |
 | `config` | object | 否 | 当前连接的服务端配置覆写，仅白名单字段生效（见“可覆写配置”） |
 
 ### update_hotwords
 
-兼容旧客户端的控制消息。`hotwords` 字段会被接收为后续 final 段的临时请求热词：服务端会把去重后的前 `recall_custom_hotword_limit` 个追加到当前 `user_id` 的 Triton 用户池召回结果后进入 prompt，但不会写入用户池。该消息仍可用于切换/清除目标说话人，也可用 `user_id` 切换热词池。
+兼容旧客户端的控制消息。`hotwords` 字段会被接收为后续 final 段的临时请求热词：服务端会把去重后的前 `recall_custom_hotword_limit` 个优先注入 prompt，并过滤当前 `user_id` 的 Triton 用户池中精确重复或整词同音（忽略声调）的召回词，但不会写入用户池。该消息仍可用于切换/清除目标说话人，也可用 `user_id` 切换热词池。
 
 ```json
 {
@@ -261,7 +261,7 @@ python docs/examples/ws_transcribe.py sample.wav \
 |---|---|---|---|
 | `audio` | file | 是 | WAV 音频文件 |
 | `language` | string | 否 | 语言代码 |
-| `hotwords` | string | 否 | 临时请求热词；去重限量后追加到 Triton 召回结果后进入 prompt，不写入用户池 |
+| `hotwords` | string | 否 | 临时请求热词；去重限量后优先进入 prompt，并覆盖精确重复或整词同音（忽略声调）的 Triton 召回热词，不写入用户池 |
 | `enrollment_id` | string | 否 | 由 `POST /api/asr/enrollment` 返回的目标说话人 id；不传或失效时静默回退到普通 ASR |
 
 ### 响应
@@ -385,7 +385,7 @@ print(r.json())
 
 ## ASR Prompt 模板
 
-后端按主模型 upstream 的 `prompt_template` 选择 prompt 结构。热词偏置来自当前 `user_id` 的 Triton 用户池召回 top-K 结果，并追加少量请求临时 `hotwords`（默认最多 8 个，去重后不写入用户池）。模板选择是服务端模型配置，不可客户端覆写。两套模板都支持普通 ASR、召回热词、TS-ASR、TS-ASR + 召回热词。
+后端按主模型 upstream 的 `prompt_template` 选择 prompt 结构。热词偏置来自当前 `user_id` 的 Triton 用户池召回 top-K 结果，以及优先进入 prompt 的少量请求临时 `hotwords`（默认最多 8 个，去重后不写入用户池）；与临时热词精确重复或整词同音（忽略声调）的召回词会被过滤。模板选择是服务端模型配置，不可客户端覆写。两套模板都支持普通 ASR、召回热词、TS-ASR、TS-ASR + 召回热词。
 
 ### `amphion_asr`（Amphion 4B）
 
@@ -489,7 +489,7 @@ TS-ASR + 热词的实际 `messages` 示例：
 ]
 ```
 
-final 段 prompt 中实际注入的是 Triton 召回 top-K（默认 `recall_top_k=50`）热词，再按顺序追加去重后的临时 `hotwords`（默认最多 `recall_custom_hotword_limit=8` 个），格式仍为半角逗号 `,` 分隔无空格。伪流式 partial 不执行召回、不注入热词、也不走 encoder bypass，只使用纯 vLLM raw-audio 推理。`Language:` 行不会出现在 ASR prompt 中；1.7B 若输出 `language Chinese<asr_text>...` 前缀，服务端会剥离前缀并记录模型自检语种。服务端还会折叠超过 20 次的退化重复输出，避免解码 loop 污染 partial / final 文本。
+final 段 prompt 中实际注入的是去重限量后的临时 `hotwords`（默认最多 `recall_custom_hotword_limit=8` 个），再追加未被精确重复或整词同音（忽略声调）规则过滤的 Triton 召回 top-K（默认 `recall_top_k=50`）热词，格式仍为半角逗号 `,` 分隔无空格。伪流式 partial 不执行召回、不注入热词、也不走 encoder bypass，只使用纯 vLLM raw-audio 推理。`Language:` 行不会出现在 ASR prompt 中；1.7B 若输出 `language Chinese<asr_text>...` 前缀，服务端会剥离前缀并记录模型自检语种。服务端还会折叠超过 20 次的退化重复输出，避免解码 loop 污染 partial / final 文本。
 
 ## 相关文档
 

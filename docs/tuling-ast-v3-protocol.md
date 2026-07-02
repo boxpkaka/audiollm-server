@@ -82,7 +82,7 @@ Client                                      Server
 | 字段 | 类型 | 必传 | 说明 |
 |---|---|---|---|
 | payload.audio.audio | String | 是 | base64 编码的 PCM 音频分片 |
-| payload.text.text | String | 否 | 兼容旧客户端的文本类型热词字段；会被解析为临时请求热词，final 段去重限量后追加到 Triton 召回结果后进入 prompt，不写入用户池 |
+| payload.text.text | String | 否 | 兼容旧客户端的文本类型热词字段；会被解析为临时请求热词，final 段去重限量后优先进入 prompt，并覆盖精确重复或整词同音（忽略声调）的 Triton 召回热词，不写入用户池 |
 
 ### 状态机与音频
 

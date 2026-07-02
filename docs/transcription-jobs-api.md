@@ -29,7 +29,7 @@
 | `audio` | file | 是 | WAV 文件（PCM 8/16/24/32-bit，任意采样率与声道数，服务端重采样到 16 kHz mono）。压缩格式（flac/mp3/m4a）需客户端先转码，例如 `ffmpeg -i in.flac -ac 1 -ar 16000 -sample_fmt s16 out.wav` |
 | `language` | string | 否 | 语言提示，如 `zh`、`en`；空为自动检测 |
 | `user_id` | string | 否 | Triton 热词池隔离 ID，默认 `default`；每段 ASR 都使用该用户池召回 |
-| `hotwords` | string | 否 | 临时请求热词；每段 ASR 会把去重后的前 `recall_custom_hotword_limit` 个追加到 Triton 用户池召回结果后进入 prompt，不写入用户池 |
+| `hotwords` | string | 否 | 临时请求热词；每段 ASR 会把去重后的前 `recall_custom_hotword_limit` 个优先注入 prompt，并覆盖精确重复或整词同音（忽略声调）的 Triton 用户池召回热词，不写入用户池 |
 
 不支持 `enrollment_id`：目标说话人过滤只保留单一说话人的语音，与多人会议转写语义相反。
 
