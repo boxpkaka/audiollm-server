@@ -1,19 +1,22 @@
-"""Triton hotword recall client.
+"""Triton hotword recall and RAG-ASR management client.
 
-The deployed RAG-ASR Triton model owns a process-wide hotword pool.  This module
-keeps audiollm-demo as a thin async gateway: it sends PCM to Triton, receives the
-recalled top-K words plus vLLM-ready audio_embeds, and proxies pool management
-operations.
+AudioLLM stays a thin gateway: final ASR sends PCM to Triton for top-K hotword
+recall and optional vLLM-ready audio_embeds.  Hotword-pool management and
+enrollment embedding storage can be routed to the optional RAG-ASR HTTP
+management service; when that service is not configured, legacy Triton
+management and local enrollment fallback remain available.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
+import httpx
 import numpy as np
 
 from ..config import Config, Upstream, get_service_upstream
@@ -62,6 +65,17 @@ def _recall_upstream() -> Upstream:
     return upstream
 
 
+def _management_upstream() -> Upstream | None:
+    upstream = get_service_upstream("recall_management")
+    if upstream is None or not upstream.base_url:
+        return None
+    return upstream
+
+
+def _management_url(upstream: Upstream, path: str) -> str:
+    return f"{upstream.base_url.rstrip('/')}/{path.lstrip('/')}"
+
+
 def _client_for(upstream: Upstream):
     import tritonclient.http as httpclient
 
@@ -78,6 +92,12 @@ def _int_input(httpclient, name: str, value: int):
     tensor = httpclient.InferInput(name, [1], "INT32")
     tensor.set_data_from_numpy(np.array([int(value)], dtype=np.int32))
     return tensor
+
+
+def _control_request_id(payload: dict[str, object]) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    return f"ctl:{encoded}"
 
 
 def _model_name(upstream: Upstream) -> str:
@@ -100,19 +120,21 @@ def _infer_sync(
     httpclient, client = _client_for(upstream)
     wav = np.asarray(pcm, dtype=np.float32).reshape(-1)
     wav_input = httpclient.InferInput("WAV", wav.shape, "FP32")
+    control: dict[str, object] = {
+        "action": "infer",
+        "hotword_pool_id": hotword_pool_id,
+    }
+    if enrollment_id:
+        control["enrollment_id"] = enrollment_id
+    if enrollment_user_id:
+        control["enrollment_user_id"] = enrollment_user_id
     inputs = [
-        _string_input(httpclient, "ACTION", "infer"),
-        _string_input(httpclient, "USER_ID", hotword_pool_id),
         wav_input,
         _int_input(httpclient, "SAMPLE_RATE", sample_rate),
         _int_input(httpclient, "TOP_K", top_k),
     ]
     if not enable_hotword_recall:
         inputs.append(_int_input(httpclient, "ENABLE_HOTWORD_RECALL", 0))
-    if enrollment_id:
-        inputs.append(_string_input(httpclient, "ENROLLMENT_ID", enrollment_id))
-    if enrollment_user_id:
-        inputs.append(_string_input(httpclient, "ENROLLMENT_USER_ID", enrollment_user_id))
     if want_enrollment_audio_embeds:
         inputs.append(_int_input(httpclient, "WANT_ENROLLMENT_AUDIO_EMBEDS", 1))
     wav_input.set_data_from_numpy(wav)
@@ -132,7 +154,12 @@ def _infer_sync(
             ]
         )
 
-    result = client.infer(_model_name(upstream), inputs, outputs=outputs)
+    result = client.infer(
+        _model_name(upstream),
+        inputs,
+        outputs=outputs,
+        request_id=_control_request_id(control),
+    )
     words = json.loads(_decode(result.as_numpy("WORD_LIST")[0]))
     projector_len = int(result.as_numpy("PROJECTOR_LEN")[0])
     audio_embeds_b64 = None
@@ -209,29 +236,78 @@ def _enrollment_sync(
     pcm: np.ndarray | None = None,
     sample_rate: int = SAMPLE_RATE,
 ) -> dict[str, object]:
+    management = _management_upstream()
+    if management is not None:
+        resolved_enrollment_user_id = normalize_hotword_pool_id(
+            enrollment_user_id if enrollment_user_id is not None else user_id,
+            default=DEFAULT_HOTWORD_POOL_ID,
+        )
+        with httpx.Client(timeout=management.timeout) as client:
+            if action == "upsert_enrollment":
+                if pcm is None:
+                    raise ValueError("pcm is required for upsert_enrollment")
+                wav = np.asarray(pcm, dtype=np.float32).reshape(-1)
+                response = client.post(
+                    _management_url(management, f"/enrollments/{enrollment_id}"),
+                    data={
+                        "enrollment_user_id": resolved_enrollment_user_id,
+                        "sample_rate": str(int(sample_rate)),
+                    },
+                    files={
+                        "file": (
+                            "audio.f32",
+                            wav.tobytes(),
+                            "application/octet-stream",
+                        )
+                    },
+                )
+            elif action == "get_enrollment":
+                response = client.get(
+                    _management_url(management, f"/enrollments/{enrollment_id}"),
+                    params={"enrollment_user_id": resolved_enrollment_user_id},
+                )
+            elif action == "delete_enrollment":
+                response = client.delete(
+                    _management_url(management, f"/enrollments/{enrollment_id}"),
+                    params={"enrollment_user_id": resolved_enrollment_user_id},
+                )
+            else:
+                raise ValueError(f"unknown enrollment action: {action}")
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, dict) else {"status": "ok", "data": data}
+
     upstream = _recall_upstream()
     httpclient, client = _client_for(upstream)
     resolved_enrollment_user_id = normalize_hotword_pool_id(
         enrollment_user_id if enrollment_user_id is not None else user_id,
         default=DEFAULT_HOTWORD_POOL_ID,
     )
-    inputs = [
-        _string_input(httpclient, "ACTION", action),
-        _string_input(httpclient, "ENROLLMENT_USER_ID", resolved_enrollment_user_id),
-        _string_input(httpclient, "ENROLLMENT_ID", enrollment_id),
-    ]
+    control: dict[str, object] = {
+        "action": action,
+        "enrollment_id": enrollment_id,
+        "enrollment_user_id": resolved_enrollment_user_id,
+    }
+    inputs = []
     if pcm is not None:
         wav = np.asarray(pcm, dtype=np.float32).reshape(-1)
         wav_input = httpclient.InferInput("WAV", wav.shape, "FP32")
         wav_input.set_data_from_numpy(wav)
         inputs.extend([wav_input, _int_input(httpclient, "SAMPLE_RATE", sample_rate)])
+    else:
+        inputs.append(_int_input(httpclient, "OFFSET", 0))
     outputs = [
         httpclient.InferRequestedOutput("STATUS"),
         httpclient.InferRequestedOutput("MESSAGE"),
         httpclient.InferRequestedOutput("HOTWORD_COUNT"),
         httpclient.InferRequestedOutput("HOTWORD_LIST"),
     ]
-    result = client.infer(_model_name(upstream), inputs, outputs=outputs)
+    result = client.infer(
+        _model_name(upstream),
+        inputs,
+        outputs=outputs,
+        request_id=_control_request_id(control),
+    )
     status = _decode(result.as_numpy("STATUS")[0])
     message_raw = _decode(result.as_numpy("MESSAGE")[0])
     message = json.loads(message_raw) if message_raw else {}
@@ -299,26 +375,66 @@ def _management_sync(
     hotword_pool_id: str | None = None,
     user_id: str | None = None,
 ) -> dict[str, object]:
+    management = _management_upstream()
+    if management is not None:
+        resolved_hotword_pool_id = normalize_hotword_pool_id(
+            hotword_pool_id if hotword_pool_id is not None else user_id,
+            default=DEFAULT_HOTWORD_POOL_ID,
+        )
+        with httpx.Client(timeout=management.timeout) as client:
+            if action == "list":
+                response = client.get(
+                    _management_url(management, "/hotword-pool"),
+                    params={
+                        "hotword_pool_id": resolved_hotword_pool_id,
+                        "query": query,
+                        "limit": limit,
+                        "offset": offset,
+                    },
+                )
+            elif action == "add":
+                response = client.post(
+                    _management_url(management, "/hotword-pool"),
+                    json={
+                        "hotword_pool_id": resolved_hotword_pool_id,
+                        "hotwords": hotwords or [],
+                    },
+                )
+            elif action == "delete":
+                response = client.request(
+                    "DELETE",
+                    _management_url(management, "/hotword-pool"),
+                    json={
+                        "hotword_pool_id": resolved_hotword_pool_id,
+                        "hotwords": hotwords or [],
+                    },
+                )
+            elif action == "reload":
+                response = client.post(
+                    _management_url(management, "/hotword-pool/reload"),
+                    json={"hotword_pool_id": resolved_hotword_pool_id},
+                )
+            else:
+                raise ValueError(f"unknown hotword action: {action}")
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, dict) else {"status": "ok", "data": data}
+
     upstream = _recall_upstream()
     httpclient, client = _client_for(upstream)
     resolved_hotword_pool_id = normalize_hotword_pool_id(
         hotword_pool_id if hotword_pool_id is not None else user_id,
         default=DEFAULT_HOTWORD_POOL_ID,
     )
-    inputs = [
-        _string_input(httpclient, "ACTION", action),
-        _string_input(httpclient, "USER_ID", resolved_hotword_pool_id),
-    ]
+    control: dict[str, object] = {
+        "action": action,
+        "hotword_pool_id": resolved_hotword_pool_id,
+    }
     if hotwords is not None:
-        inputs.append(
-            _string_input(
-                httpclient,
-                "HOTWORDS",
-                json.dumps(hotwords, ensure_ascii=False),
-            )
-        )
+        control["hotwords"] = hotwords
     if query:
-        inputs.append(_string_input(httpclient, "QUERY", query))
+        control["query"] = query
+    inputs = []
     if limit is not None:
         inputs.append(_int_input(httpclient, "LIMIT", limit))
     inputs.append(_int_input(httpclient, "OFFSET", offset))
@@ -329,7 +445,12 @@ def _management_sync(
         httpclient.InferRequestedOutput("HOTWORD_COUNT"),
         httpclient.InferRequestedOutput("HOTWORD_LIST"),
     ]
-    result = client.infer(_model_name(upstream), inputs, outputs=outputs)
+    result = client.infer(
+        _model_name(upstream),
+        inputs,
+        outputs=outputs,
+        request_id=_control_request_id(control),
+    )
     status = _decode(result.as_numpy("STATUS")[0])
     message_raw = _decode(result.as_numpy("MESSAGE")[0])
     hotwords_raw = _decode(result.as_numpy("HOTWORD_LIST")[0])

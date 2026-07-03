@@ -51,6 +51,14 @@ upstreams:
     base_url: http://localhost:10001
     model_name: rag_asr_retrieve
     timeout: 30
+  rag_asr_management:
+    # Optional RAG-ASR HTTP management service. Keep empty to preserve the
+    # legacy Triton-management/local-enrollment path. When enabling gray
+    # enrollment embedding store, point this to RAG-ASR serve_http.sh, for
+    # example http://127.0.0.1:18080.
+    base_url: ${RAG_ASR_MANAGEMENT_BASE_URL}
+    model_name: rag_asr_management
+    timeout: 30
 
 # 全局默认 tuning; 端点的 policy 可逐项软覆盖, lock 可硬锁定。
 # 注: base_url/model/timeout 属 upstreams, 不在此; 这里只放纯调参。
@@ -97,7 +105,7 @@ defaults:
     recall_top_k: 50
     hotword_pool_id: default                 # 未显式传 hotword_pool_id/user_id 时使用的热词池 ID
     recall_user_id: default                  # 兼容旧配置键；语义同 hotword_pool_id
-    recall_custom_hotword_limit: 8           # 每次请求最多追加多少个临时 hotwords 到 prompt；不写入用户池
+    recall_custom_hotword_limit: 8           # 每次请求最多追加多少个临时 hotwords 到 prompt；不写入热词池
     enable_encoder_bypass: true
   itn:
     enable_asr_itn: true
@@ -109,7 +117,7 @@ defaults:
     asr_enrollment_max_sec: 8.0
     asr_enrollment_ttl_sec: 3600
     asr_enrollment_max_entries: 256       # 进程级 store 容量(非 per-endpoint)
-    enable_triton_enrollment_store: false # 关闭时保持本地注册音频缓存；灰度打开后由 Triton 保存 embedding tensor
+    enable_triton_enrollment_store: false # 关闭时保持本地注册音频缓存；灰度打开后转发管理服务保存 embedding tensor
     enable_enrollment_embedding_bypass: true
   transcribe:                             # 离线长音频转写 job (POST /api/asr/transcriptions)
                                           # 本组只放纯调参; 用哪个模型/是否融合在下方 rest.routes.transcribe
@@ -148,6 +156,7 @@ defaults:
 services:
   hotword: hotword_llm
   recall: triton_recall
+  recall_management: rag_asr_management
   text_cleanup: dashscope_cleanup
 
 # REST/HTTP 路由的上游绑定: upstreams 是所有 REST 接口的共享默认,

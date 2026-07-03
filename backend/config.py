@@ -138,7 +138,8 @@ class Config:
     fusion_primary_score_margin: float = 0.08
 
     # ---- ASR: Triton hotword recall + vLLM encoder bypass -----------------
-    # Hotword biasing uses a per-user Triton recall pool: each audio segment
+    # Hotword biasing uses a hotword_pool_id. The historical user_id wire/config
+    # names are accepted as compatibility aliases only. Each audio segment
     # retrieves a small top-K list from that pool, then appends a bounded number
     # of per-request hotwords before building the ASR prompt. Encoder bypass
     # additionally sends Triton's projector frames to vLLM as an
@@ -211,7 +212,8 @@ class Config:
     asr_enrollment_max_entries: int = 256
     # Compatibility-first rollout: when false, target-speaker enrollment keeps
     # using the legacy in-process WAV cache. When true, new enrollment uploads
-    # are forwarded to Triton, which persists only projector/embedding tensors.
+    # are forwarded to the configured RAG-ASR management path, which persists
+    # only embedding tensors and metadata.
     enable_triton_enrollment_store: bool = False
     enable_enrollment_embedding_bypass: bool = True
 

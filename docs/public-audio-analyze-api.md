@@ -16,11 +16,11 @@
 
 接口会按以下流程处理音频：
 
-1. 调用 ASR 模型识别音频文本，热词偏置来自当前 `user_id` 对应的 Triton 用户热词池召回，以及优先注入的少量表单 `hotwords` 临时热词；临时热词会覆盖精确重复或整词同音（忽略声调）的召回词。
+1. 调用 ASR 模型识别音频文本，热词偏置来自当前 `hotword_pool_id` 对应的 RAG-ASR 热词池召回，以及优先注入的少量表单 `hotwords` 临时热词；临时热词会覆盖精确重复或整词同音（忽略声调）的召回词。旧字段 `user_id` 继续作为兼容别名。
 2. 对 ASR 文本做清洗，只处理标点、空格、重复词和明显格式问题。
 3. 做情感理解，同时返回情感标签和情感描述。
 
-注意：`hotwords` 是临时请求热词，默认最多 8 个优先进入 ASR prompt，不写入用户池；它不会传给文本清洗阶段，因此不会发生“根据热词事后替换 ASR 文本”的行为。
+注意：`hotwords` 是临时请求热词，默认最多 8 个优先进入 ASR prompt，不写入热词池；它不会传给文本清洗阶段，因此不会发生“根据热词事后替换 ASR 文本”的行为。
 
 ## 请求参数
 
@@ -28,8 +28,9 @@
 |---|---|---|---|
 | `audio` | file | 是 | WAV 音频文件。当前接口要求 WAV 容器；m4a/mp3 请先转 WAV |
 | `language` | string | 否 | 语言代码，例如 `zh`、`en`。中文建议传 `zh` |
-| `user_id` | string | 否 | Triton 热词池隔离 ID，默认 `default` |
-| `hotwords` | string | 否 | 临时请求热词；去重限量后优先进入 ASR prompt，并覆盖精确重复或整词同音（忽略声调）的 Triton 召回热词，不写入用户池 |
+| `hotword_pool_id` | string | 否 | 推荐字段，热词池隔离 ID，默认 `default` |
+| `user_id` | string | 否 | 兼容字段，语义同 `hotword_pool_id` |
+| `hotwords` | string | 否 | 临时请求热词；去重限量后优先进入 ASR prompt，并覆盖精确重复或整词同音（忽略声调）的 RAG-ASR 召回热词，不写入热词池 |
 
 音频建议：
 
@@ -48,7 +49,7 @@
 curl -X POST "http://172.16.0.3:8080/api/audio/analyze" \
   -F "audio=@sample.wav" \
   -F "language=zh" \
-  -F "user_id=tenant-a" \
+  -F "hotword_pool_id=tenant-a" \
   -F "hotwords=挚音科技"
 ```
 

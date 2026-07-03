@@ -57,7 +57,7 @@ Client                                      Server
   "sample_rate_hz": 16000,
   "channels": 1,
   "language": "zh",
-  "user_id": "tenant-a",
+  "hotword_pool_id": "tenant-a",
   "hotwords": ["挚音科技", "张硕"],
   "enrollment_id": "ule8QilVjZql30Q9oy9kiQ",
   "config": {
@@ -73,21 +73,22 @@ Client                                      Server
 | `sample_rate_hz` | integer | 是 | 固定为 `16000` |
 | `channels` | integer | 是 | 固定为 `1` |
 | `language` | string | 否 | 语言代码；与 query 参数二选一即可 |
-| `user_id` | string | 否 | Triton 热词池隔离 ID，默认 `default`；只召回和管理该用户池 |
-| `hotwords` | string[] | 否 | 临时请求热词；final 段会把去重后的前 `recall_custom_hotword_limit` 个优先注入 prompt，并覆盖精确重复或整词同音（忽略声调）的 Triton 召回热词，不写入用户池 |
+| `hotword_pool_id` | string | 否 | 推荐字段，热词池隔离 ID，默认 `default`；只召回该热词池 |
+| `user_id` | string | 否 | 兼容字段，语义同 `hotword_pool_id`；两者同时传时优先使用 `hotword_pool_id` |
+| `hotwords` | string[] | 否 | 临时请求热词；final 段会把去重后的前 `recall_custom_hotword_limit` 个优先注入 prompt，并覆盖精确重复或整词同音（忽略声调）的 RAG-ASR 召回热词，不写入热词池 |
 | `enrollment_id` | string | 否 | 由 `POST /api/asr/enrollment` 返回的目标说话人 id；传 `null` 或省略表示普通 ASR |
 | `config` | object | 否 | 当前连接的服务端配置覆写，仅白名单字段生效（见“可覆写配置”） |
 
 ### update_hotwords
 
-兼容旧客户端的控制消息。`hotwords` 字段会被接收为后续 final 段的临时请求热词：服务端会把去重后的前 `recall_custom_hotword_limit` 个优先注入 prompt，并过滤当前 `user_id` 的 Triton 用户池中精确重复或整词同音（忽略声调）的召回词，但不会写入用户池。该消息仍可用于切换/清除目标说话人，也可用 `user_id` 切换热词池。
+兼容旧客户端的控制消息。`hotwords` 字段会被接收为后续 final 段的临时请求热词：服务端会把去重后的前 `recall_custom_hotword_limit` 个优先注入 prompt，并过滤当前热词池中精确重复或整词同音（忽略声调）的召回词，但不会写入热词池。该消息仍可用于切换/清除目标说话人，也可用 `hotword_pool_id` 或兼容字段 `user_id` 切换热词池。
 
 ```json
 {
   "type": "update_hotwords",
   "hotwords": ["产品名", "人名"],
   "src_lang": "zh",
-  "user_id": "tenant-a",
+  "hotword_pool_id": "tenant-a",
   "enrollment_id": "ule8QilVjZql30Q9oy9kiQ"
 }
 ```
@@ -95,9 +96,10 @@ Client                                      Server
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `type` | string | 是 | 固定为 `update_hotwords` |
-| `hotwords` | string[] | 是 | 临时请求热词；空数组表示清空后续 final 段的临时热词，不会改变 Triton 用户池 |
+| `hotwords` | string[] | 是 | 临时请求热词；空数组表示清空后续 final 段的临时热词，不会改变 RAG-ASR 热词池 |
 | `src_lang` | string | 否 | 语言代码或语言名称 |
-| `user_id` | string | 否 | 切换后续 final 段使用的 Triton 用户热词池；非法值会返回 `invalid_user_id` 错误并保持原用户 |
+| `hotword_pool_id` | string | 否 | 切换后续 final 段使用的热词池；非法值会返回 `invalid_user_id` 错误并保持原热词池 |
+| `user_id` | string | 否 | 兼容字段，语义同 `hotword_pool_id` |
 | `enrollment_id` | string \| null | 否 | 切换或清除目标说话人；缺省字段则保持原状，显式传 `null` 表示清除 |
 
 ### 二进制音频帧
@@ -263,7 +265,9 @@ python docs/examples/ws_transcribe.py sample.wav \
 |---|---|---|---|
 | `audio` | file | 是 | WAV 音频文件 |
 | `language` | string | 否 | 语言代码 |
-| `hotwords` | string | 否 | 临时请求热词；去重限量后优先进入 prompt，并覆盖精确重复或整词同音（忽略声调）的 Triton 召回热词，不写入用户池 |
+| `hotword_pool_id` | string | 否 | 推荐字段，热词池隔离 ID，默认 `default` |
+| `user_id` | string | 否 | 兼容字段，语义同 `hotword_pool_id` |
+| `hotwords` | string | 否 | 临时请求热词；去重限量后优先进入 prompt，并覆盖精确重复或整词同音（忽略声调）的 RAG-ASR 召回热词，不写入热词池 |
 | `enrollment_id` | string | 否 | 由 `POST /api/asr/enrollment` 返回的目标说话人 id；不传或失效时静默回退到普通 ASR |
 
 ### 响应
@@ -298,7 +302,7 @@ python docs/examples/rest_upload.py asr sample.wav \
 
 ## 目标说话人注册接口
 
-`POST /api/asr/enrollment` 上传一段 1-8 秒的目标说话人音频。服务端把音频规范化为 16 kHz mono WAV、写入进程内缓存，并返回不透明的 `enrollment_id`。后续 WebSocket `start` / `update_hotwords` 或 `/api/asr/upload` 携带该 id 时，主模型 prompt 自动切换为 TS-ASR 双音频形态（先 enrollment 后 target），具体文本位置由服务端 `prompt_template` 随模型选择。
+`POST /api/asr/enrollment` 上传一段 1-8 秒的目标说话人音频。默认配置下服务端把音频规范化为 16 kHz mono WAV、写入进程内缓存，并返回不透明的 `enrollment_id`；当 `enable_triton_enrollment_store=true` 且配置了 RAG-ASR 管理服务时，新注册音频会临时转发给 RAG-ASR 保存 embedding tensor 和元数据，本服务不再持久化注册人原始音频。后续 WebSocket `start` / `update_hotwords` 或 `/api/asr/upload` 携带该 id 时，主模型 prompt 自动切换为 TS-ASR 双音频形态（先 enrollment 后 target），具体文本位置由服务端 `prompt_template` 随模型选择。
 
 ### 请求
 
@@ -320,7 +324,7 @@ HTTP 200。
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `enrollment_id` | string | 后续请求复用的不透明 id；TTL 默认 3600 秒，每次成功 `get` 刷新过期时间 |
-| `duration_sec` | number | 服务端最终缓存的音频时长（裁剪后） |
+| `duration_sec` | number | 最终注册音频时长（裁剪后）；下沉链路中该时长来自 RAG-ASR 元数据 |
 
 ### 错误响应
 
@@ -354,7 +358,7 @@ HTTP 400，`detail` 为结构化对象：
 | asr_enrollment_min_sec | 1.0 | 最小时长，低于此值返回 too_short |
 | asr_enrollment_max_sec | 8.0 | 最大时长，超出尾截 |
 | asr_enrollment_ttl_sec | 3600 | 缓存 TTL；最近一次 get 后重新计时 |
-| asr_enrollment_max_entries | 256 | 进程内缓存条目上限，溢出按 LRU 淘汰 |
+| asr_enrollment_max_entries | 256 | 本地进程内缓存条目上限；下沉链路由 RAG-ASR enrollment cache/store 管理 |
 
 ### 与 fusion 的关系
 
@@ -387,7 +391,7 @@ print(r.json())
 
 ## ASR Prompt 模板
 
-后端按主模型 upstream 的 `prompt_template` 选择 prompt 结构。热词偏置来自当前 `user_id` 的 Triton 用户池召回 top-K 结果，以及优先进入 prompt 的少量请求临时 `hotwords`（默认最多 8 个，去重后不写入用户池）；与临时热词精确重复或整词同音（忽略声调）的召回词会被过滤。模板选择是服务端模型配置，不可客户端覆写。两套模板都支持普通 ASR、召回热词、TS-ASR、TS-ASR + 召回热词。
+后端按主模型 upstream 的 `prompt_template` 选择 prompt 结构。热词偏置来自当前 `hotword_pool_id` 的 RAG-ASR 热词池召回 top-K 结果（旧字段 `user_id` 兼容），以及优先进入 prompt 的少量请求临时 `hotwords`（默认最多 8 个，去重后不写入热词池）；与临时热词精确重复或整词同音（忽略声调）的召回词会被过滤。模板选择是服务端模型配置，不可客户端覆写。两套模板都支持普通 ASR、召回热词、TS-ASR、TS-ASR + 召回热词。
 
 ### `amphion_asr`（Amphion 4B）
 
