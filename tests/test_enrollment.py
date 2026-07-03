@@ -237,6 +237,35 @@ def test_amphion_asr_17b_task6_tsasr_hotwords():
     ]
 
 
+def test_amphion_asr_17b_tsasr_audio_embeds_order():
+    msgs = build_primary_messages(
+        "TARGET_B64",
+        hotwords=["北京"],
+        enrollment_audio_embeds_b64="ENROLL_EMBEDS_B64",
+        enrollment_audio_embeds_uuid="triton-enrollment-default-speaker",
+        audio_embeds_b64="TARGET_EMBEDS_B64",
+        audio_embeds_uuid="triton-audio-target",
+        template="amphion_asr_1.7b",
+    )
+
+    assert msgs[0] == {
+        "role": "system",
+        "content": "Given the speaker's voice in the first audio.\nHotwords: 北京",
+    }
+    assert msgs[1]["content"] == [
+        {
+            "type": "audio_embeds",
+            "audio_embeds": "ENROLL_EMBEDS_B64",
+            "uuid": "triton-enrollment-default-speaker",
+        },
+        {
+            "type": "audio_embeds",
+            "audio_embeds": "TARGET_EMBEDS_B64",
+            "uuid": "triton-audio-target",
+        },
+    ]
+
+
 def test_unknown_primary_prompt_template_raises():
     with pytest.raises(ValueError):
         build_primary_messages("TARGET_B64", template="does_not_exist")

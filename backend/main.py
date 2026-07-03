@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import logging
+import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -32,11 +33,20 @@ from .asr.recall import (
     add_hotwords as add_recall_hotwords,
 )
 from .asr.recall import (
+    delete_enrollment as delete_triton_enrollment,
+)
+from .asr.recall import (
     delete_hotwords as delete_recall_hotwords,
+)
+from .asr.recall import (
+    get_enrollment as get_triton_enrollment,
 )
 from .asr.recall import (
     list_hotword_pool,
     reload_hotword_pool,
+)
+from .asr.recall import (
+    upsert_enrollment as upsert_triton_enrollment,
 )
 from .asr.transcribe import float_pcm_to_i16_bytes
 from .audio.utils import wav_base64_to_pcm_16k_mono, wav_bytes_to_pcm_16k_mono
@@ -46,7 +56,7 @@ from .emotion.jobs import JobQueueFullError, get_emotion_job_store
 from .emotion.service import EmotionDecodeError, decode_wav_capped
 from .emotion_spec.jobs import get_emotion_spec_job_store
 from .http_client import close_client
-from .recall_user import RecallUserIdError, normalize_recall_user_id
+from .recall_user import HotwordPoolIdError, normalize_hotword_pool_id
 from .streaming import (
     AstV3Protocol,
     K2SegmentedStream,
@@ -375,6 +385,36 @@ def _resolve_enrollment_b64(enrollment_id: str | None) -> str | None:
     return entry.wav_base64 if entry is not None else None
 
 
+def _enrollment_store_owner_id(cfg) -> str:
+    return normalize_hotword_pool_id(None, default=cfg.hotword_pool_id)
+
+
+async def _resolve_enrollment_for_request(
+    cfg,
+    enrollment_id: str | None,
+) -> tuple[str | None, str | None]:
+    """Return ``(legacy_b64, triton_id)`` for the configured enrollment store."""
+    if not enrollment_id:
+        return None, None
+    if not cfg.enable_triton_enrollment_store:
+        return _resolve_enrollment_b64(enrollment_id), None
+    ident = str(enrollment_id or "").strip()
+    if not ident:
+        return None, None
+    try:
+        summary = await get_triton_enrollment(
+            enrollment_id=ident,
+            enrollment_user_id=_enrollment_store_owner_id(cfg),
+        )
+    except Exception as exc:
+        logger.warning("Triton enrollment lookup failed; falling back to plain ASR: %s", exc)
+        return None, None
+    if str(summary.get("status", "")).lower() == "ok":
+        return None, ident
+    logger.warning("Triton enrollment id %s not found / expired", ident)
+    return None, None
+
+
 async def _run_dual_asr_upload(
     wav_b64: str,
     *,
@@ -383,6 +423,9 @@ async def _run_dual_asr_upload(
     language: str,
     audio_pcm: np.ndarray,
     enrollment_b64: str | None = None,
+    enrollment_id: str | None = None,
+    enrollment_user_id: str | None = None,
+    hotword_pool_id: str | None = None,
     recall_user_id: str | None = None,
 ) -> dict:
     """Route-facing wrapper over :func:`run_oneshot_asr`.
@@ -398,7 +441,9 @@ async def _run_dual_asr_upload(
             language=language,
             audio_pcm=audio_pcm,
             enrollment_b64=enrollment_b64,
-            recall_user_id=recall_user_id,
+            enrollment_id=enrollment_id,
+            enrollment_user_id=enrollment_user_id,
+            hotword_pool_id=hotword_pool_id if hotword_pool_id is not None else recall_user_id,
         )
     except OneshotAsrError as exc:
         raise HTTPException(status_code=502, detail=exc.to_detail()) from exc
@@ -430,6 +475,30 @@ async def asr_enrollment_create(audio: UploadFile = File(...)):
             detail={"code": exc.code, "message": str(exc)},
         ) from exc
 
+    if cfg.enable_triton_enrollment_store:
+        enrollment_id = secrets.token_urlsafe(16)
+        pcm = wav_base64_to_pcm_16k_mono(canonical_b64)
+        try:
+            await upsert_triton_enrollment(
+                pcm,
+                enrollment_id=enrollment_id,
+                enrollment_user_id=_enrollment_store_owner_id(cfg),
+                sample_rate=SAMPLE_RATE,
+            )
+        except Exception as exc:
+            logger.exception("Triton enrollment upsert failed")
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "triton_enrollment_failed",
+                    "message": str(exc),
+                },
+            ) from exc
+        return {
+            "enrollment_id": enrollment_id,
+            "duration_sec": round(duration_sec, 3),
+        }
+
     store = get_enrollment_store()
     store.configure(
         ttl_sec=cfg.asr_enrollment_ttl_sec,
@@ -449,7 +518,17 @@ async def asr_enrollment_delete(enrollment_id: str):
     Returning 204 on missing ids keeps the frontend's "clear" button
     idempotent — repeated clears never error out.
     """
-    get_enrollment_store().delete(enrollment_id)
+    cfg = load_config()
+    if cfg.enable_triton_enrollment_store:
+        try:
+            await delete_triton_enrollment(
+                enrollment_id=enrollment_id,
+                enrollment_user_id=_enrollment_store_owner_id(cfg),
+            )
+        except Exception:
+            logger.warning("Triton enrollment delete failed", exc_info=True)
+    else:
+        get_enrollment_store().delete(enrollment_id)
     return JSONResponse(status_code=204, content=None)
 
 
@@ -475,10 +554,13 @@ def _hotword_pool_payload(body: dict) -> list[str]:
     return words
 
 
-def _resolve_recall_user_id(raw_user_id: object | None, cfg) -> str:
+def _resolve_hotword_pool_id(raw_hotword_pool_id: object | None, cfg) -> str:
     try:
-        return normalize_recall_user_id(raw_user_id, default=cfg.recall_user_id)
-    except RecallUserIdError as exc:
+        return normalize_hotword_pool_id(
+            raw_hotword_pool_id,
+            default=cfg.hotword_pool_id,
+        )
+    except HotwordPoolIdError as exc:
         raise HTTPException(
             status_code=400,
             detail={
@@ -486,6 +568,18 @@ def _resolve_recall_user_id(raw_user_id: object | None, cfg) -> str:
                 "message": str(exc),
             },
         ) from exc
+
+
+def _resolve_recall_user_id(raw_user_id: object | None, cfg) -> str:
+    return _resolve_hotword_pool_id(raw_user_id, cfg)
+
+
+def _route_id_value(value: object) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _route_hotword_pool_id(hotword_pool_id: object, user_id: object) -> str:
+    return _route_id_value(hotword_pool_id) or _route_id_value(user_id)
 
 
 def _recall_error(exc: Exception) -> HTTPException:
@@ -504,16 +598,20 @@ async def asr_hotword_pool_list(
     query: str = "",
     limit: int = 50,
     offset: int = 0,
+    hotword_pool_id: str = "",
     user_id: str = "",
 ):
     cfg = load_config()
-    resolved_user_id = _resolve_recall_user_id(user_id, cfg)
+    resolved_hotword_pool_id = _resolve_hotword_pool_id(
+        _route_hotword_pool_id(hotword_pool_id, user_id),
+        cfg,
+    )
     try:
         return await list_hotword_pool(
             query=query or None,
             limit=max(0, min(int(limit), 1000)),
             offset=max(0, int(offset)),
-            user_id=resolved_user_id,
+            hotword_pool_id=resolved_hotword_pool_id,
         )
     except Exception as exc:  # noqa: BLE001 - route maps upstream failures
         raise _recall_error(exc) from exc
@@ -522,11 +620,14 @@ async def asr_hotword_pool_list(
 @app.post("/api/asr/hotword-pool")
 async def asr_hotword_pool_add(body: dict = Body(...)):
     cfg = load_config()
-    resolved_user_id = _resolve_recall_user_id(body.get("user_id"), cfg)
+    resolved_hotword_pool_id = _resolve_hotword_pool_id(
+        body.get("hotword_pool_id", body.get("user_id")),
+        cfg,
+    )
     try:
         return await add_recall_hotwords(
             _hotword_pool_payload(body),
-            user_id=resolved_user_id,
+            hotword_pool_id=resolved_hotword_pool_id,
         )
     except HTTPException:
         raise
@@ -537,11 +638,14 @@ async def asr_hotword_pool_add(body: dict = Body(...)):
 @app.delete("/api/asr/hotword-pool")
 async def asr_hotword_pool_delete(body: dict = Body(...)):
     cfg = load_config()
-    resolved_user_id = _resolve_recall_user_id(body.get("user_id"), cfg)
+    resolved_hotword_pool_id = _resolve_hotword_pool_id(
+        body.get("hotword_pool_id", body.get("user_id")),
+        cfg,
+    )
     try:
         return await delete_recall_hotwords(
             _hotword_pool_payload(body),
-            user_id=resolved_user_id,
+            hotword_pool_id=resolved_hotword_pool_id,
         )
     except HTTPException:
         raise
@@ -550,11 +654,14 @@ async def asr_hotword_pool_delete(body: dict = Body(...)):
 
 
 @app.post("/api/asr/hotword-pool/reload")
-async def asr_hotword_pool_reload(user_id: str = ""):
+async def asr_hotword_pool_reload(hotword_pool_id: str = "", user_id: str = ""):
     cfg = load_config()
-    resolved_user_id = _resolve_recall_user_id(user_id, cfg)
+    resolved_hotword_pool_id = _resolve_hotword_pool_id(
+        _route_hotword_pool_id(hotword_pool_id, user_id),
+        cfg,
+    )
     try:
-        return await reload_hotword_pool(user_id=resolved_user_id)
+        return await reload_hotword_pool(hotword_pool_id=resolved_hotword_pool_id)
     except Exception as exc:  # noqa: BLE001
         raise _recall_error(exc) from exc
 
@@ -565,6 +672,7 @@ async def asr_upload(
     language: str = Form(""),
     hotwords: str = Form(""),
     enrollment_id: str = Form(""),
+    hotword_pool_id: str = Form(""),
     user_id: str = Form(""),
 ):
     """One-shot ASR over an uploaded clip.
@@ -582,9 +690,15 @@ async def asr_upload(
     wav_bytes, audio_pcm, duration_sec = _wav_to_pcm_capped(raw, _ASR_MAX_SECONDS)
     wav_b64 = base64.b64encode(wav_bytes).decode("ascii")
     cfg = load_config()
-    recall_user_id = _resolve_recall_user_id(user_id, cfg)
+    resolved_hotword_pool_id = _resolve_hotword_pool_id(
+        _route_hotword_pool_id(hotword_pool_id, user_id),
+        cfg,
+    )
     hw_list = _parse_csv(hotwords)
-    enrollment_b64 = _resolve_enrollment_b64(enrollment_id)
+    enrollment_b64, triton_enrollment_id = await _resolve_enrollment_for_request(
+        cfg,
+        enrollment_id,
+    )
     asr_result = await _run_dual_asr_upload(
         wav_b64,
         cfg=cfg,
@@ -592,7 +706,11 @@ async def asr_upload(
         language=language,
         audio_pcm=audio_pcm,
         enrollment_b64=enrollment_b64,
-        recall_user_id=recall_user_id,
+        enrollment_id=triton_enrollment_id,
+        enrollment_user_id=_enrollment_store_owner_id(cfg)
+        if triton_enrollment_id
+        else None,
+        hotword_pool_id=resolved_hotword_pool_id,
     )
 
     return {
@@ -600,7 +718,8 @@ async def asr_upload(
         "text": asr_result["text"],
         "language": asr_result["language"],
         "duration_sec": round(duration_sec, 3),
-        "enrollment_used": enrollment_b64 is not None,
+        "effective_hotwords": list(asr_result.get("effective_hotwords") or []),
+        "enrollment_used": enrollment_b64 is not None or triton_enrollment_id is not None,
     }
 
 
@@ -609,6 +728,7 @@ async def asr_transcription_create(
     audio: UploadFile = File(...),
     language: str = Form(""),
     hotwords: str = Form(""),
+    hotword_pool_id: str = Form(""),
     user_id: str = Form(""),
 ):
     """Enqueue offline transcription of a long recording (meeting minutes).
@@ -631,7 +751,10 @@ async def asr_transcription_create(
     # Transcription-specific view: rest.routes.transcribe bindings (model
     # choice, fusion switch) layered over the shared REST defaults.
     cfg = load_transcribe_config()
-    recall_user_id = _resolve_recall_user_id(user_id, cfg)
+    resolved_hotword_pool_id = _resolve_hotword_pool_id(
+        _route_hotword_pool_id(hotword_pool_id, user_id),
+        cfg,
+    )
     raw = await _read_audio_bytes(audio, max_bytes=cfg.transcribe_max_upload_bytes)
     try:
         pcm = wav_bytes_to_pcm_16k_mono(raw)
@@ -665,7 +788,7 @@ async def asr_transcription_create(
             duration_sec=duration_sec,
             language=language,
             hotwords=_parse_csv(hotwords),
-            recall_user_id=recall_user_id,
+            recall_user_id=resolved_hotword_pool_id,
             cfg=cfg,
         )
     except JobQueueFullError as exc:
@@ -813,14 +936,21 @@ async def audio_analyze(
     hotwords: str = Form(""),
     emotion_mode: str = Form("both"),
     enrollment_id: str = Form(""),
+    hotword_pool_id: str = Form(""),
     user_id: str = Form(""),
 ):
     """One-shot audio analysis: ASR raw output + cleaned text + emotion."""
     raw = await _read_audio_bytes(audio)
     cfg = load_config()
-    recall_user_id = _resolve_recall_user_id(user_id, cfg)
+    resolved_hotword_pool_id = _resolve_hotword_pool_id(
+        _route_hotword_pool_id(hotword_pool_id, user_id),
+        cfg,
+    )
     hw_list = _parse_csv(hotwords)
-    enrollment_b64 = _resolve_enrollment_b64(enrollment_id)
+    enrollment_b64, triton_enrollment_id = await _resolve_enrollment_for_request(
+        cfg,
+        enrollment_id,
+    )
 
     asr_wav_bytes, asr_pcm, duration_sec = _wav_to_pcm_capped(raw, _ASR_MAX_SECONDS)
     asr_wav_b64 = base64.b64encode(asr_wav_bytes).decode("ascii")
@@ -837,7 +967,11 @@ async def audio_analyze(
             language=language,
             audio_pcm=asr_pcm,
             enrollment_b64=enrollment_b64,
-            recall_user_id=recall_user_id,
+            enrollment_id=triton_enrollment_id,
+            enrollment_user_id=_enrollment_store_owner_id(cfg)
+            if triton_enrollment_id
+            else None,
+            hotword_pool_id=resolved_hotword_pool_id,
         )
     )
     emotion_ser_task = asyncio.create_task(

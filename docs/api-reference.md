@@ -26,7 +26,7 @@
 | `/tuling/ast/v3` | 通用流式 ASR（讯飞图灵 AST v3 协议） | 对接讯飞 tuling-ast-sdk 或按 AST v3 信封集成 | `payload.result` 词图（msgtype sentence / Progressive） |
 | `/astv3-test-proxy` | AST v3 同源代理（测试用） | 仅供 HTTPS 前端规避 mixed content，透明转发到写死的远程 AST v3 后端 | 同 `/tuling/ast/v3`（透明转发） |
 
-`/transcribe-streaming` 的 `final` / `final_asr` 消息除文本外会带当前语音分段的 `audio_b64`（WAV base64）和 `duration_sec`，主前端用它做分段音频回放。k2 模式下该音频是同一段送入 LLM ASR 的 k2 段缓冲，不再经过本地 VAD 段首/段尾二次裁剪；完整字段见 [实时转写 WebSocket 协议](transcribe-streaming-protocol.md)。服务端开启 `debug_dump_enabled`（`defaults.debug`，运维级、不在客户端覆写白名单）后，`ready` 带 `session_id`/`dump_dir`、`final` 带 `dump_id`，并把每段音频+元信息落盘到 `<dump_dir>/<session_id>/<seg_id>.{wav,json}`，前端在气泡上显示可复制的 `dump_id`，用于回放/最终结果对账，详见协议文档“调试落盘”小节。
+`/transcribe-streaming` 的 `final` / `final_asr` 消息除文本外会带当前语音分段的 `audio_b64`（WAV base64）、`duration_sec` 和 `effective_hotwords`（本段音频经 RAG-ASR/Triton 实际召回的热词列表，不含临时请求热词），主前端用音频字段做分段回放、可用 `effective_hotwords` 展示本段召回命中。k2 模式下该音频是同一段送入 LLM ASR 的 k2 段缓冲，不再经过本地 VAD 段首/段尾二次裁剪；完整字段见 [实时转写 WebSocket 协议](transcribe-streaming-protocol.md)。服务端开启 `debug_dump_enabled`（`defaults.debug`，运维级、不在客户端覆写白名单）后，`ready` 带 `session_id`/`dump_dir`、`final` 带 `dump_id`，并把每段音频+元信息落盘到 `<dump_dir>/<session_id>/<seg_id>.{wav,json}`，前端在气泡上显示可复制的 `dump_id`，用于回放/最终结果对账，详见协议文档“调试落盘”小节。
 
 `/tuling/ast/v3` 与上面两个任务接口的线上协议不同：音频以 base64 放在 JSON 帧，`header.status`（0/1/2）驱动状态机，无 `ready`/`start`/`stop`，结果为词图结构。模型组合上也不同：本端点恒为 primary-only（强制关闭副模型/本地 Qwen/融合，客户端无法经 `parameter.asr_config` 重开），主模型由 `astv3_vllm_*` 指定（当前留空，回退全局 primary `vllm_base_url`），而 `/transcribe-streaming` 仍按 `config.yaml` 走双模型。它兼容旧热词字段（`payload.text.text`，作为临时请求热词限量优先注入 prompt，并覆盖精确重复或整词同音的召回词）、用户热词池隔离（首帧 `parameter.asr_config.user_id`，默认 `default`）、目标说话人（先经 `POST /api/asr/enrollment` 注册，再把 id 放进首帧 `header.resIdList[0]`）与配置覆写（首帧 `parameter.asr_config`，等价于其他端点的 `start.config`）。它不遵循下文“WebSocket 调用流程”，详见 [实时转写 AST v3 WebSocket](tuling-ast-v3-protocol.md)。
 
@@ -200,11 +200,12 @@ python docs/examples/rest_upload.py asr sample.wav \
   "text": "你好，欢迎使用语音识别服务。",
   "language": "zh",
   "duration_sec": 3.42,
+  "effective_hotwords": ["挚音科技", "张硕"],
   "enrollment_used": false
 }
 ```
 
-`text`（流式 `final` 与上传响应一致）默认已做逆文本规范化（ITN，仅中文）与车牌规范化：`六五四三八`→`65438`、`辽b二四五零七`→`辽B24507`；`partial`/中间结果保持口语形式。省份简称被声学误识别成字母（`冀`→`J`）属识别错误，后处理只修数字/字母、不还原省份字。开关 `enable_asr_itn`、`asr_itn_enable_0_to_9`、`enable_asr_plate_normalize` 为服务端 `config.yaml` 配置（`defaults.itn` 分组），不在客户端覆写白名单内；详见各协议文档的“文本规范化”小节。
+`effective_hotwords` 是该音频经 RAG-ASR/Triton 实际召回的热词列表，不包含本次请求临时传入的 `hotwords` 追加部分；召回关闭、失败或无结果时为空数组。`text`（流式 `final` 与上传响应一致）默认已做逆文本规范化（ITN，仅中文）与车牌规范化：`六五四三八`→`65438`、`辽b二四五零七`→`辽B24507`；`partial`/中间结果保持口语形式。省份简称被声学误识别成字母（`冀`→`J`）属识别错误，后处理只修数字/字母、不还原省份字。开关 `enable_asr_itn`、`asr_itn_enable_0_to_9`、`enable_asr_plate_normalize` 为服务端 `config.yaml` 配置（`defaults.itn` 分组），不在客户端覆写白名单内；详见各协议文档的“文本规范化”小节。
 
 如需让模型只转写指定说话人的话，先用 `POST /api/asr/enrollment` 上传 1-8 秒目标人语音、拿到 `enrollment_id`，再把它作为表单字段附加到 `/api/asr/upload`，响应里的 `enrollment_used` 会变为 `true`。注册字段、错误码与生命周期见下文“目标说话人注册”。
 

@@ -9,7 +9,7 @@ from typing import Any
 
 import yaml
 
-from .recall_user import DEFAULT_RECALL_USER_ID, normalize_recall_user_id
+from .recall_user import DEFAULT_HOTWORD_POOL_ID, normalize_hotword_pool_id
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +147,8 @@ class Config:
     # different prompt template is used.
     enable_hotword_recall: bool = True
     recall_top_k: int = 50
-    recall_user_id: str = DEFAULT_RECALL_USER_ID
+    hotword_pool_id: str = DEFAULT_HOTWORD_POOL_ID
+    recall_user_id: str = DEFAULT_HOTWORD_POOL_ID
     recall_custom_hotword_limit: int = 8
     enable_encoder_bypass: bool = True
 
@@ -208,6 +209,11 @@ class Config:
     asr_enrollment_max_sec: float = 8.0
     asr_enrollment_ttl_sec: float = 3600.0
     asr_enrollment_max_entries: int = 256
+    # Compatibility-first rollout: when false, target-speaker enrollment keeps
+    # using the legacy in-process WAV cache. When true, new enrollment uploads
+    # are forwarded to Triton, which persists only projector/embedding tensors.
+    enable_triton_enrollment_store: bool = False
+    enable_enrollment_embedding_bypass: bool = True
 
     # ---- ASR: VAD segmentation -------------------------------------------
     # These VAD defaults mirror config.yaml's vad block. They are pure
@@ -371,11 +377,19 @@ class Config:
             object.__setattr__(self, "recall_top_k", 0)
         if self.recall_custom_hotword_limit < 0:
             object.__setattr__(self, "recall_custom_hotword_limit", 0)
-        object.__setattr__(
-            self,
-            "recall_user_id",
-            normalize_recall_user_id(self.recall_user_id),
+        raw_hotword_pool_id = str(self.hotword_pool_id or "").strip()
+        raw_recall_user_id = str(self.recall_user_id or "").strip()
+        # ``recall_user_id`` is the historical config key. Prefer the clearer
+        # ``hotword_pool_id`` when present, otherwise keep old configs working.
+        pool_source = (
+            raw_recall_user_id
+            if raw_hotword_pool_id in {"", DEFAULT_HOTWORD_POOL_ID}
+            and raw_recall_user_id
+            else raw_hotword_pool_id
         )
+        resolved_hotword_pool_id = normalize_hotword_pool_id(pool_source)
+        object.__setattr__(self, "hotword_pool_id", resolved_hotword_pool_id)
+        object.__setattr__(self, "recall_user_id", resolved_hotword_pool_id)
         # 首个 partial 门槛若严于 final 段最小时长,partial 就会永远比 final 晚、失去
         # "中间结果"意义;夹到 <= min_segment_duration_ms。和 fusion 不变量一样下沉
         # 到 dataclass,确保 load/override/直接构造(测试)各路径都一致。

@@ -6,7 +6,12 @@ import asyncio
 import logging
 import time
 
-from ..asr.client import query_audio_model, query_audio_model_secondary
+from ..asr.client import (
+    diagnostic_hotword_misses,
+    hotword_hits_in_text,
+    query_audio_model,
+    query_audio_model_secondary,
+)
 from ..asr.fusion import choose_fused_result
 from ..asr.itn import normalize_final_text
 from ..audio.utils import pcm_to_wav_base64
@@ -72,7 +77,11 @@ class AsrTaskEngine(BaseTaskEngine):
                     prompt_template=cfg.vllm_prompt_template,
                     timeout=cfg.asr_request_timeout,
                     runtime_config=cfg,
-                    recall_user_id=ctx.recall_user_id,
+                    hotword_pool_id=ctx.hotword_pool_id,
+                    enrollment_id=ctx.enrollment_id,
+                    enrollment_user_id=cfg.hotword_pool_id,
+                    session_id=ctx.session_id,
+                    gateway_trace_id=ctx.gateway_trace_id,
                 ),
                 timeout=cfg.primary_asr_timeout,
             )
@@ -98,6 +107,14 @@ class AsrTaskEngine(BaseTaskEngine):
         # stay spoken-form (see handle_partial).
         if text:
             text = normalize_final_text(text, detected_lang, cfg)
+        effective_hotwords = self._effective_hotwords_for_final(
+            primary_result,
+            hw_snapshot,
+        )
+        returned_effective_hotwords = self._rag_recalled_hotwords_for_final(
+            primary_result
+        )
+        hotword_hits = hotword_hits_in_text(effective_hotwords, text)
 
         elapsed = time.monotonic() - t0
         rtf = elapsed / audio_duration if audio_duration > 0 else 0.0
@@ -105,6 +122,27 @@ class AsrTaskEngine(BaseTaskEngine):
             "Final ASR: audio=%.2fs infer=%.3fs RTF=%.3f text=%r",
             audio_duration, elapsed, rtf, text[:80],
         )
+        logger.info(
+            "Final ASR diagnostic: session_id=%s gateway_trace_id=%s "
+            "segment_id=%s final_text=%r effective_hotwords_count=%d "
+            "effective_hotword_hits=%s",
+            ctx.session_id or "n/a",
+            ctx.gateway_trace_id or "n/a",
+            seg.id or "n/a",
+            text,
+            len(effective_hotwords),
+            hotword_hits,
+        )
+        hotword_miss = diagnostic_hotword_misses(effective_hotwords, text)
+        if hotword_miss:
+            logger.warning(
+                "Final ASR hotword miss: session_id=%s gateway_trace_id=%s "
+                "segment_id=%s hotword_miss=%s",
+                ctx.session_id or "n/a",
+                ctx.gateway_trace_id or "n/a",
+                seg.id or "n/a",
+                hotword_miss,
+            )
 
         # Dump before the empty-text early return: a segment that produced
         # audio but no text ("audio came in, nothing recognized") is exactly a
@@ -138,6 +176,7 @@ class AsrTaskEngine(BaseTaskEngine):
             "language": detected_lang,
             "audio_b64": wav_b64,
             "duration_sec": audio_duration,
+            "effective_hotwords": returned_effective_hotwords,
         }
         if dump_id:
             payload["dump_id"] = dump_id
@@ -191,7 +230,7 @@ class AsrTaskEngine(BaseTaskEngine):
                     prompt_template=cfg.vllm_prompt_template,
                     timeout=cfg.asr_request_timeout,
                     runtime_config=cfg,
-                    recall_user_id=ctx.recall_user_id,
+                    hotword_pool_id=ctx.hotword_pool_id,
                 ),
                 timeout=cfg.primary_asr_timeout,
             )
@@ -271,6 +310,7 @@ class AsrTaskEngine(BaseTaskEngine):
                     "type": "final",
                     "text": "",
                     "language": ctx.language,
+                    "effective_hotwords": [],
                 }
             )
 
@@ -335,7 +375,7 @@ class AsrTaskEngine(BaseTaskEngine):
                 "secondary_raw": self._result_raw(secondary_result),
                 "reported_hotwords": reported,
                 "hotwords_snapshot": list(hw_snapshot or []),
-                "recall_user_id": ctx.recall_user_id,
+                "hotword_pool_id": ctx.hotword_pool_id,
             },
             "model": {
                 "vllm_base_url": cfg.vllm_base_url,
@@ -389,7 +429,11 @@ class AsrTaskEngine(BaseTaskEngine):
                         prompt_template=cfg.vllm_prompt_template,
                         timeout=cfg.asr_request_timeout,
                         runtime_config=cfg,
-                        recall_user_id=ctx.recall_user_id,
+                        hotword_pool_id=ctx.hotword_pool_id,
+                        enrollment_id=ctx.enrollment_id,
+                        enrollment_user_id=cfg.hotword_pool_id,
+                        session_id=ctx.session_id,
+                        gateway_trace_id=ctx.gateway_trace_id,
                     ),
                     timeout=cfg.primary_asr_timeout,
                 )
@@ -469,3 +513,17 @@ class AsrTaskEngine(BaseTaskEngine):
             if reported:
                 return [str(word) for word in reported]
         return fallback
+
+    @staticmethod
+    def _effective_hotwords_for_final(primary_result, fallback: list[str]) -> list[str]:
+        if isinstance(primary_result, dict):
+            reported = primary_result.get("reported_hotwords") or []
+            if reported:
+                return [str(word) for word in reported]
+        return list(fallback or [])
+
+    @staticmethod
+    def _rag_recalled_hotwords_for_final(primary_result) -> list[str]:
+        if isinstance(primary_result, dict):
+            return [str(word) for word in primary_result.get("effective_hotwords") or []]
+        return []

@@ -250,6 +250,8 @@ class AstV3Protocol:
                     engine_params,
                 )
             start_ctrl: dict = {"type": "start"}
+            if self.trace_id:
+                start_ctrl["gateway_trace_id"] = self.trace_id
             hotwords = _parse_hotword_text(self._payload_text(payload))
             if hotwords:
                 start_ctrl["hotwords"] = hotwords
@@ -264,11 +266,11 @@ class AstV3Protocol:
             # (distinct from the log-only iFlytek engine block). language is not
             # a Config field so it rides start.language; the rest becomes
             # start.config and is whitelist-filtered downstream in the session.
-            language, user_id, cfg_overrides = self._extract_asr_config(parameter)
+            language, hotword_pool_id, cfg_overrides = self._extract_asr_config(parameter)
             if language:
                 start_ctrl["language"] = language
-            if user_id:
-                start_ctrl["user_id"] = user_id
+            if hotword_pool_id:
+                start_ctrl["hotword_pool_id"] = hotword_pool_id
             if cfg_overrides:
                 start_ctrl["config"] = cfg_overrides
             actions.append(ControlAction(start_ctrl))
@@ -304,14 +306,15 @@ class AstV3Protocol:
 
     @staticmethod
     def _extract_asr_config(parameter: dict) -> tuple[str, str, dict]:
-        """Split ``parameter.asr_config`` into language, user id, and overrides.
+        """Split ``parameter.asr_config`` into language, pool id, and overrides.
 
         ``asr_config`` is this service's extension slot for per-connection
         tuning; the iFlytek ``parameter.engine`` block stays log-only. The
         ``language`` key is pulled out because it is not a ``Config`` field (the
-        session maps it separately via ``start.language``), and ``user_id`` is
-        pulled out as the Triton hotword-pool isolation key. Every other key is
-        forwarded verbatim as ``start.config`` and is whitelist-filtered by
+        session maps it separately via ``start.language``), and
+        ``hotword_pool_id`` is pulled out as the Triton hotword-pool isolation
+        key. The historical ``user_id`` key remains an alias. Every other key
+        is forwarded verbatim as ``start.config`` and is whitelist-filtered by
         ``Config.override_client`` downstream, so no validation happens here.
         Returns empty values when the slot is absent or not a dict.
         """
@@ -320,8 +323,12 @@ class AstV3Protocol:
             return "", "", {}
         overrides = dict(cfg)
         language = str(overrides.pop("language", "") or "").strip()
-        user_id = str(overrides.pop("user_id", "") or "").strip()
-        return language, user_id, overrides
+        hotword_pool_id = str(overrides.pop("hotword_pool_id", "") or "").strip()
+        if not hotword_pool_id:
+            hotword_pool_id = str(overrides.pop("user_id", "") or "").strip()
+        else:
+            overrides.pop("user_id", None)
+        return language, hotword_pool_id, overrides
 
     def _decode_audio(self, payload: dict) -> bytes:
         audio_obj = payload.get("audio")

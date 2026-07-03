@@ -44,7 +44,7 @@ async def test_audio_analyze_returns_asr_cleanup_and_emotion(monkeypatch):
 
     async def fake_asr(*args, **kwargs):
         assert kwargs["hotwords"] == ["挚音科技", "张硕"]
-        assert kwargs["recall_user_id"] == "tenant-a"
+        assert kwargs["hotword_pool_id"] == "tenant-a"
         return {
             "transcription": "挚音科技 今天 发布 新 功能",
             "reported_hotwords": ["挚音科技"],
@@ -109,15 +109,16 @@ async def test_audio_analyze_returns_asr_cleanup_and_emotion(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_asr_upload_passes_recall_user_id(monkeypatch):
+async def test_asr_upload_passes_hotword_pool_id(monkeypatch):
     cfg = Config(enable_primary_asr=True, enable_secondary_asr=False)
     monkeypatch.setattr(main_mod, "load_config", lambda: cfg)
 
     async def fake_asr(*args, **kwargs):
-        assert kwargs["recall_user_id"] == "tenant-a"
+        assert kwargs["hotword_pool_id"] == "tenant-a"
         return {
             "transcription": "上传结果",
             "reported_hotwords": [],
+            "effective_hotwords": ["召回上传"],
             "raw_text": "上传结果",
             "detected_language": "zh",
         }
@@ -134,6 +135,7 @@ async def test_asr_upload_passes_recall_user_id(monkeypatch):
 
     assert result["type"] == "final"
     assert result["text"] == "上传结果"
+    assert result["effective_hotwords"] == ["召回上传"]
 
 
 @pytest.mark.asyncio

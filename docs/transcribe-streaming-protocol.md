@@ -165,6 +165,7 @@ Client                                      Server
   "id": "seg-001",
   "text": "你好，欢迎使用语音识别服务。",
   "language": "zh",
+  "effective_hotwords": ["挚音科技", "张硕"],
   "duration_sec": 3.42,
   "audio_b64": "UklGR...",
   "dump_id": "260629-150812-3f9a/seg-001"
@@ -177,6 +178,7 @@ Client                                      Server
 | `id` | string | 语音段 ID；可能不存在 |
 | `text` | string | 最终转写文本，默认已做逆文本规范化（ITN）与车牌规范化，见下方说明 |
 | `language` | string | 检测或传入的语言 |
+| `effective_hotwords` | string[] | 本段音频经 RAG-ASR/Triton 热词召回得到的热词列表；不包含 `start.hotwords` / `update_hotwords` 里的临时请求热词。召回关闭、失败或无召回结果时为空数组 |
 | `duration_sec` | number | 本次推理使用的音频时长；部分流式消息可能不带 |
 | `audio_b64` | string | 当前分段音频的 WAV base64，用于前端回放；为空 final 不带。k2 模式下它与送入 LLM ASR 的音频同源，来自 k2 endpoint 对应的本地缓冲，不再经过本地 VAD 段首/段尾二次裁剪 |
 | `dump_id` | string | 仅 `debug_dump_enabled=true` 且本段有 final 文本时出现；值为 `<session_id>/<seg_id>`，同时是落盘文件相对路径 stem（`<dump_dir>/../<dump_id>.wav` 与 `.json`） |

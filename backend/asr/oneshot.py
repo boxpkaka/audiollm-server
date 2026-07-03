@@ -66,6 +66,9 @@ async def run_oneshot_asr(
     language: str,
     audio_pcm: np.ndarray | None = None,
     enrollment_b64: str | None = None,
+    enrollment_id: str | None = None,
+    enrollment_user_id: str | None = None,
+    hotword_pool_id: str | None = None,
     recall_user_id: str | None = None,
 ) -> dict:
     """Transcribe one clip with the configured primary/secondary models.
@@ -91,7 +94,11 @@ async def run_oneshot_asr(
                     prompt_template=cfg.vllm_prompt_template,
                     timeout=cfg.asr_request_timeout,
                     runtime_config=cfg,
-                    recall_user_id=recall_user_id,
+                    hotword_pool_id=hotword_pool_id
+                    if hotword_pool_id is not None
+                    else recall_user_id,
+                    enrollment_id=enrollment_id,
+                    enrollment_user_id=enrollment_user_id,
                 ),
                 timeout=cfg.primary_asr_timeout,
             )
@@ -176,6 +183,7 @@ async def run_oneshot_asr(
         "text": text,
         "language": detected_lang,
         "raw_text": raw_text,
+        "effective_hotwords": _rag_recalled_hotwords(primary_result),
         "primary": model_result_payload(primary_res),
         "secondary": model_result_payload(secondary_res),
         "fusion": fusion_payload,
@@ -188,3 +196,9 @@ def _fusion_hotwords(primary_result, fallback: list[str]) -> list[str]:
         if reported:
             return [str(word) for word in reported]
     return fallback
+
+
+def _rag_recalled_hotwords(primary_result) -> list[str]:
+    if isinstance(primary_result, dict):
+        return [str(word) for word in primary_result.get("effective_hotwords") or []]
+    return []

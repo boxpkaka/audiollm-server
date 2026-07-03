@@ -95,7 +95,8 @@ defaults:
   recall:
     enable_hotword_recall: true
     recall_top_k: 50
-    recall_user_id: default                  # 未显式传 user_id 时使用的热词池用户
+    hotword_pool_id: default                 # 未显式传 hotword_pool_id/user_id 时使用的热词池 ID
+    recall_user_id: default                  # 兼容旧配置键；语义同 hotword_pool_id
     recall_custom_hotword_limit: 8           # 每次请求最多追加多少个临时 hotwords 到 prompt；不写入用户池
     enable_encoder_bypass: true
   itn:
@@ -108,6 +109,8 @@ defaults:
     asr_enrollment_max_sec: 8.0
     asr_enrollment_ttl_sec: 3600
     asr_enrollment_max_entries: 256       # 进程级 store 容量(非 per-endpoint)
+    enable_triton_enrollment_store: false # 关闭时保持本地注册音频缓存；灰度打开后由 Triton 保存 embedding tensor
+    enable_enrollment_embedding_bypass: true
   transcribe:                             # 离线长音频转写 job (POST /api/asr/transcriptions)
                                           # 本组只放纯调参; 用哪个模型/是否融合在下方 rest.routes.transcribe
                                           # 调参依据: docs/transcription-jobs-benchmark.md(H20 实测扫参)

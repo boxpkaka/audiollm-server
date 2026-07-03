@@ -399,6 +399,14 @@ def test_encoder_bypass_requires_recall_invariant() -> None:
     assert cfg.enable_encoder_bypass is False
 
 
+def test_triton_enrollment_store_defaults_off_and_server_side() -> None:
+    cfg = Config()
+    assert cfg.enable_triton_enrollment_store is False
+    assert cfg.enable_enrollment_embedding_bypass is True
+    assert "enable_triton_enrollment_store" not in CLIENT_OVERRIDABLE_FIELDS
+    assert "enable_enrollment_embedding_bypass" not in CLIENT_OVERRIDABLE_FIELDS
+
+
 def test_recall_top_k_clamps_to_non_negative() -> None:
     cfg = Config(recall_top_k=-1)
     assert cfg.recall_top_k == 0
@@ -503,10 +511,16 @@ def test_recall_knobs_client_overridable() -> None:
 
 def test_recall_user_id_default_and_validation() -> None:
     cfg = load_config()
+    assert cfg.hotword_pool_id == "default"
     assert cfg.recall_user_id == "default"
-    assert cfg.override(recall_user_id="tenant-a").recall_user_id == "tenant-a"
-    with pytest.raises(ValueError, match="USER_ID"):
-        cfg.override(recall_user_id="../escape")
+    out = cfg.override(hotword_pool_id="tenant-a")
+    assert out.hotword_pool_id == "tenant-a"
+    assert out.recall_user_id == "tenant-a"
+    legacy = cfg.override(recall_user_id="tenant-b")
+    assert legacy.hotword_pool_id == "tenant-b"
+    assert legacy.recall_user_id == "tenant-b"
+    with pytest.raises(ValueError, match="HOTWORD_POOL_ID"):
+        cfg.override(hotword_pool_id="../escape")
 
 
 def test_pseudo_stream_first_partial_clamp_applies_on_override() -> None:
