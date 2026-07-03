@@ -208,6 +208,11 @@ class Config:
     asr_enrollment_max_sec: float = 8.0
     asr_enrollment_ttl_sec: float = 3600.0
     asr_enrollment_max_entries: int = 256
+    # Compatibility-first rollout: when false, target-speaker enrollment keeps
+    # using the legacy in-process WAV cache. When true, new enrollment uploads
+    # are forwarded to Triton, which persists only projector/embedding tensors.
+    enable_triton_enrollment_store: bool = False
+    enable_enrollment_embedding_bypass: bool = True
 
     # ---- ASR: VAD segmentation -------------------------------------------
     # These VAD defaults mirror config.yaml's vad block. They are pure

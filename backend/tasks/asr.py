@@ -73,6 +73,8 @@ class AsrTaskEngine(BaseTaskEngine):
                     timeout=cfg.asr_request_timeout,
                     runtime_config=cfg,
                     recall_user_id=ctx.recall_user_id,
+                    enrollment_id=ctx.enrollment_id,
+                    enrollment_user_id=cfg.recall_user_id,
                 ),
                 timeout=cfg.primary_asr_timeout,
             )
@@ -390,6 +392,8 @@ class AsrTaskEngine(BaseTaskEngine):
                         timeout=cfg.asr_request_timeout,
                         runtime_config=cfg,
                         recall_user_id=ctx.recall_user_id,
+                        enrollment_id=ctx.enrollment_id,
+                        enrollment_user_id=cfg.recall_user_id,
                     ),
                     timeout=cfg.primary_asr_timeout,
                 )

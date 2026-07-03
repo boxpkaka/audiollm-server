@@ -105,3 +105,60 @@ async def test_query_audio_model_merges_recalled_and_custom_hotwords(monkeypatch
     assert isinstance(messages, list)
     content = messages[0]["content"]
     assert content[0]["text"] == "Transcribe the following audio.\nHotwords: 上灯板,临时一,召回A"
+
+
+@pytest.mark.asyncio
+async def test_query_audio_model_uses_triton_enrollment_embeds(monkeypatch):
+    captured: dict[str, object] = {}
+
+    async def fake_recall_audio(*_args, **kwargs):
+        captured["recall_kwargs"] = kwargs
+        return SimpleNamespace(
+            words=["北京"],
+            audio_embeds_b64="TARGET_EMBEDS_B64",
+            enrollment_audio_embeds_b64="ENROLL_EMBEDS_B64",
+            uuid="triton-audio-target",
+        )
+
+    async def fake_post_chat(messages, **_kwargs):
+        captured["messages"] = messages
+        return {
+            "transcription": "北京",
+            "reported_hotwords": [],
+            "raw_text": "北京",
+            "detected_language": "zh",
+        }
+
+    monkeypatch.setattr(client_mod, "recall_audio", fake_recall_audio)
+    monkeypatch.setattr(client_mod, "_post_chat", fake_post_chat)
+
+    await client_mod.query_audio_model(
+        "TARGET_WAV_B64",
+        hotwords=[],
+        audio_pcm=np.zeros(160, dtype=np.float32),
+        runtime_config=Config(
+            enable_hotword_recall=True,
+            enable_encoder_bypass=True,
+            enable_triton_enrollment_store=True,
+            enable_enrollment_embedding_bypass=True,
+            vllm_prompt_template="amphion_asr_1.7b",
+        ),
+        enrollment_id="speaker-1",
+        enrollment_user_id="default",
+    )
+
+    recall_kwargs = captured["recall_kwargs"]
+    assert recall_kwargs["enrollment_id"] == "speaker-1"
+    assert recall_kwargs["enrollment_user_id"] == "default"
+    assert recall_kwargs["want_enrollment_audio_embeds"] is True
+    messages = captured["messages"]
+    assert isinstance(messages, list)
+    assert messages[0]["content"] == (
+        "Given the speaker's voice in the first audio.\nHotwords: 北京"
+    )
+    assert [item["type"] for item in messages[1]["content"]] == [
+        "audio_embeds",
+        "audio_embeds",
+    ]
+    assert messages[1]["content"][0]["audio_embeds"] == "ENROLL_EMBEDS_B64"
+    assert messages[1]["content"][1]["audio_embeds"] == "TARGET_EMBEDS_B64"

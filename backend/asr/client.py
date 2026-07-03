@@ -28,6 +28,8 @@ def build_primary_messages(
     *,
     hotwords: list[str] | None = None,
     enrollment_wav_base64: str | None = None,
+    enrollment_audio_embeds_b64: str | None = None,
+    enrollment_audio_embeds_uuid: str | None = None,
     audio_embeds_b64: str | None = None,
     audio_embeds_uuid: str | None = None,
     template: str | None = None,
@@ -37,6 +39,8 @@ def build_primary_messages(
         target_wav_base64,
         hotwords=hotwords,
         enrollment_wav_base64=enrollment_wav_base64,
+        enrollment_audio_embeds_b64=enrollment_audio_embeds_b64,
+        enrollment_audio_embeds_uuid=enrollment_audio_embeds_uuid,
         audio_embeds_b64=audio_embeds_b64,
         audio_embeds_uuid=audio_embeds_uuid,
         template=template or default_config.vllm_prompt_template,
@@ -323,6 +327,8 @@ async def query_audio_model(
     timeout: float | None = None,
     runtime_config: Config | None = None,
     recall_user_id: str | None = None,
+    enrollment_id: str | None = None,
+    enrollment_user_id: str | None = None,
 ) -> ASRResult:
     """Primary ASR call.
 
@@ -338,6 +344,8 @@ async def query_audio_model(
     effective_hotwords = request_hotwords
     audio_embeds_b64: str | None = None
     audio_embeds_uuid: str | None = None
+    enrollment_audio_embeds_b64: str | None = None
+    enrollment_audio_embeds_uuid: str | None = None
 
     if cfg.enable_hotword_recall and audio_pcm is not None:
         # The recall service owns the large per-user pool. Request-local
@@ -347,6 +355,13 @@ async def query_audio_model(
             [],
             request_hotwords,
             custom_limit=cfg.recall_custom_hotword_limit,
+        )
+        want_enrollment_bypass = (
+            cfg.enable_triton_enrollment_store
+            and cfg.enable_enrollment_embedding_bypass
+            and template == "amphion_asr_1.7b"
+            and bool(enrollment_id)
+            and enrollment_wav_base64 is None
         )
         want_bypass = (
             cfg.enable_encoder_bypass
@@ -360,6 +375,9 @@ async def query_audio_model(
                 sample_rate=audio_sample_rate,
                 want_audio_embeds=want_bypass,
                 user_id=recall_user_id,
+                enrollment_id=enrollment_id if want_enrollment_bypass else None,
+                enrollment_user_id=enrollment_user_id if want_enrollment_bypass else None,
+                want_enrollment_audio_embeds=want_enrollment_bypass,
             )
             effective_hotwords = merge_recalled_and_custom_hotwords(
                 recalled.words,
@@ -369,6 +387,19 @@ async def query_audio_model(
             if want_bypass and recalled.audio_embeds_b64:
                 audio_embeds_b64 = recalled.audio_embeds_b64
                 audio_embeds_uuid = recalled.uuid
+            recalled_enrollment_embeds = getattr(
+                recalled,
+                "enrollment_audio_embeds_b64",
+                None,
+            )
+            if want_enrollment_bypass and recalled_enrollment_embeds:
+                enrollment_audio_embeds_b64 = recalled_enrollment_embeds
+                enrollment_owner = (
+                    enrollment_user_id or recall_user_id or cfg.recall_user_id
+                )
+                enrollment_audio_embeds_uuid = (
+                    f"triton-enrollment-{enrollment_owner}-{enrollment_id}"
+                )
         except Exception as exc:
             logger.warning("Triton hotword recall failed; using raw ASR audio: %s", exc)
 
@@ -376,6 +407,8 @@ async def query_audio_model(
         audio_wav_base64,
         hotwords=effective_hotwords,
         enrollment_wav_base64=enrollment_wav_base64,
+        enrollment_audio_embeds_b64=enrollment_audio_embeds_b64,
+        enrollment_audio_embeds_uuid=enrollment_audio_embeds_uuid,
         audio_embeds_b64=audio_embeds_b64,
         audio_embeds_uuid=audio_embeds_uuid,
         template=template,

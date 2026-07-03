@@ -399,6 +399,14 @@ def test_encoder_bypass_requires_recall_invariant() -> None:
     assert cfg.enable_encoder_bypass is False
 
 
+def test_triton_enrollment_store_defaults_off_and_server_side() -> None:
+    cfg = Config()
+    assert cfg.enable_triton_enrollment_store is False
+    assert cfg.enable_enrollment_embedding_bypass is True
+    assert "enable_triton_enrollment_store" not in CLIENT_OVERRIDABLE_FIELDS
+    assert "enable_enrollment_embedding_bypass" not in CLIENT_OVERRIDABLE_FIELDS
+
+
 def test_recall_top_k_clamps_to_non_negative() -> None:
     cfg = Config(recall_top_k=-1)
     assert cfg.recall_top_k == 0

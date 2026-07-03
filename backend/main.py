@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import logging
+import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -32,11 +33,20 @@ from .asr.recall import (
     add_hotwords as add_recall_hotwords,
 )
 from .asr.recall import (
+    delete_enrollment as delete_triton_enrollment,
+)
+from .asr.recall import (
     delete_hotwords as delete_recall_hotwords,
+)
+from .asr.recall import (
+    get_enrollment as get_triton_enrollment,
 )
 from .asr.recall import (
     list_hotword_pool,
     reload_hotword_pool,
+)
+from .asr.recall import (
+    upsert_enrollment as upsert_triton_enrollment,
 )
 from .asr.transcribe import float_pcm_to_i16_bytes
 from .audio.utils import wav_base64_to_pcm_16k_mono, wav_bytes_to_pcm_16k_mono
@@ -375,6 +385,36 @@ def _resolve_enrollment_b64(enrollment_id: str | None) -> str | None:
     return entry.wav_base64 if entry is not None else None
 
 
+def _enrollment_store_user_id(cfg) -> str:
+    return normalize_recall_user_id(None, default=cfg.recall_user_id)
+
+
+async def _resolve_enrollment_for_request(
+    cfg,
+    enrollment_id: str | None,
+) -> tuple[str | None, str | None]:
+    """Return ``(legacy_b64, triton_id)`` for the configured enrollment store."""
+    if not enrollment_id:
+        return None, None
+    if not cfg.enable_triton_enrollment_store:
+        return _resolve_enrollment_b64(enrollment_id), None
+    ident = str(enrollment_id or "").strip()
+    if not ident:
+        return None, None
+    try:
+        summary = await get_triton_enrollment(
+            enrollment_id=ident,
+            user_id=_enrollment_store_user_id(cfg),
+        )
+    except Exception as exc:
+        logger.warning("Triton enrollment lookup failed; falling back to plain ASR: %s", exc)
+        return None, None
+    if str(summary.get("status", "")).lower() == "ok":
+        return None, ident
+    logger.warning("Triton enrollment id %s not found / expired", ident)
+    return None, None
+
+
 async def _run_dual_asr_upload(
     wav_b64: str,
     *,
@@ -383,6 +423,8 @@ async def _run_dual_asr_upload(
     language: str,
     audio_pcm: np.ndarray,
     enrollment_b64: str | None = None,
+    enrollment_id: str | None = None,
+    enrollment_user_id: str | None = None,
     recall_user_id: str | None = None,
 ) -> dict:
     """Route-facing wrapper over :func:`run_oneshot_asr`.
@@ -398,6 +440,8 @@ async def _run_dual_asr_upload(
             language=language,
             audio_pcm=audio_pcm,
             enrollment_b64=enrollment_b64,
+            enrollment_id=enrollment_id,
+            enrollment_user_id=enrollment_user_id,
             recall_user_id=recall_user_id,
         )
     except OneshotAsrError as exc:
@@ -430,6 +474,30 @@ async def asr_enrollment_create(audio: UploadFile = File(...)):
             detail={"code": exc.code, "message": str(exc)},
         ) from exc
 
+    if cfg.enable_triton_enrollment_store:
+        enrollment_id = secrets.token_urlsafe(16)
+        pcm = wav_base64_to_pcm_16k_mono(canonical_b64)
+        try:
+            await upsert_triton_enrollment(
+                pcm,
+                enrollment_id=enrollment_id,
+                user_id=_enrollment_store_user_id(cfg),
+                sample_rate=SAMPLE_RATE,
+            )
+        except Exception as exc:
+            logger.exception("Triton enrollment upsert failed")
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "triton_enrollment_failed",
+                    "message": str(exc),
+                },
+            ) from exc
+        return {
+            "enrollment_id": enrollment_id,
+            "duration_sec": round(duration_sec, 3),
+        }
+
     store = get_enrollment_store()
     store.configure(
         ttl_sec=cfg.asr_enrollment_ttl_sec,
@@ -449,7 +517,17 @@ async def asr_enrollment_delete(enrollment_id: str):
     Returning 204 on missing ids keeps the frontend's "clear" button
     idempotent — repeated clears never error out.
     """
-    get_enrollment_store().delete(enrollment_id)
+    cfg = load_config()
+    if cfg.enable_triton_enrollment_store:
+        try:
+            await delete_triton_enrollment(
+                enrollment_id=enrollment_id,
+                user_id=_enrollment_store_user_id(cfg),
+            )
+        except Exception:
+            logger.warning("Triton enrollment delete failed", exc_info=True)
+    else:
+        get_enrollment_store().delete(enrollment_id)
     return JSONResponse(status_code=204, content=None)
 
 
@@ -584,7 +662,10 @@ async def asr_upload(
     cfg = load_config()
     recall_user_id = _resolve_recall_user_id(user_id, cfg)
     hw_list = _parse_csv(hotwords)
-    enrollment_b64 = _resolve_enrollment_b64(enrollment_id)
+    enrollment_b64, triton_enrollment_id = await _resolve_enrollment_for_request(
+        cfg,
+        enrollment_id,
+    )
     asr_result = await _run_dual_asr_upload(
         wav_b64,
         cfg=cfg,
@@ -592,6 +673,10 @@ async def asr_upload(
         language=language,
         audio_pcm=audio_pcm,
         enrollment_b64=enrollment_b64,
+        enrollment_id=triton_enrollment_id,
+        enrollment_user_id=_enrollment_store_user_id(cfg)
+        if triton_enrollment_id
+        else None,
         recall_user_id=recall_user_id,
     )
 
@@ -600,7 +685,7 @@ async def asr_upload(
         "text": asr_result["text"],
         "language": asr_result["language"],
         "duration_sec": round(duration_sec, 3),
-        "enrollment_used": enrollment_b64 is not None,
+        "enrollment_used": enrollment_b64 is not None or triton_enrollment_id is not None,
     }
 
 
@@ -820,7 +905,10 @@ async def audio_analyze(
     cfg = load_config()
     recall_user_id = _resolve_recall_user_id(user_id, cfg)
     hw_list = _parse_csv(hotwords)
-    enrollment_b64 = _resolve_enrollment_b64(enrollment_id)
+    enrollment_b64, triton_enrollment_id = await _resolve_enrollment_for_request(
+        cfg,
+        enrollment_id,
+    )
 
     asr_wav_bytes, asr_pcm, duration_sec = _wav_to_pcm_capped(raw, _ASR_MAX_SECONDS)
     asr_wav_b64 = base64.b64encode(asr_wav_bytes).decode("ascii")
@@ -837,6 +925,10 @@ async def audio_analyze(
             language=language,
             audio_pcm=asr_pcm,
             enrollment_b64=enrollment_b64,
+            enrollment_id=triton_enrollment_id,
+            enrollment_user_id=_enrollment_store_user_id(cfg)
+            if triton_enrollment_id
+            else None,
             recall_user_id=recall_user_id,
         )
     )

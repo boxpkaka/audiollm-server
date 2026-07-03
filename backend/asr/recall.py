@@ -29,6 +29,9 @@ class RecallResult:
     audio_embeds_b64: str | None
     projector_len: int | None
     uuid: str
+    enrollment_audio_embeds_b64: str | None = None
+    enrollment_projector_len: int | None = None
+    message: dict[str, object] | None = None
 
 
 def stable_audio_uuid(pcm: np.ndarray, sample_rate: int = SAMPLE_RATE) -> str:
@@ -88,6 +91,10 @@ def _infer_sync(
     top_k: int,
     want_audio_embeds: bool,
     user_id: str,
+    enable_hotword_recall: bool = True,
+    enrollment_id: str | None = None,
+    enrollment_user_id: str | None = None,
+    want_enrollment_audio_embeds: bool = False,
 ) -> RecallResult:
     upstream = _recall_upstream()
     httpclient, client = _client_for(upstream)
@@ -100,6 +107,14 @@ def _infer_sync(
         _int_input(httpclient, "SAMPLE_RATE", sample_rate),
         _int_input(httpclient, "TOP_K", top_k),
     ]
+    if not enable_hotword_recall:
+        inputs.append(_int_input(httpclient, "ENABLE_HOTWORD_RECALL", 0))
+    if enrollment_id:
+        inputs.append(_string_input(httpclient, "ENROLLMENT_ID", enrollment_id))
+    if enrollment_user_id:
+        inputs.append(_string_input(httpclient, "ENROLLMENT_USER_ID", enrollment_user_id))
+    if want_enrollment_audio_embeds:
+        inputs.append(_int_input(httpclient, "WANT_ENROLLMENT_AUDIO_EMBEDS", 1))
     wav_input.set_data_from_numpy(wav)
 
     outputs = [
@@ -108,6 +123,14 @@ def _infer_sync(
     ]
     if want_audio_embeds:
         outputs.append(httpclient.InferRequestedOutput("AUDIO_EMBEDS_B64"))
+    if want_enrollment_audio_embeds:
+        outputs.extend(
+            [
+                httpclient.InferRequestedOutput("ENROLLMENT_AUDIO_EMBEDS_B64"),
+                httpclient.InferRequestedOutput("ENROLLMENT_PROJECTOR_LEN"),
+                httpclient.InferRequestedOutput("MESSAGE"),
+            ]
+        )
 
     result = client.infer(_model_name(upstream), inputs, outputs=outputs)
     words = json.loads(_decode(result.as_numpy("WORD_LIST")[0]))
@@ -115,11 +138,25 @@ def _infer_sync(
     audio_embeds_b64 = None
     if want_audio_embeds:
         audio_embeds_b64 = _decode(result.as_numpy("AUDIO_EMBEDS_B64")[0])
+    enrollment_audio_embeds_b64 = None
+    enrollment_projector_len = None
+    message: dict[str, object] | None = None
+    if want_enrollment_audio_embeds:
+        enrollment_audio_embeds_b64 = _decode(
+            result.as_numpy("ENROLLMENT_AUDIO_EMBEDS_B64")[0]
+        )
+        enrollment_projector_len = int(result.as_numpy("ENROLLMENT_PROJECTOR_LEN")[0])
+        message_raw = _decode(result.as_numpy("MESSAGE")[0])
+        parsed = json.loads(message_raw) if message_raw else {}
+        message = parsed if isinstance(parsed, dict) else {"message": parsed}
     return RecallResult(
         words=[str(word) for word in words],
         audio_embeds_b64=audio_embeds_b64,
         projector_len=projector_len,
         uuid=stable_audio_uuid(wav, sample_rate),
+        enrollment_audio_embeds_b64=enrollment_audio_embeds_b64,
+        enrollment_projector_len=enrollment_projector_len,
+        message=message,
     )
 
 
@@ -130,11 +167,15 @@ async def recall_audio(
     sample_rate: int = SAMPLE_RATE,
     want_audio_embeds: bool = True,
     user_id: str | None = None,
+    enable_hotword_recall: bool = True,
+    enrollment_id: str | None = None,
+    enrollment_user_id: str | None = None,
+    want_enrollment_audio_embeds: bool = False,
 ) -> RecallResult:
     """Recall hotwords for one audio segment."""
-    top_k = max(int(cfg.recall_top_k), 0)
+    top_k = max(int(cfg.recall_top_k), 0) if enable_hotword_recall else 0
     resolved_user_id = normalize_recall_user_id(user_id, default=cfg.recall_user_id)
-    if top_k == 0:
+    if top_k == 0 and not (enrollment_id or want_enrollment_audio_embeds):
         return RecallResult(
             words=[],
             audio_embeds_b64=None,
@@ -148,6 +189,89 @@ async def recall_audio(
         top_k=top_k,
         want_audio_embeds=want_audio_embeds,
         user_id=resolved_user_id,
+        enable_hotword_recall=enable_hotword_recall,
+        enrollment_id=enrollment_id,
+        enrollment_user_id=enrollment_user_id,
+        want_enrollment_audio_embeds=want_enrollment_audio_embeds,
+    )
+
+
+def _enrollment_sync(
+    action: str,
+    *,
+    enrollment_id: str,
+    user_id: str | None = None,
+    pcm: np.ndarray | None = None,
+    sample_rate: int = SAMPLE_RATE,
+) -> dict[str, object]:
+    upstream = _recall_upstream()
+    httpclient, client = _client_for(upstream)
+    resolved_user_id = normalize_recall_user_id(user_id, default=DEFAULT_RECALL_USER_ID)
+    inputs = [
+        _string_input(httpclient, "ACTION", action),
+        _string_input(httpclient, "USER_ID", resolved_user_id),
+        _string_input(httpclient, "ENROLLMENT_ID", enrollment_id),
+    ]
+    if pcm is not None:
+        wav = np.asarray(pcm, dtype=np.float32).reshape(-1)
+        wav_input = httpclient.InferInput("WAV", wav.shape, "FP32")
+        wav_input.set_data_from_numpy(wav)
+        inputs.extend([wav_input, _int_input(httpclient, "SAMPLE_RATE", sample_rate)])
+    outputs = [
+        httpclient.InferRequestedOutput("STATUS"),
+        httpclient.InferRequestedOutput("MESSAGE"),
+        httpclient.InferRequestedOutput("HOTWORD_COUNT"),
+        httpclient.InferRequestedOutput("HOTWORD_LIST"),
+    ]
+    result = client.infer(_model_name(upstream), inputs, outputs=outputs)
+    status = _decode(result.as_numpy("STATUS")[0])
+    message_raw = _decode(result.as_numpy("MESSAGE")[0])
+    message = json.loads(message_raw) if message_raw else {}
+    if not isinstance(message, dict):
+        message = {"message": message}
+    return {"status": status, **message}
+
+
+async def upsert_enrollment(
+    pcm: np.ndarray,
+    *,
+    enrollment_id: str,
+    user_id: str | None = None,
+    sample_rate: int = SAMPLE_RATE,
+) -> dict[str, object]:
+    return await asyncio.to_thread(
+        _enrollment_sync,
+        "upsert_enrollment",
+        enrollment_id=enrollment_id,
+        user_id=user_id,
+        pcm=pcm,
+        sample_rate=sample_rate,
+    )
+
+
+async def get_enrollment(
+    *,
+    enrollment_id: str,
+    user_id: str | None = None,
+) -> dict[str, object]:
+    return await asyncio.to_thread(
+        _enrollment_sync,
+        "get_enrollment",
+        enrollment_id=enrollment_id,
+        user_id=user_id,
+    )
+
+
+async def delete_enrollment(
+    *,
+    enrollment_id: str,
+    user_id: str | None = None,
+) -> dict[str, object]:
+    return await asyncio.to_thread(
+        _enrollment_sync,
+        "delete_enrollment",
+        enrollment_id=enrollment_id,
+        user_id=user_id,
     )
 
 

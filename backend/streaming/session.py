@@ -437,6 +437,10 @@ class StreamingSession:
             self.ctx.enrollment_b64 = None
             return
         ident = raw_id.strip()
+        if self.cfg.enable_triton_enrollment_store:
+            self.ctx.enrollment_id = ident
+            self.ctx.enrollment_b64 = None
+            return
         entry = get_enrollment_store().get(ident)
         if entry is None:
             logger.warning("Enrollment id %s not found / expired", ident)
