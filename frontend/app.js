@@ -54,6 +54,10 @@
   // Last-known UI states so we can re-render strings after a language switch.
   let currentSyncState = 'waiting';
   let currentExtractDyn = { key: 'asr.extract.idle', vars: null };
+  // The backend emits ready immediately after accepting; this budget covers slow
+  // proxy/TLS setup without hiding a real outage behind a long spinner.
+  const WS_READY_TIMEOUT_MS = 5000;
+  const WS_READY_POLL_MS = 50;
 
   const UI_TO_API_LANG = {
     chinese: 'Chinese',
@@ -400,11 +404,7 @@
     return { added: toAdd.length, total: normalized.length };
   }
 
-  function requestHotwordExtraction(text) {
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      setExtractStatus('error', 'asr.extract.wsOffline');
-      return;
-    }
+  async function requestHotwordExtraction(text) {
     const payloadText = String(text || '').trim();
     if (!payloadText) {
       setExtractStatus('error', 'asr.extract.pasteFirst');
@@ -412,6 +412,10 @@
     }
     if (extractRequestId) {
       setExtractStatus('error', 'asr.extract.alreadyRunning');
+      return;
+    }
+    if (!(await waitForWSReady())) {
+      setExtractStatus('error', 'asr.extract.wsOffline');
       return;
     }
 
@@ -481,7 +485,7 @@
     hotwordReloadBtn.addEventListener('click', () => { void reloadHotwordPool(); });
   }
   hotwordExtractBtn.addEventListener('click', () => {
-    requestHotwordExtraction(hotwordTextarea.value);
+    void requestHotwordExtraction(hotwordTextarea.value);
   });
   hotwordTextarea.addEventListener('input', updateExtractButtonAttention);
 
@@ -544,21 +548,31 @@
     }
   }
 
+  function setConnecting() {
+    if (window.AmphionSidebar && window.AmphionSidebar.setConnectionState) {
+      window.AmphionSidebar.setConnectionState('pending');
+    }
+  }
+
   // --- WebSocket ---
   function connectWS() {
     if (isDisposed) return;
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+      if (wsReady) setConnected(true);
+      else setConnecting();
       return;
     }
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     wsReady = false;
     streamStarted = false;
     pendingStop = false;
+    setConnecting();
     ws = new WebSocket(`${proto}//${location.host}/transcribe-streaming`);
     ws.binaryType = 'arraybuffer';
 
     ws.onopen = () => {
       // Wait for the protocol-level ready frame before sending controls/audio.
+      setConnecting();
     };
 
     ws.onclose = () => {
@@ -595,6 +609,32 @@
         // ignore non-JSON
       }
     };
+  }
+
+  function waitForWSReady(timeoutMs = WS_READY_TIMEOUT_MS) {
+    if (isDisposed) return Promise.resolve(false);
+    if (ws && ws.readyState === WebSocket.OPEN && wsReady) return Promise.resolve(true);
+    connectWS();
+
+    const deadline = Date.now() + timeoutMs;
+    return new Promise((resolve) => {
+      const tick = () => {
+        if (isDisposed) {
+          resolve(false);
+          return;
+        }
+        if (ws && ws.readyState === WebSocket.OPEN && wsReady) {
+          resolve(true);
+          return;
+        }
+        if (Date.now() >= deadline) {
+          resolve(false);
+          return;
+        }
+        setTimeout(tick, WS_READY_POLL_MS);
+      };
+      tick();
+    });
   }
 
   function closeTranscribeWSSoon(delayMs) {
@@ -1124,8 +1164,7 @@
       alert(t('asrtest.mic.insecure'));
       return;
     }
-    if (!ws || ws.readyState !== WebSocket.OPEN || !wsReady) {
-      connectWS();
+    if (!(await waitForWSReady())) {
       alert(t('asr.extract.wsOffline'));
       return;
     }
@@ -1146,6 +1185,12 @@
 
     recordingSeq += 1;
     currentRecordingSeq = recordingSeq;
+    if (!(await waitForWSReady())) {
+      mediaStream.getTracks().forEach((tr) => tr.stop());
+      mediaStream = null;
+      alert(t('asr.extract.wsOffline'));
+      return;
+    }
     if (!sendStartFrame()) {
       mediaStream.getTracks().forEach((tr) => tr.stop());
       mediaStream = null;
