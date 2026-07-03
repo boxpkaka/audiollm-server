@@ -75,14 +75,14 @@ Client                                      Server
 | 字段 | 类型 | 必传 | 说明 |
 |---|---|---|---|
 | engine | Map | 否 | 引擎透传参数，仅记录日志，当前不映射到任何行为（见已知限制）。兼容 SDK 使用的 parameter.service |
-| asr_config | Map | 否 | 本服务扩展的 per-connection 配置覆写与 `user_id` 承载槽，仅首帧（status=0）读取，仅当前连接生效、不落盘。详见“配置覆写”章节 |
+| asr_config | Map | 否 | 本服务扩展的 per-connection 配置覆写与热词池 ID 承载槽，仅首帧（status=0）读取，仅当前连接生效、不落盘。推荐 `hotword_pool_id`，旧字段 `user_id` 继续兼容；详见“配置覆写”章节 |
 
 ### payload
 
 | 字段 | 类型 | 必传 | 说明 |
 |---|---|---|---|
 | payload.audio.audio | String | 是 | base64 编码的 PCM 音频分片 |
-| payload.text.text | String | 否 | 兼容旧客户端的文本类型热词字段；会被解析为临时请求热词，final 段去重限量后优先进入 prompt，并覆盖精确重复或整词同音（忽略声调）的 Triton 召回热词，不写入用户池 |
+| payload.text.text | String | 否 | 兼容旧客户端的文本类型热词字段；会被解析为临时请求热词，final 段去重限量后优先进入 prompt，并覆盖精确重复或整词同音（忽略声调）的 RAG-ASR 召回热词，不写入热词池 |
 
 ### 状态机与音频
 
@@ -96,11 +96,11 @@ Client                                      Server
 
 ## 配置覆写（parameter.asr_config）
 
-`parameter.asr_config` 是本服务在 AST v3 信封上的扩展槽位，用于按连接临时调参，也承载 Triton 用户热词池隔离 ID `user_id`；它与讯飞 `parameter.engine`（仅记录日志、不映射行为）并列、互不影响。仅在首帧（status=0）读取，仅对当前连接生效、不落盘；新连接或服务重启都回到服务端默认。
+`parameter.asr_config` 是本服务在 AST v3 信封上的扩展槽位，用于按连接临时调参，也承载 RAG-ASR 热词池隔离 ID。推荐字段是 `hotword_pool_id`，旧字段 `user_id` 继续兼容；它与讯飞 `parameter.engine`（仅记录日志、不映射行为）并列、互不影响。仅在首帧（status=0）读取，仅对当前连接生效、不落盘；新连接或服务重启都回到服务端默认。
 
 取值优先级（后者覆盖前者）：`backend/config.py` 内置默认 → `config.yaml` 服务端默认 → `parameter.asr_config` 客户端临时覆写。
 
-只接受白名单内的扁平字段名；未知字段、受限字段（模型地址、密钥、连接池/队列等基础设施项）以及非法值会被忽略并保持服务端默认，不会中断连接。`language` 和 `user_id` 是特例：`language` 会被用作本次会话语言（等价于 `/transcribe-streaming` 的 `start.language`），`user_id` 会被用作 Triton 热词池隔离 ID（默认 `default`），不会进入配置覆写白名单。
+只接受白名单内的扁平字段名；未知字段、受限字段（模型地址、密钥、连接池/队列等基础设施项）以及非法值会被忽略并保持服务端默认，不会中断连接。`language`、`hotword_pool_id` 和兼容字段 `user_id` 是特例：`language` 会被用作本次会话语言（等价于 `/transcribe-streaming` 的 `start.language`），`hotword_pool_id` / `user_id` 会被用作热词池隔离 ID（默认 `default`），不会进入配置覆写白名单。两者同时存在时优先使用 `hotword_pool_id`。
 
 可覆写字段与 `/transcribe-streaming` 的 `start.config` 共用同一白名单（`backend/config.py` 的 `CLIENT_OVERRIDABLE_FIELDS`）。下面按类别逐字段说明语义：默认列为服务端 `config.yaml` 当前生效值，本端点列标注该字段在 AST v3 是否产生可观察效果（本端点恒为 primary-only，副模型与融合相关字段即使传入也不生效）。
 
@@ -216,7 +216,7 @@ TS-ASR 注册参数（约束注册接口的时长校验与缓存 TTL）：
 
 支持只转写指定说话人的语音，复用与 `/transcribe-streaming` 相同的注册机制，分两步：
 
-1. 注册：通过 `POST /api/asr/enrollment` 上传 1-8 秒目标说话人音频，拿到 `enrollment_id`（见 [API 总览](api-reference.md) 的注册接口）。
+1. 注册：通过 `POST /api/asr/enrollment` 上传 1-8 秒目标说话人音频，拿到 `enrollment_id`（见 [API 总览](api-reference.md) 的注册接口）。默认本地缓存注册音频；灰度打开 `enable_triton_enrollment_store=true` 且配置 RAG-ASR 管理服务后，新注册音频会转发给 RAG-ASR 保存 embedding tensor 和元数据。
 2. 携带：在首帧（status=0）把该 id 放进 `header.resIdList`，服务端取 `resIdList[0]` 作为目标说话人。
 
 ```json
@@ -235,7 +235,7 @@ TS-ASR 注册参数（约束注册接口的时长校验与缓存 TTL）：
 说明：
 
 - enrollment_id 仅在首帧读取，整段会话沿用同一目标说话人。
-- 若 resIdList[0] 未注册或已过期，服务端静默回退为普通 ASR（仅记 WARN，不返回 error），避免长连接因陈旧 id 中断。enrollment_id 有 TTL（默认 3600 秒、每次使用续期）且服务重启即失效，完整生命周期（存储/有效期/容量/删除）见 [API 总览](api-reference.md) 注册接口的“生命周期”。
+- 若 resIdList[0] 未注册或已过期，服务端默认静默回退为普通 ASR（仅记 WARN，不返回 error），避免长连接因陈旧 id 中断。默认本地缓存下 enrollment_id 有 TTL（默认 3600 秒、每次使用续期）且服务重启即失效；下沉链路中缺失 RAG-ASR embedding 也按同一兼容语义处理。完整生命周期（存储/有效期/容量/删除）见 [API 总览](api-reference.md) 注册接口的“生命周期”。
 - resIdList 含多个 id 时只用第一个，不做多说话人分离。
 - 未携带 resIdList 时为普通 ASR。
 

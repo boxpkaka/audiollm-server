@@ -1,9 +1,10 @@
-"""Triton hotword recall client.
+"""Triton hotword recall and RAG-ASR management client.
 
-The deployed RAG-ASR Triton model owns a process-wide hotword pool.  This module
-keeps audiollm-demo as a thin async gateway: it sends PCM to Triton, receives the
-recalled top-K words plus vLLM-ready audio_embeds, and proxies pool management
-operations.
+AudioLLM stays a thin gateway: final ASR sends PCM to Triton for top-K hotword
+recall and optional vLLM-ready audio_embeds.  Hotword-pool management and
+enrollment embedding storage can be routed to the optional RAG-ASR HTTP
+management service; when that service is not configured, legacy Triton
+management and local enrollment fallback remain available.
 """
 
 from __future__ import annotations
