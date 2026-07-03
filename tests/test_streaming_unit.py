@@ -591,6 +591,7 @@ async def test_session_dispatches_start_pcm_segment_and_stop():
     assert "ack" in sent_types
 
     assert engine.starts and engine.starts[0]["type"] == "start"
+    assert session.ctx.hotword_pool_id == "tenant-a"
     assert session.ctx.recall_user_id == "tenant-a"
     assert len(engine.segments) == 1
     assert engine.segments[0].pcm.shape == (800,)
@@ -1183,7 +1184,7 @@ def test_ast_v3_asr_config_injects_config_and_language():
     ctrl = acts[0].ctrl
     assert ctrl["type"] == "start"
     assert ctrl["language"] == "en"
-    assert ctrl["user_id"] == "tenant-a"
+    assert ctrl["hotword_pool_id"] == "tenant-a"
     assert ctrl["config"] == {"vad_threshold": 0.3, "enable_pseudo_stream": False}
 
 
@@ -1461,6 +1462,7 @@ async def test_session_ast_v3_asr_config_overrides_and_whitelist():
 
     assert session.cfg.vad_threshold == 0.37  # whitelisted -> applied
     assert session.cfg.vllm_base_url == base_url_before  # infra field dropped
+    assert session.ctx.hotword_pool_id == "tenant-a"
     assert session.ctx.recall_user_id == "tenant-a"
     assert stream.cfg.vad_threshold == 0.37  # stream reconfigured with new cfg
 

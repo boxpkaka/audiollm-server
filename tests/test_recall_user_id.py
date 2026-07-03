@@ -87,27 +87,30 @@ def _install_fake_triton(monkeypatch) -> list[dict[str, object]]:
 
 
 @pytest.mark.asyncio
-async def test_recall_audio_sends_user_id(monkeypatch):
+async def test_recall_audio_sends_hotword_pool_id(monkeypatch):
     calls = _install_fake_triton(monkeypatch)
 
     result = await recall_mod.recall_audio(
         np.zeros(160, dtype=np.float32),
         Config(recall_top_k=1, recall_user_id="default"),
         want_audio_embeds=False,
-        user_id="tenant-a",
+        hotword_pool_id="tenant-a",
     )
 
     assert result.words == ["挚音科技"]
-    assert calls[0]["inputs"]["USER_ID"] == ["tenant-a"]
+    assert calls[0]["inputs"]["HOTWORD_POOL_ID"] == ["tenant-a"]
 
 
 @pytest.mark.asyncio
-async def test_hotword_management_sends_user_id(monkeypatch):
+async def test_hotword_management_sends_hotword_pool_id(monkeypatch):
     calls = _install_fake_triton(monkeypatch)
 
-    result = await recall_mod.add_hotwords(["挚音科技"], user_id="tenant-a")
+    result = await recall_mod.add_hotwords(
+        ["挚音科技"],
+        hotword_pool_id="tenant-a",
+    )
 
     assert result["hotwords"] == ["挚音科技"]
     assert calls[0]["inputs"]["ACTION"] == ["add"]
-    assert calls[0]["inputs"]["USER_ID"] == ["tenant-a"]
+    assert calls[0]["inputs"]["HOTWORD_POOL_ID"] == ["tenant-a"]
     assert calls[0]["inputs"]["HOTWORDS"] == ['["挚音科技"]']

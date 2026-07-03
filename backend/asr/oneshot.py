@@ -68,6 +68,7 @@ async def run_oneshot_asr(
     enrollment_b64: str | None = None,
     enrollment_id: str | None = None,
     enrollment_user_id: str | None = None,
+    hotword_pool_id: str | None = None,
     recall_user_id: str | None = None,
 ) -> dict:
     """Transcribe one clip with the configured primary/secondary models.
@@ -93,7 +94,9 @@ async def run_oneshot_asr(
                     prompt_template=cfg.vllm_prompt_template,
                     timeout=cfg.asr_request_timeout,
                     runtime_config=cfg,
-                    recall_user_id=recall_user_id,
+                    hotword_pool_id=hotword_pool_id
+                    if hotword_pool_id is not None
+                    else recall_user_id,
                     enrollment_id=enrollment_id,
                     enrollment_user_id=enrollment_user_id,
                 ),

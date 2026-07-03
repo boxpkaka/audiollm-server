@@ -326,6 +326,7 @@ async def query_audio_model(
     prompt_template: str | None = None,
     timeout: float | None = None,
     runtime_config: Config | None = None,
+    hotword_pool_id: str | None = None,
     recall_user_id: str | None = None,
     enrollment_id: str | None = None,
     enrollment_user_id: str | None = None,
@@ -340,6 +341,7 @@ async def query_audio_model(
     _ = src_lang  # noqa: F841 — preserved for compatibility, see docstring
     cfg = runtime_config or default_config
     template = prompt_template or cfg.vllm_prompt_template
+    resolved_hotword_pool_id = hotword_pool_id or recall_user_id
     request_hotwords = list(hotwords or [])
     effective_hotwords = request_hotwords
     audio_embeds_b64: str | None = None
@@ -374,7 +376,7 @@ async def query_audio_model(
                 cfg,
                 sample_rate=audio_sample_rate,
                 want_audio_embeds=want_bypass,
-                user_id=recall_user_id,
+                hotword_pool_id=resolved_hotword_pool_id,
                 enrollment_id=enrollment_id if want_enrollment_bypass else None,
                 enrollment_user_id=enrollment_user_id if want_enrollment_bypass else None,
                 want_enrollment_audio_embeds=want_enrollment_bypass,
@@ -395,7 +397,9 @@ async def query_audio_model(
             if want_enrollment_bypass and recalled_enrollment_embeds:
                 enrollment_audio_embeds_b64 = recalled_enrollment_embeds
                 enrollment_owner = (
-                    enrollment_user_id or recall_user_id or cfg.recall_user_id
+                    enrollment_user_id
+                    or resolved_hotword_pool_id
+                    or cfg.hotword_pool_id
                 )
                 enrollment_audio_embeds_uuid = (
                     f"triton-enrollment-{enrollment_owner}-{enrollment_id}"

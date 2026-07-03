@@ -54,6 +54,6 @@ def test_enrollment_api_triton_store_does_not_use_local_store(monkeypatch):
     assert payload["duration_sec"] == 1.2
     kwargs = captured["kwargs"]
     assert kwargs["enrollment_id"] == payload["enrollment_id"]
-    assert kwargs["user_id"] == "default"
+    assert kwargs["enrollment_user_id"] == "default"
     assert kwargs["sample_rate"] == SAMPLE_RATE
     assert captured["pcm_len"] == int(SAMPLE_RATE * 1.2)

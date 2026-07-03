@@ -76,6 +76,7 @@ class SessionContext:
     language: str = ""
     src_lang: str = "N/A"
     hotwords: list[str] = field(default_factory=list)
+    hotword_pool_id: str = "default"
     recall_user_id: str = "default"
     # Optional cached target-speaker enrollment (base64 WAV). The session
     # resolves the opaque ``enrollment_id`` once at start / on every
@@ -151,9 +152,13 @@ class StreamingSession:
             language=language,
             src_lang=map_language(language),
             hotwords=[],
+            hotword_pool_id=normalize_recall_user_id(
+                None,
+                default=self.cfg.hotword_pool_id,
+            ),
             recall_user_id=normalize_recall_user_id(
                 None,
-                default=self.cfg.recall_user_id,
+                default=self.cfg.hotword_pool_id,
             ),
             session_id=self.session_id,
             dumper=self._dumper,
@@ -346,12 +351,18 @@ class StreamingSession:
                 self.ctx.cfg = self.cfg
                 self.stream.configure(self.cfg)
 
-        if "user_id" in ctrl:
+        hotword_pool_raw = (
+            ctrl.get("hotword_pool_id")
+            if "hotword_pool_id" in ctrl
+            else ctrl.get("user_id", _SENTINEL)
+        )
+        if hotword_pool_raw is not _SENTINEL:
             try:
-                self.ctx.recall_user_id = normalize_recall_user_id(
-                    ctrl.get("user_id"),
-                    default=self.cfg.recall_user_id,
+                self.ctx.hotword_pool_id = normalize_recall_user_id(
+                    hotword_pool_raw,
+                    default=self.cfg.hotword_pool_id,
                 )
+                self.ctx.recall_user_id = self.ctx.hotword_pool_id
             except RecallUserIdError as exc:
                 await self._send_json(
                     {
@@ -362,10 +373,11 @@ class StreamingSession:
                 )
                 return
         else:
-            self.ctx.recall_user_id = normalize_recall_user_id(
+            self.ctx.hotword_pool_id = normalize_recall_user_id(
                 None,
-                default=self.cfg.recall_user_id,
+                default=self.cfg.hotword_pool_id,
             )
+            self.ctx.recall_user_id = self.ctx.hotword_pool_id
 
         lang_val = str(ctrl.get("language", "")).strip()
         if lang_val:
@@ -385,9 +397,9 @@ class StreamingSession:
         sr = ctrl.get("sample_rate_hz", 16000)
         ch = ctrl.get("channels", 1)
         logger.info(
-            "Start[%s] mode=%s format=%s sr=%s ch=%s language=%s user_id=%s",
+            "Start[%s] mode=%s format=%s sr=%s ch=%s language=%s hotword_pool_id=%s",
             self.engine.name, ctrl.get("mode"), fmt, sr, ch,
-            self.ctx.language, self.ctx.recall_user_id,
+            self.ctx.language, self.ctx.hotword_pool_id,
         )
 
         try:
@@ -397,12 +409,18 @@ class StreamingSession:
 
     async def _handle_update_hotwords(self, ctrl: dict) -> None:
         self.ctx.hotwords = sanitize_hotwords(ctrl.get("hotwords", []))
-        if "user_id" in ctrl:
+        hotword_pool_raw = (
+            ctrl.get("hotword_pool_id")
+            if "hotword_pool_id" in ctrl
+            else ctrl.get("user_id", _SENTINEL)
+        )
+        if hotword_pool_raw is not _SENTINEL:
             try:
-                self.ctx.recall_user_id = normalize_recall_user_id(
-                    ctrl.get("user_id"),
-                    default=self.cfg.recall_user_id,
+                self.ctx.hotword_pool_id = normalize_recall_user_id(
+                    hotword_pool_raw,
+                    default=self.cfg.hotword_pool_id,
                 )
+                self.ctx.recall_user_id = self.ctx.hotword_pool_id
             except RecallUserIdError as exc:
                 await self._send_json(
                     {
@@ -420,11 +438,11 @@ class StreamingSession:
         if "enrollment_id" in ctrl:
             self._apply_enrollment(ctrl.get("enrollment_id"))
         logger.info(
-            "Hotwords updated: %s (src_lang=%s, enrollment=%s, user_id=%s)",
+            "Hotwords updated: %s (src_lang=%s, enrollment=%s, hotword_pool_id=%s)",
             self.ctx.hotwords,
             self.ctx.src_lang,
             self.ctx.enrollment_id,
-            self.ctx.recall_user_id,
+            self.ctx.hotword_pool_id,
         )
 
     def _apply_enrollment(self, raw_id: object) -> None:

@@ -72,9 +72,9 @@ class AsrTaskEngine(BaseTaskEngine):
                     prompt_template=cfg.vllm_prompt_template,
                     timeout=cfg.asr_request_timeout,
                     runtime_config=cfg,
-                    recall_user_id=ctx.recall_user_id,
+                    hotword_pool_id=ctx.hotword_pool_id,
                     enrollment_id=ctx.enrollment_id,
-                    enrollment_user_id=cfg.recall_user_id,
+                    enrollment_user_id=cfg.hotword_pool_id,
                 ),
                 timeout=cfg.primary_asr_timeout,
             )
@@ -193,7 +193,7 @@ class AsrTaskEngine(BaseTaskEngine):
                     prompt_template=cfg.vllm_prompt_template,
                     timeout=cfg.asr_request_timeout,
                     runtime_config=cfg,
-                    recall_user_id=ctx.recall_user_id,
+                    hotword_pool_id=ctx.hotword_pool_id,
                 ),
                 timeout=cfg.primary_asr_timeout,
             )
@@ -337,7 +337,7 @@ class AsrTaskEngine(BaseTaskEngine):
                 "secondary_raw": self._result_raw(secondary_result),
                 "reported_hotwords": reported,
                 "hotwords_snapshot": list(hw_snapshot or []),
-                "recall_user_id": ctx.recall_user_id,
+                "hotword_pool_id": ctx.hotword_pool_id,
             },
             "model": {
                 "vllm_base_url": cfg.vllm_base_url,
@@ -391,9 +391,9 @@ class AsrTaskEngine(BaseTaskEngine):
                         prompt_template=cfg.vllm_prompt_template,
                         timeout=cfg.asr_request_timeout,
                         runtime_config=cfg,
-                        recall_user_id=ctx.recall_user_id,
+                        hotword_pool_id=ctx.hotword_pool_id,
                         enrollment_id=ctx.enrollment_id,
-                        enrollment_user_id=cfg.recall_user_id,
+                        enrollment_user_id=cfg.hotword_pool_id,
                     ),
                     timeout=cfg.primary_asr_timeout,
                 )
