@@ -53,7 +53,9 @@ upstreams:
     timeout: 30
   rag_asr_management:
     # Optional RAG-ASR HTTP management service. Keep empty to preserve the
-    # legacy Triton-management/local-enrollment path.
+    # legacy Triton-management/local-enrollment path. When enabling gray
+    # enrollment embedding store, point this to RAG-ASR serve_http.sh, for
+    # example http://127.0.0.1:18080.
     base_url: ${RAG_ASR_MANAGEMENT_BASE_URL}
     model_name: rag_asr_management
     timeout: 30
