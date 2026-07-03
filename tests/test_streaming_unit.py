@@ -875,7 +875,9 @@ async def test_asr_engine_on_stop_emits_empty_final_when_nothing_sent():
     ctx = SessionContext(cfg=cfg, language="zh", src_lang="Chinese", send_json=_send_json)
     engine = AsrTaskEngine()
     await engine.on_stop(ctx, sent_any_response=False, stopped=True)
-    assert sent == [{"type": "final", "text": "", "language": "zh"}]
+    assert sent == [
+        {"type": "final", "text": "", "language": "zh", "effective_hotwords": []}
+    ]
 
 
 @pytest.mark.asyncio
@@ -915,6 +917,7 @@ async def test_asr_final_preserves_segment_id(monkeypatch):
         return {
             "transcription": "分句结果",
             "detected_language": "zh",
+            "effective_hotwords": ["召回A", "召回B"],
         }
 
     async def fail_secondary(*_args, **_kwargs):
@@ -948,6 +951,7 @@ async def test_asr_final_preserves_segment_id(monkeypatch):
     assert sent[0]["text"] == "分句结果"
     assert sent[0]["language"] == "zh"
     assert sent[0]["id"] == "seg-k2-2"
+    assert sent[0]["effective_hotwords"] == ["召回A", "召回B"]
     assert sent[0]["duration_sec"] == pytest.approx(0.1)
     assert isinstance(sent[0]["audio_b64"], str) and sent[0]["audio_b64"]
 

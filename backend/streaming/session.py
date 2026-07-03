@@ -15,6 +15,8 @@ It does NOT know what "ASR" or "emotion" means; that lives in the engine.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -63,6 +65,18 @@ def map_language(lang_query: str) -> str:
     return "N/A"
 
 
+def _hotwords_log_fields(hotwords: list[str]) -> dict[str, Any]:
+    count = len(hotwords)
+    if count <= 50:
+        return {"hotwords_count": count, "hotwords": list(hotwords)}
+    encoded = json.dumps(hotwords, ensure_ascii=False, separators=(",", ":"))
+    return {
+        "hotwords_count": count,
+        "hotwords_preview": hotwords[:20],
+        "hotwords_hash": hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16],
+    }
+
+
 @dataclass
 class SessionContext:
     """Snapshot of common session state passed to engine callbacks.
@@ -78,6 +92,7 @@ class SessionContext:
     hotwords: list[str] = field(default_factory=list)
     hotword_pool_id: str = "default"
     recall_user_id: str = "default"
+    gateway_trace_id: str = ""
     # Optional cached target-speaker enrollment (base64 WAV). The session
     # resolves the opaque ``enrollment_id`` once at start / on every
     # ``update_hotwords`` and stores the WAV inline so per-segment
@@ -160,6 +175,7 @@ class StreamingSession:
                 None,
                 default=self.cfg.hotword_pool_id,
             ),
+            gateway_trace_id="",
             session_id=self.session_id,
             dumper=self._dumper,
             send_json=self._send_json,
@@ -379,6 +395,18 @@ class StreamingSession:
             )
             self.ctx.recall_user_id = self.ctx.hotword_pool_id
 
+        for key in (
+            "gateway_trace_id",
+            "gateway_session_id",
+            "session_id",
+            "trace_id",
+            "traceId",
+        ):
+            value = str(ctrl.get(key, "") or "").strip()
+            if value:
+                self.ctx.gateway_trace_id = value
+                break
+
         lang_val = str(ctrl.get("language", "")).strip()
         if lang_val:
             self.ctx.language = lang_val
@@ -387,7 +415,6 @@ class StreamingSession:
         hw_raw = ctrl.get("hotwords")
         if isinstance(hw_raw, list):
             self.ctx.hotwords = sanitize_hotwords(hw_raw)
-            logger.info("Hotwords from start: %d items", len(self.ctx.hotwords))
 
         if "enrollment_id" in ctrl:
             self._apply_enrollment(ctrl.get("enrollment_id"))
@@ -397,9 +424,13 @@ class StreamingSession:
         sr = ctrl.get("sample_rate_hz", 16000)
         ch = ctrl.get("channels", 1)
         logger.info(
-            "Start[%s] mode=%s format=%s sr=%s ch=%s language=%s hotword_pool_id=%s",
-            self.engine.name, ctrl.get("mode"), fmt, sr, ch,
-            self.ctx.language, self.ctx.hotword_pool_id,
+            "Start[%s] backend_session_id=%s gateway_trace_id=%s mode=%s "
+            "format=%s sr=%s ch=%s language=%s hotword_pool_id=%s hotwords=%s",
+            self.engine.name,
+            self.session_id,
+            self.ctx.gateway_trace_id or "n/a",
+            ctrl.get("mode"), fmt, sr, ch, self.ctx.language,
+            self.ctx.hotword_pool_id, _hotwords_log_fields(self.ctx.hotwords),
         )
 
         try:
@@ -438,11 +469,14 @@ class StreamingSession:
         if "enrollment_id" in ctrl:
             self._apply_enrollment(ctrl.get("enrollment_id"))
         logger.info(
-            "Hotwords updated: %s (src_lang=%s, enrollment=%s, hotword_pool_id=%s)",
-            self.ctx.hotwords,
+            "Hotwords updated: backend_session_id=%s gateway_trace_id=%s "
+            "src_lang=%s enrollment=%s hotword_pool_id=%s hotwords=%s",
+            self.session_id,
+            self.ctx.gateway_trace_id or "n/a",
             self.ctx.src_lang,
             self.ctx.enrollment_id,
             self.ctx.hotword_pool_id,
+            _hotwords_log_fields(self.ctx.hotwords),
         )
 
     def _apply_enrollment(self, raw_id: object) -> None:

@@ -101,6 +101,7 @@ async def test_query_audio_model_merges_recalled_and_custom_hotwords(monkeypatch
     )
 
     assert result["reported_hotwords"] == ["上灯板", "临时一", "召回A"]
+    assert result["effective_hotwords"] == ["召回A", "上灯板"]
     messages = captured["messages"]
     assert isinstance(messages, list)
     content = messages[0]["content"]

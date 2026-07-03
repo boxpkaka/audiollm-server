@@ -250,6 +250,8 @@ class AstV3Protocol:
                     engine_params,
                 )
             start_ctrl: dict = {"type": "start"}
+            if self.trace_id:
+                start_ctrl["gateway_trace_id"] = self.trace_id
             hotwords = _parse_hotword_text(self._payload_text(payload))
             if hotwords:
                 start_ctrl["hotwords"] = hotwords

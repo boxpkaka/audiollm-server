@@ -1,5 +1,8 @@
+import hashlib
+import json
 import logging
 import re
+import time
 from typing import Any, TypedDict
 
 import numpy as np
@@ -14,6 +17,37 @@ from .recall import recall_audio
 logger = logging.getLogger(__name__)
 
 _CHINESE_WORD_RE = re.compile(r"^[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+$")
+
+
+def _hotwords_hash(words: list[str]) -> str:
+    encoded = json.dumps(words, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
+
+
+def _hotwords_preview(words: list[str], *, limit: int = 50) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "count": len(words),
+        "hotwords": list(words[:limit]),
+    }
+    if len(words) > limit:
+        payload["hotwords_truncated"] = len(words) - limit
+        payload["hotwords_hash"] = _hotwords_hash(words)
+    return payload
+
+
+def hotword_hits_in_text(hotwords: list[str], text: str) -> list[str]:
+    final_text = str(text or "")
+    return [word for word in hotwords if word and word in final_text]
+
+
+def diagnostic_hotword_misses(hotwords: list[str], text: str) -> list[str]:
+    hits = set(hotword_hits_in_text(hotwords, text))
+    misses = [word for word in hotwords if word and word not in hits]
+    return [
+        word
+        for word in misses
+        if len(word) <= 3 or _hotword_pronunciation_key(word) is not None
+    ][:50]
 
 
 class ASRResult(TypedDict):
@@ -330,6 +364,8 @@ async def query_audio_model(
     recall_user_id: str | None = None,
     enrollment_id: str | None = None,
     enrollment_user_id: str | None = None,
+    session_id: str = "",
+    gateway_trace_id: str = "",
 ) -> ASRResult:
     """Primary ASR call.
 
@@ -344,10 +380,14 @@ async def query_audio_model(
     resolved_hotword_pool_id = hotword_pool_id or recall_user_id
     request_hotwords = list(hotwords or [])
     effective_hotwords = request_hotwords
+    recalled_hotwords: list[str] = []
     audio_embeds_b64: str | None = None
     audio_embeds_uuid: str | None = None
     enrollment_audio_embeds_b64: str | None = None
     enrollment_audio_embeds_uuid: str | None = None
+    audio_embeds_bypass_used = False
+    enrollment_embeds_bypass_used = False
+    is_final_path = audio_pcm is not None
 
     if cfg.enable_hotword_recall and audio_pcm is not None:
         # The recall service owns the large per-user pool. Request-local
@@ -368,8 +408,9 @@ async def query_audio_model(
         want_bypass = (
             cfg.enable_encoder_bypass
             and template == "amphion_asr_1.7b"
-            and enrollment_wav_base64 is None
+            and (enrollment_wav_base64 is None)
         )
+        recall_t0 = time.monotonic()
         try:
             recalled = await recall_audio(
                 audio_pcm,
@@ -381,14 +422,17 @@ async def query_audio_model(
                 enrollment_user_id=enrollment_user_id if want_enrollment_bypass else None,
                 want_enrollment_audio_embeds=want_enrollment_bypass,
             )
+            recall_latency_ms = (time.monotonic() - recall_t0) * 1000.0
+            recalled_hotwords = list(recalled.words)
             effective_hotwords = merge_recalled_and_custom_hotwords(
-                recalled.words,
+                recalled_hotwords,
                 request_hotwords,
                 custom_limit=cfg.recall_custom_hotword_limit,
             )
             if want_bypass and recalled.audio_embeds_b64:
                 audio_embeds_b64 = recalled.audio_embeds_b64
                 audio_embeds_uuid = recalled.uuid
+                audio_embeds_bypass_used = True
             recalled_enrollment_embeds = getattr(
                 recalled,
                 "enrollment_audio_embeds_b64",
@@ -404,8 +448,59 @@ async def query_audio_model(
                 enrollment_audio_embeds_uuid = (
                     f"triton-enrollment-{enrollment_owner}-{enrollment_id}"
                 )
+                enrollment_embeds_bypass_used = True
+            logger.info(
+                "ASR recall result: session_id=%s gateway_trace_id=%s "
+                "hotword_pool_id=%s recall_top_k=%d recalled_count=%d "
+                "recalled=%s recall_latency_ms=%.1f "
+                "audio_embeds_requested=%s audio_embeds_returned=%s "
+                "enrollment_embeds_requested=%s enrollment_embeds_returned=%s",
+                session_id or "n/a",
+                gateway_trace_id or "n/a",
+                resolved_hotword_pool_id or cfg.hotword_pool_id,
+                cfg.recall_top_k,
+                len(recalled_hotwords),
+                _hotwords_preview(recalled_hotwords, limit=50),
+                recall_latency_ms,
+                want_bypass,
+                bool(recalled.audio_embeds_b64),
+                want_enrollment_bypass,
+                bool(recalled_enrollment_embeds),
+            )
         except Exception as exc:
-            logger.warning("Triton hotword recall failed; using raw ASR audio: %s", exc)
+            recall_latency_ms = (time.monotonic() - recall_t0) * 1000.0
+            logger.warning(
+                "ASR recall failed: session_id=%s gateway_trace_id=%s "
+                "hotword_pool_id=%s recall_top_k=%d reason=%r "
+                "recall_latency_ms=%.1f",
+                session_id or "n/a",
+                gateway_trace_id or "n/a",
+                resolved_hotword_pool_id or cfg.hotword_pool_id,
+                cfg.recall_top_k,
+                exc,
+                recall_latency_ms,
+            )
+
+    if is_final_path:
+        logger.info(
+            "ASR prompt hotwords: session_id=%s gateway_trace_id=%s "
+            "custom_hotwords_count=%d recalled_hotwords_count=%d "
+            "effective_hotwords_count=%d effective=%s prompt_has_hotwords=%s "
+            "audio_embeds_bypass_requested=%s audio_embeds_bypass_used=%s",
+            session_id or "n/a",
+            gateway_trace_id or "n/a",
+            len(request_hotwords),
+            len(recalled_hotwords),
+            len(effective_hotwords),
+            _hotwords_preview(effective_hotwords, limit=50),
+            bool(effective_hotwords),
+            (
+                cfg.enable_encoder_bypass
+                and template == "amphion_asr_1.7b"
+                and enrollment_wav_base64 is None
+            ),
+            audio_embeds_bypass_used,
+        )
 
     messages = build_primary_messages(
         audio_wav_base64,
@@ -431,6 +526,8 @@ async def query_audio_model(
         if not audio_embeds_b64:
             raise
         logger.warning("Primary ASR audio_embeds request failed; retrying raw audio")
+        audio_embeds_bypass_used = False
+        enrollment_embeds_bypass_used = False
         fallback_messages = build_primary_messages(
             audio_wav_base64,
             hotwords=effective_hotwords,
@@ -445,6 +542,29 @@ async def query_audio_model(
         )
     if effective_hotwords:
         result["reported_hotwords"] = effective_hotwords
+    if is_final_path:
+        result["effective_hotwords"] = list(recalled_hotwords)
+        text = str(result.get("transcription") or "")
+        hits = hotword_hits_in_text(effective_hotwords, text)
+        logger.info(
+            "ASR model final diagnostic: session_id=%s gateway_trace_id=%s "
+            "final_text=%r effective_hotwords_count=%d "
+            "effective_hotword_hits=%s audio_embeds_bypass_used=%s",
+            session_id or "n/a",
+            gateway_trace_id or "n/a",
+            text,
+            len(effective_hotwords),
+            hits,
+            audio_embeds_bypass_used or enrollment_embeds_bypass_used,
+        )
+        misses = diagnostic_hotword_misses(effective_hotwords, text)
+        if misses:
+            logger.warning(
+                "ASR hotword miss: session_id=%s gateway_trace_id=%s hotword_miss=%s",
+                session_id or "n/a",
+                gateway_trace_id or "n/a",
+                misses,
+            )
     return result
 
 

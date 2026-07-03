@@ -718,6 +718,7 @@ async def asr_upload(
         "text": asr_result["text"],
         "language": asr_result["language"],
         "duration_sec": round(duration_sec, 3),
+        "effective_hotwords": list(asr_result.get("effective_hotwords") or []),
         "enrollment_used": enrollment_b64 is not None or triton_enrollment_id is not None,
     }
 

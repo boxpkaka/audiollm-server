@@ -118,6 +118,7 @@ async def test_asr_upload_passes_hotword_pool_id(monkeypatch):
         return {
             "transcription": "上传结果",
             "reported_hotwords": [],
+            "effective_hotwords": ["召回上传"],
             "raw_text": "上传结果",
             "detected_language": "zh",
         }
@@ -134,6 +135,7 @@ async def test_asr_upload_passes_hotword_pool_id(monkeypatch):
 
     assert result["type"] == "final"
     assert result["text"] == "上传结果"
+    assert result["effective_hotwords"] == ["召回上传"]
 
 
 @pytest.mark.asyncio
