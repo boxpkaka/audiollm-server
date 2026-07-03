@@ -51,6 +51,10 @@ upstreams:
     base_url: http://localhost:10001
     model_name: rag_asr_retrieve
     timeout: 30
+  rag_asr_management:
+    base_url: ${RAG_ASR_MANAGEMENT_BASE_URL}
+    model_name: rag_asr_management
+    timeout: 30
 
 # 全局默认 tuning; 端点的 policy 可逐项软覆盖, lock 可硬锁定。
 # 注: base_url/model/timeout 属 upstreams, 不在此; 这里只放纯调参。
@@ -148,6 +152,7 @@ defaults:
 services:
   hotword: hotword_llm
   recall: triton_recall
+  recall_management: rag_asr_management
   text_cleanup: dashscope_cleanup
 
 # REST/HTTP 路由的上游绑定: upstreams 是所有 REST 接口的共享默认,

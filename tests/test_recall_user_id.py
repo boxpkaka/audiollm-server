@@ -74,6 +74,35 @@ class _FakeClient:
         return _FakeResult()
 
 
+class _FakeHttpResponse:
+    def __init__(self, data: dict[str, object]) -> None:
+        self._data = data
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, object]:
+        return self._data
+
+
+class _FakeManagementClient:
+    def __init__(self, calls: list[dict[str, object]], timeout: float) -> None:
+        self.calls = calls
+        self.timeout = timeout
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args) -> None:
+        return None
+
+    def post(self, url: str, **kwargs):
+        self.calls.append({"method": "POST", "url": url, **kwargs})
+        return _FakeHttpResponse(
+            {"status": "ok", "hotwords": ["挚音科技"], "total_count": 1}
+        )
+
+
 def _install_fake_triton(monkeypatch) -> list[dict[str, object]]:
     calls: list[dict[str, object]] = []
     upstream = Upstream(
@@ -129,3 +158,31 @@ async def test_hotword_management_sends_hotword_pool_id(monkeypatch):
     assert payload["action"] == "add"
     assert payload["hotword_pool_id"] == "tenant-a"
     assert payload["hotwords"] == ["挚音科技"]
+
+
+@pytest.mark.asyncio
+async def test_hotword_management_uses_http_management_when_configured(monkeypatch):
+    calls: list[dict[str, object]] = []
+    upstream = Upstream(
+        name="recall_management",
+        base_url="http://localhost:18080",
+        model_name="rag_asr_management",
+        timeout=7,
+    )
+    monkeypatch.setattr(recall_mod, "_management_upstream", lambda: upstream)
+    monkeypatch.setattr(
+        recall_mod.httpx,
+        "Client",
+        lambda timeout: _FakeManagementClient(calls, timeout),
+    )
+
+    result = await recall_mod.add_hotwords(["挚音科技"], hotword_pool_id="tenant-a")
+
+    assert result["status"] == "ok"
+    assert calls == [
+        {
+            "method": "POST",
+            "url": "http://localhost:18080/hotword-pool",
+            "json": {"hotword_pool_id": "tenant-a", "hotwords": ["挚音科技"]},
+        }
+    ]

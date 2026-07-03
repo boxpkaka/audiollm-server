@@ -15,6 +15,7 @@ import json
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
+import httpx
 import numpy as np
 
 from ..config import Config, Upstream, get_service_upstream
@@ -61,6 +62,17 @@ def _recall_upstream() -> Upstream:
     if upstream is None or not upstream.base_url:
         raise RuntimeError("Triton recall service is not configured")
     return upstream
+
+
+def _management_upstream() -> Upstream | None:
+    upstream = get_service_upstream("recall_management")
+    if upstream is None or not upstream.base_url:
+        return None
+    return upstream
+
+
+def _management_url(upstream: Upstream, path: str) -> str:
+    return f"{upstream.base_url.rstrip('/')}/{path.lstrip('/')}"
 
 
 def _client_for(upstream: Upstream):
@@ -223,6 +235,47 @@ def _enrollment_sync(
     pcm: np.ndarray | None = None,
     sample_rate: int = SAMPLE_RATE,
 ) -> dict[str, object]:
+    management = _management_upstream()
+    if management is not None:
+        resolved_enrollment_user_id = normalize_hotword_pool_id(
+            enrollment_user_id if enrollment_user_id is not None else user_id,
+            default=DEFAULT_HOTWORD_POOL_ID,
+        )
+        with httpx.Client(timeout=management.timeout) as client:
+            if action == "upsert_enrollment":
+                if pcm is None:
+                    raise ValueError("pcm is required for upsert_enrollment")
+                wav = np.asarray(pcm, dtype=np.float32).reshape(-1)
+                response = client.post(
+                    _management_url(management, f"/enrollments/{enrollment_id}"),
+                    data={
+                        "enrollment_user_id": resolved_enrollment_user_id,
+                        "sample_rate": str(int(sample_rate)),
+                    },
+                    files={
+                        "file": (
+                            "audio.f32",
+                            wav.tobytes(),
+                            "application/octet-stream",
+                        )
+                    },
+                )
+            elif action == "get_enrollment":
+                response = client.get(
+                    _management_url(management, f"/enrollments/{enrollment_id}"),
+                    params={"enrollment_user_id": resolved_enrollment_user_id},
+                )
+            elif action == "delete_enrollment":
+                response = client.delete(
+                    _management_url(management, f"/enrollments/{enrollment_id}"),
+                    params={"enrollment_user_id": resolved_enrollment_user_id},
+                )
+            else:
+                raise ValueError(f"unknown enrollment action: {action}")
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, dict) else {"status": "ok", "data": data}
+
     upstream = _recall_upstream()
     httpclient, client = _client_for(upstream)
     resolved_enrollment_user_id = normalize_hotword_pool_id(
@@ -321,6 +374,51 @@ def _management_sync(
     hotword_pool_id: str | None = None,
     user_id: str | None = None,
 ) -> dict[str, object]:
+    management = _management_upstream()
+    if management is not None:
+        resolved_hotword_pool_id = normalize_hotword_pool_id(
+            hotword_pool_id if hotword_pool_id is not None else user_id,
+            default=DEFAULT_HOTWORD_POOL_ID,
+        )
+        with httpx.Client(timeout=management.timeout) as client:
+            if action == "list":
+                response = client.get(
+                    _management_url(management, "/hotword-pool"),
+                    params={
+                        "hotword_pool_id": resolved_hotword_pool_id,
+                        "query": query,
+                        "limit": limit,
+                        "offset": offset,
+                    },
+                )
+            elif action == "add":
+                response = client.post(
+                    _management_url(management, "/hotword-pool"),
+                    json={
+                        "hotword_pool_id": resolved_hotword_pool_id,
+                        "hotwords": hotwords or [],
+                    },
+                )
+            elif action == "delete":
+                response = client.request(
+                    "DELETE",
+                    _management_url(management, "/hotword-pool"),
+                    json={
+                        "hotword_pool_id": resolved_hotword_pool_id,
+                        "hotwords": hotwords or [],
+                    },
+                )
+            elif action == "reload":
+                response = client.post(
+                    _management_url(management, "/hotword-pool/reload"),
+                    json={"hotword_pool_id": resolved_hotword_pool_id},
+                )
+            else:
+                raise ValueError(f"unknown hotword action: {action}")
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, dict) else {"status": "ok", "data": data}
+
     upstream = _recall_upstream()
     httpclient, client = _client_for(upstream)
     resolved_hotword_pool_id = normalize_hotword_pool_id(
