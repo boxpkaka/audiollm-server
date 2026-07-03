@@ -102,7 +102,7 @@ def _infer_sync(
     wav_input = httpclient.InferInput("WAV", wav.shape, "FP32")
     inputs = [
         _string_input(httpclient, "ACTION", "infer"),
-        _string_input(httpclient, "HOTWORD_POOL_ID", hotword_pool_id),
+        _string_input(httpclient, "USER_ID", hotword_pool_id),
         wav_input,
         _int_input(httpclient, "SAMPLE_RATE", sample_rate),
         _int_input(httpclient, "TOP_K", top_k),
@@ -307,7 +307,7 @@ def _management_sync(
     )
     inputs = [
         _string_input(httpclient, "ACTION", action),
-        _string_input(httpclient, "HOTWORD_POOL_ID", resolved_hotword_pool_id),
+        _string_input(httpclient, "USER_ID", resolved_hotword_pool_id),
     ]
     if hotwords is not None:
         inputs.append(

@@ -98,7 +98,7 @@ async def test_recall_audio_sends_hotword_pool_id(monkeypatch):
     )
 
     assert result.words == ["挚音科技"]
-    assert calls[0]["inputs"]["HOTWORD_POOL_ID"] == ["tenant-a"]
+    assert calls[0]["inputs"]["USER_ID"] == ["tenant-a"]
 
 
 @pytest.mark.asyncio
@@ -112,5 +112,5 @@ async def test_hotword_management_sends_hotword_pool_id(monkeypatch):
 
     assert result["hotwords"] == ["挚音科技"]
     assert calls[0]["inputs"]["ACTION"] == ["add"]
-    assert calls[0]["inputs"]["HOTWORD_POOL_ID"] == ["tenant-a"]
+    assert calls[0]["inputs"]["USER_ID"] == ["tenant-a"]
     assert calls[0]["inputs"]["HOTWORDS"] == ['["挚音科技"]']
