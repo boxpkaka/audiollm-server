@@ -9,6 +9,7 @@ operations.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 from dataclasses import dataclass
@@ -80,6 +81,12 @@ def _int_input(httpclient, name: str, value: int):
     return tensor
 
 
+def _control_request_id(payload: dict[str, object]) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    return f"ctl:{encoded}"
+
+
 def _model_name(upstream: Upstream) -> str:
     return upstream.model_name or DEFAULT_RECALL_MODEL
 
@@ -100,19 +107,21 @@ def _infer_sync(
     httpclient, client = _client_for(upstream)
     wav = np.asarray(pcm, dtype=np.float32).reshape(-1)
     wav_input = httpclient.InferInput("WAV", wav.shape, "FP32")
+    control: dict[str, object] = {
+        "action": "infer",
+        "hotword_pool_id": hotword_pool_id,
+    }
+    if enrollment_id:
+        control["enrollment_id"] = enrollment_id
+    if enrollment_user_id:
+        control["enrollment_user_id"] = enrollment_user_id
     inputs = [
-        _string_input(httpclient, "ACTION", "infer"),
-        _string_input(httpclient, "USER_ID", hotword_pool_id),
         wav_input,
         _int_input(httpclient, "SAMPLE_RATE", sample_rate),
         _int_input(httpclient, "TOP_K", top_k),
     ]
     if not enable_hotword_recall:
         inputs.append(_int_input(httpclient, "ENABLE_HOTWORD_RECALL", 0))
-    if enrollment_id:
-        inputs.append(_string_input(httpclient, "ENROLLMENT_ID", enrollment_id))
-    if enrollment_user_id:
-        inputs.append(_string_input(httpclient, "ENROLLMENT_USER_ID", enrollment_user_id))
     if want_enrollment_audio_embeds:
         inputs.append(_int_input(httpclient, "WANT_ENROLLMENT_AUDIO_EMBEDS", 1))
     wav_input.set_data_from_numpy(wav)
@@ -132,7 +141,12 @@ def _infer_sync(
             ]
         )
 
-    result = client.infer(_model_name(upstream), inputs, outputs=outputs)
+    result = client.infer(
+        _model_name(upstream),
+        inputs,
+        outputs=outputs,
+        request_id=_control_request_id(control),
+    )
     words = json.loads(_decode(result.as_numpy("WORD_LIST")[0]))
     projector_len = int(result.as_numpy("PROJECTOR_LEN")[0])
     audio_embeds_b64 = None
@@ -215,23 +229,31 @@ def _enrollment_sync(
         enrollment_user_id if enrollment_user_id is not None else user_id,
         default=DEFAULT_HOTWORD_POOL_ID,
     )
-    inputs = [
-        _string_input(httpclient, "ACTION", action),
-        _string_input(httpclient, "ENROLLMENT_USER_ID", resolved_enrollment_user_id),
-        _string_input(httpclient, "ENROLLMENT_ID", enrollment_id),
-    ]
+    control: dict[str, object] = {
+        "action": action,
+        "enrollment_id": enrollment_id,
+        "enrollment_user_id": resolved_enrollment_user_id,
+    }
+    inputs = []
     if pcm is not None:
         wav = np.asarray(pcm, dtype=np.float32).reshape(-1)
         wav_input = httpclient.InferInput("WAV", wav.shape, "FP32")
         wav_input.set_data_from_numpy(wav)
         inputs.extend([wav_input, _int_input(httpclient, "SAMPLE_RATE", sample_rate)])
+    else:
+        inputs.append(_int_input(httpclient, "OFFSET", 0))
     outputs = [
         httpclient.InferRequestedOutput("STATUS"),
         httpclient.InferRequestedOutput("MESSAGE"),
         httpclient.InferRequestedOutput("HOTWORD_COUNT"),
         httpclient.InferRequestedOutput("HOTWORD_LIST"),
     ]
-    result = client.infer(_model_name(upstream), inputs, outputs=outputs)
+    result = client.infer(
+        _model_name(upstream),
+        inputs,
+        outputs=outputs,
+        request_id=_control_request_id(control),
+    )
     status = _decode(result.as_numpy("STATUS")[0])
     message_raw = _decode(result.as_numpy("MESSAGE")[0])
     message = json.loads(message_raw) if message_raw else {}
@@ -305,20 +327,15 @@ def _management_sync(
         hotword_pool_id if hotword_pool_id is not None else user_id,
         default=DEFAULT_HOTWORD_POOL_ID,
     )
-    inputs = [
-        _string_input(httpclient, "ACTION", action),
-        _string_input(httpclient, "USER_ID", resolved_hotword_pool_id),
-    ]
+    control: dict[str, object] = {
+        "action": action,
+        "hotword_pool_id": resolved_hotword_pool_id,
+    }
     if hotwords is not None:
-        inputs.append(
-            _string_input(
-                httpclient,
-                "HOTWORDS",
-                json.dumps(hotwords, ensure_ascii=False),
-            )
-        )
+        control["hotwords"] = hotwords
     if query:
-        inputs.append(_string_input(httpclient, "QUERY", query))
+        control["query"] = query
+    inputs = []
     if limit is not None:
         inputs.append(_int_input(httpclient, "LIMIT", limit))
     inputs.append(_int_input(httpclient, "OFFSET", offset))
@@ -329,7 +346,12 @@ def _management_sync(
         httpclient.InferRequestedOutput("HOTWORD_COUNT"),
         httpclient.InferRequestedOutput("HOTWORD_LIST"),
     ]
-    result = client.infer(_model_name(upstream), inputs, outputs=outputs)
+    result = client.infer(
+        _model_name(upstream),
+        inputs,
+        outputs=outputs,
+        request_id=_control_request_id(control),
+    )
     status = _decode(result.as_numpy("STATUS")[0])
     message_raw = _decode(result.as_numpy("MESSAGE")[0])
     hotwords_raw = _decode(result.as_numpy("HOTWORD_LIST")[0])

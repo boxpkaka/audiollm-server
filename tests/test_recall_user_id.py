@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 import sys
 from pathlib import Path
 
@@ -54,7 +56,7 @@ class _FakeClient:
     def __init__(self, calls: list[dict[str, object]]) -> None:
         self.calls = calls
 
-    def infer(self, model_name: str, inputs, outputs=None):
+    def infer(self, model_name: str, inputs, outputs=None, request_id="", parameters=None):
         self.calls.append(
             {
                 "model_name": model_name,
@@ -65,6 +67,8 @@ class _FakeClient:
                     for item in inputs
                 },
                 "outputs": outputs,
+                "request_id": request_id,
+                "parameters": parameters or {},
             }
         )
         return _FakeResult()
@@ -86,6 +90,16 @@ def _install_fake_triton(monkeypatch) -> list[dict[str, object]]:
     return calls
 
 
+def _control_payload(call: dict[str, object]) -> dict[str, object]:
+    request_id = call["request_id"]
+    assert request_id.startswith("ctl:")
+    encoded = request_id[4:]
+    raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+    payload = json.loads(raw.decode("utf-8"))
+    assert isinstance(payload, dict)
+    return payload
+
+
 @pytest.mark.asyncio
 async def test_recall_audio_sends_hotword_pool_id(monkeypatch):
     calls = _install_fake_triton(monkeypatch)
@@ -98,7 +112,7 @@ async def test_recall_audio_sends_hotword_pool_id(monkeypatch):
     )
 
     assert result.words == ["挚音科技"]
-    assert calls[0]["inputs"]["USER_ID"] == ["tenant-a"]
+    assert _control_payload(calls[0])["hotword_pool_id"] == "tenant-a"
 
 
 @pytest.mark.asyncio
@@ -111,6 +125,7 @@ async def test_hotword_management_sends_hotword_pool_id(monkeypatch):
     )
 
     assert result["hotwords"] == ["挚音科技"]
-    assert calls[0]["inputs"]["ACTION"] == ["add"]
-    assert calls[0]["inputs"]["USER_ID"] == ["tenant-a"]
-    assert calls[0]["inputs"]["HOTWORDS"] == ['["挚音科技"]']
+    payload = _control_payload(calls[0])
+    assert payload["action"] == "add"
+    assert payload["hotword_pool_id"] == "tenant-a"
+    assert payload["hotwords"] == ["挚音科技"]
