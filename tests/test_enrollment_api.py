@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import base64
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 from fastapi.testclient import TestClient
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -21,6 +24,43 @@ def _wav_bytes(seconds: float = 1.2) -> bytes:
     t = np.arange(n, dtype=np.float32) / SAMPLE_RATE
     pcm = 0.2 * np.sin(2 * np.pi * 440 * t)
     return base64.b64decode(pcm_to_wav_base64(pcm.astype(np.float32)))
+
+
+def _pcm_bytes(seconds: float = 1.2) -> bytes:
+    n = int(SAMPLE_RATE * seconds)
+    t = np.arange(n, dtype=np.float32) / SAMPLE_RATE
+    pcm = 0.2 * np.sin(2 * np.pi * 440 * t)
+    return np.clip(pcm * 32767, -32768, 32767).astype(np.int16).tobytes()
+
+
+def _mp3_bytes(seconds: float = 1.2) -> bytes:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        pytest.skip("ffmpeg is not installed")
+    proc = subprocess.run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-f",
+            "wav",
+            "-i",
+            "pipe:0",
+            "-f",
+            "mp3",
+            "pipe:1",
+        ],
+        input=_wav_bytes(seconds),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=30,
+    )
+    if proc.returncode != 0:
+        pytest.skip(f"ffmpeg mp3 encode failed: {proc.stderr.decode(errors='replace')}")
+    return proc.stdout
 
 
 def test_enrollment_api_triton_store_does_not_use_local_store(monkeypatch):
@@ -57,3 +97,29 @@ def test_enrollment_api_triton_store_does_not_use_local_store(monkeypatch):
     assert kwargs["enrollment_user_id"] == "default"
     assert kwargs["sample_rate"] == SAMPLE_RATE
     assert captured["pcm_len"] == int(SAMPLE_RATE * 1.2)
+
+
+def test_enrollment_api_accepts_raw_pcm(monkeypatch):
+    monkeypatch.setattr(main_mod, "load_config", lambda: Config())
+    with TestClient(main_mod.app) as client:
+        resp = client.post(
+            "/api/asr/enrollment",
+            files={"audio": ("speaker.pcm", _pcm_bytes(), "audio/pcm")},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["duration_sec"] == 1.2
+
+
+def test_enrollment_api_accepts_mp3(monkeypatch):
+    monkeypatch.setattr(main_mod, "load_config", lambda: Config())
+    with TestClient(main_mod.app) as client:
+        resp = client.post(
+            "/api/asr/enrollment",
+            files={"audio": ("speaker.mp3", _mp3_bytes(), "audio/mpeg")},
+        )
+
+    assert resp.status_code == 200
+    # MP3 decoder output includes codec delay/padding, so assert it lands in
+    # the valid enrollment window rather than requiring sample-exact duration.
+    assert 1.0 <= resp.json()["duration_sec"] <= 1.5

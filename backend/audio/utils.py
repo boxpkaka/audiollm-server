@@ -1,6 +1,8 @@
 import base64
 import io
+import shutil
 import struct
+import subprocess
 import wave
 
 import numpy as np
@@ -187,3 +189,57 @@ def wav_bytes_to_pcm_16k_mono(wav_bytes: bytes) -> np.ndarray:
         return Resampler48to16().process(samples.astype(np.float32))
 
     return _resample_linear(samples.astype(np.float32), framerate, 16000)
+
+
+def pcm_s16le_bytes_to_pcm_16k_mono(pcm_bytes: bytes) -> np.ndarray:
+    """Decode raw 16 kHz mono signed-16-bit little-endian PCM bytes."""
+    if not pcm_bytes:
+        raise ValueError("Empty PCM payload")
+    usable = len(pcm_bytes) - (len(pcm_bytes) % 2)
+    if usable <= 0:
+        return np.empty(0, dtype=np.float32)
+    samples = np.frombuffer(pcm_bytes[:usable], dtype=np.int16)
+    return samples.astype(np.float32) / 32768.0
+
+
+def mp3_bytes_to_pcm_16k_mono(mp3_bytes: bytes) -> np.ndarray:
+    """Decode MP3 bytes to float32 mono PCM at 16 kHz using ffmpeg."""
+    if not mp3_bytes:
+        raise ValueError("Empty MP3 payload")
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise ValueError("ffmpeg is required to decode MP3 enrollment audio")
+    try:
+        proc = subprocess.run(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-i",
+                "pipe:0",
+                "-f",
+                "f32le",
+                "-acodec",
+                "pcm_f32le",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "pipe:1",
+            ],
+            input=mp3_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError("MP3 decode timed out") from exc
+    if proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", errors="replace").strip()
+        raise ValueError(f"Invalid MP3 payload: {detail or 'ffmpeg failed'}")
+    if not proc.stdout:
+        return np.empty(0, dtype=np.float32)
+    return np.frombuffer(proc.stdout, dtype=np.float32).astype(np.float32, copy=True)

@@ -14,6 +14,7 @@ import base64
 import json
 
 import websockets
+from websockets.exceptions import ConnectionClosed
 
 from audio_common import chunk_bytes, make_ssl_context, read_audio_as_pcm
 
@@ -108,31 +109,34 @@ async def main_async(args: argparse.Namespace) -> None:
 
 
 async def receive_messages(ws) -> None:
-    async for raw in ws:
-        try:
-            msg = json.loads(raw)
-        except (TypeError, json.JSONDecodeError):
-            print(f"<- binary {len(raw)} bytes")
-            continue
+    try:
+        async for raw in ws:
+            try:
+                msg = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                print(f"<- binary {len(raw)} bytes")
+                continue
 
-        header = msg.get("header", {})
-        if header.get("code", 0) != 0:
-            print(f"<- error code={header.get('code')}: {header.get('message', '')}")
-            return
-        result = msg.get("payload", {}).get("result", {})
-        words = "".join(
-            cw.get("w", "")
-            for item in (result.get("ws") or [])
-            for cw in (item.get("cw") or [])
-        )
-        if header.get("status") == 2 and not result.get("ws"):
-            print(f"<- end (sid={header.get('sid')})")
-        elif result.get("msgtype") == "sentence":
-            print(f"<- final: {words} (bg={result.get('bg')}ms ed={result.get('ed')}ms)")
-        elif result.get("msgtype") == "Progressive":
-            print(f"<- partial: {words}")
-        else:
-            print(f"<- {json.dumps(msg, ensure_ascii=False)}")
+            header = msg.get("header", {})
+            if header.get("code", 0) != 0:
+                print(f"<- error code={header.get('code')}: {header.get('message', '')}")
+                return
+            result = msg.get("payload", {}).get("result", {})
+            words = "".join(
+                cw.get("w", "")
+                for item in (result.get("ws") or [])
+                for cw in (item.get("cw") or [])
+            )
+            if header.get("status") == 2 and not result.get("ws"):
+                print(f"<- end (sid={header.get('sid')})")
+            elif result.get("msgtype") == "sentence":
+                print(f"<- final: {words} (bg={result.get('bg')}ms ed={result.get('ed')}ms)")
+            elif result.get("msgtype") == "Progressive":
+                print(f"<- partial: {words}")
+            else:
+                print(f"<- {json.dumps(msg, ensure_ascii=False)}")
+    except ConnectionClosed:
+        pass
 
 
 def parse_args() -> argparse.Namespace:

@@ -302,13 +302,13 @@ python docs/examples/rest_upload.py asr sample.wav \
 
 ## 目标说话人注册接口
 
-`POST /api/asr/enrollment` 上传一段 1-8 秒的目标说话人音频。默认配置下服务端把音频规范化为 16 kHz mono WAV、写入进程内缓存，并返回不透明的 `enrollment_id`；当 `enable_triton_enrollment_store=true` 且配置了 RAG-ASR 管理服务时，新注册音频会临时转发给 RAG-ASR 保存 embedding tensor 和元数据，本服务不再持久化注册人原始音频。后续 WebSocket `start` / `update_hotwords` 或 `/api/asr/upload` 携带该 id 时，主模型 prompt 自动切换为 TS-ASR 双音频形态（先 enrollment 后 target），具体文本位置由服务端 `prompt_template` 随模型选择。
+`POST /api/asr/enrollment` 上传一段 1-8 秒的目标说话人音频，支持 WAV、MP3 和 raw PCM（16 kHz mono s16le）。默认配置下服务端把音频规范化为 16 kHz mono WAV、写入进程内缓存，并返回不透明的 `enrollment_id`；当 `enable_triton_enrollment_store=true` 且配置了 RAG-ASR 管理服务时，新注册音频会临时转发给 RAG-ASR 保存 embedding tensor 和元数据，本服务不再持久化注册人原始音频。后续 WebSocket `start` / `update_hotwords` 或 `/api/asr/upload` 携带该 id 时，主模型 prompt 自动切换为 TS-ASR 双音频形态（先 enrollment 后 target），具体文本位置由服务端 `prompt_template` 随模型选择。
 
 ### 请求
 
 | 表单字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `audio` | file | 是 | 任意浏览器可解码的音频；服务端解码为 16 kHz mono 并尾截到 8 秒以内 |
+| `audio` | file | 是 | WAV、MP3 或 raw PCM；raw PCM 必须是 16 kHz mono s16le，建议使用 `.pcm`/`.raw` 后缀或 `audio/pcm` content type；服务端解码为 16 kHz mono 并尾截到 8 秒以内 |
 
 ### 成功响应
 
@@ -343,7 +343,8 @@ HTTP 400，`detail` 为结构化对象：
 |---|---|
 | empty | 上传体为空或解码后没有音频帧 |
 | too_short | 音频时长不足 `asr_enrollment_min_sec`（默认 1.0 秒） |
-| decode_failed | WAV 容器损坏或解码失败 |
+| unsupported_format | 不是 WAV/MP3/raw PCM |
+| decode_failed | 容器损坏或解码失败 |
 
 时长超过上限不会拒绝，服务端会自动尾截到 `asr_enrollment_max_sec`（默认 8.0 秒）。
 

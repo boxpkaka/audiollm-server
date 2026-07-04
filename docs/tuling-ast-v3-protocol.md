@@ -216,7 +216,7 @@ TS-ASR 注册参数（约束注册接口的时长校验与缓存 TTL）：
 
 支持只转写指定说话人的语音，复用与 `/transcribe-streaming` 相同的注册机制，分两步：
 
-1. 注册：通过 `POST /api/asr/enrollment` 上传 1-8 秒目标说话人音频，拿到 `enrollment_id`（见 [API 总览](api-reference.md) 的注册接口）。默认本地缓存注册音频；灰度打开 `enable_triton_enrollment_store=true` 且配置 RAG-ASR 管理服务后，新注册音频会转发给 RAG-ASR 保存 embedding tensor 和元数据。
+1. 注册：通过 `POST /api/asr/enrollment` 上传 1-8 秒目标说话人音频，支持 WAV、MP3 和 raw PCM（16 kHz mono s16le），拿到 `enrollment_id`（见 [API 总览](api-reference.md) 的注册接口）。默认本地缓存注册音频；灰度打开 `enable_triton_enrollment_store=true` 且配置 RAG-ASR 管理服务后，新注册音频会转发给 RAG-ASR 保存 embedding tensor 和元数据。
 2. 携带：在首帧（status=0）把该 id 放进 `header.resIdList`，服务端取 `resIdList[0]` 作为目标说话人。
 
 ```json
@@ -397,6 +397,7 @@ python docs/examples/ws_ast_v3.py sample.wav \
 
 ```bash
 curl -X POST http://172.16.0.3:8080/api/asr/enrollment -F "audio=@speaker_enroll.wav"
+# 也支持 speaker_enroll.mp3；raw PCM 请使用 16 kHz mono s16le。
 # {"enrollment_id": "ule8QilVjZql30Q9oy9kiQ", "duration_sec": 3.0}
 
 python docs/examples/ws_ast_v3.py sample.wav \

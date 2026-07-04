@@ -23,7 +23,7 @@ from starlette.types import Receive, Scope, Send
 
 from .asr.enrollment import (
     EnrollmentError,
-    decode_and_validate,
+    decode_and_validate_audio_bytes,
     get_enrollment_store,
 )
 from .asr.jobs import get_transcription_job_store
@@ -337,6 +337,37 @@ def _wav_to_pcm_capped(raw: bytes, max_seconds: float) -> tuple[bytes, np.ndarra
     return new_bytes, pcm.astype(np.float32, copy=False), duration
 
 
+def _infer_enrollment_audio_format(audio: UploadFile, raw: bytes) -> str:
+    """Resolve the supported enrollment upload format.
+
+    PCM has no container metadata, so callers must identify it by file suffix
+    or content type. WAV/MP3 can also be detected by their common magic bytes.
+    """
+    filename = (audio.filename or "").lower()
+    content_type = (audio.content_type or "").split(";", 1)[0].strip().lower()
+    suffix = Path(filename).suffix.lower().lstrip(".")
+    if suffix in {"wav", "wave", "mp3", "pcm", "raw", "s16le"}:
+        return "wav" if suffix == "wave" else suffix
+    if content_type in {"audio/wav", "audio/wave", "audio/x-wav"}:
+        return "wav"
+    if content_type in {"audio/mpeg", "audio/mp3"}:
+        return "mp3"
+    if content_type in {
+        "audio/pcm",
+        "audio/l16",
+        "audio/x-raw",
+        "application/octet-stream+pcm",
+    }:
+        return "pcm"
+    if raw.startswith(b"RIFF") and raw[8:12] == b"WAVE":
+        return "wav"
+    if raw.startswith(b"ID3") or (
+        len(raw) >= 2 and raw[0] == 0xFF and (raw[1] & 0xE0) == 0xE0
+    ):
+        return "mp3"
+    return ""
+
+
 def _emotion_result_payload(
     result: object,
     *,
@@ -461,11 +492,11 @@ async def asr_enrollment_create(audio: UploadFile = File(...)):
     re-decoding on every segment.
     """
     raw = await _read_audio_bytes(audio)
-    wav_b64 = base64.b64encode(raw).decode("ascii")
     cfg = load_config()
     try:
-        canonical_b64, duration_sec = decode_and_validate(
-            wav_b64,
+        canonical_b64, duration_sec = decode_and_validate_audio_bytes(
+            raw,
+            audio_format=_infer_enrollment_audio_format(audio, raw),
             min_sec=cfg.asr_enrollment_min_sec,
             max_sec=cfg.asr_enrollment_max_sec,
         )

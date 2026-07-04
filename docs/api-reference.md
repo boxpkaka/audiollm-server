@@ -249,6 +249,7 @@ curl -X POST http://172.16.0.3:8080/api/asr/transcriptions \
 ```bash
 curl -X POST http://172.16.0.3:8080/api/asr/enrollment \
   -F "audio=@speaker_enroll.wav"
+# 也支持 speaker_enroll.mp3；raw PCM 请按 16 kHz mono s16le 上传并使用 .pcm 后缀。
 ```
 
 响应：
@@ -262,7 +263,7 @@ curl -X POST http://172.16.0.3:8080/api/asr/enrollment \
 
 #### 请求约束
 
-音频为 WAV，服务端解码为 16 kHz mono。短于 `asr_enrollment_min_sec`（默认 1.0 秒）返回 400 且 `detail.code=too_short`；长于 `asr_enrollment_max_sec`（默认 8.0 秒）不拒绝，服务端尾截到上限。上传体为空或解码后无音频返回 `detail.code=empty`，WAV 损坏或解码失败返回 `detail.code=decode_failed`。
+音频支持 WAV、MP3 和 raw PCM。WAV/MP3 会解码并规范化为 16 kHz mono，其中 MP3 解码依赖服务运行环境可执行 `ffmpeg`；raw PCM 必须是 16 kHz mono s16le，服务端按文件后缀 `.pcm`/`.raw` 或 `audio/pcm` 等 content type 识别，不从裸字节猜测。短于 `asr_enrollment_min_sec`（默认 1.0 秒）返回 400 且 `detail.code=too_short`；长于 `asr_enrollment_max_sec`（默认 8.0 秒）不拒绝，服务端尾截到上限。上传体为空或解码后无音频返回 `detail.code=empty`，格式不在支持范围返回 `detail.code=unsupported_format`，容器损坏或解码失败返回 `detail.code=decode_failed`。
 
 #### 生命周期
 
