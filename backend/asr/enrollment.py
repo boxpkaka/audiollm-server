@@ -36,6 +36,7 @@ Design notes (first principles):
 
 from __future__ import annotations
 
+import base64
 import secrets
 import threading
 import time
@@ -43,7 +44,12 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from ..audio.utils import pcm_to_wav_base64, wav_base64_to_pcm_16k_mono
+from ..audio.utils import (
+    mp3_bytes_to_pcm_16k_mono,
+    pcm_s16le_bytes_to_pcm_16k_mono,
+    pcm_to_wav_base64,
+    wav_base64_to_pcm_16k_mono,
+)
 from ..config import SAMPLE_RATE
 
 
@@ -99,6 +105,52 @@ def decode_and_validate(
         # Match the upload convention used elsewhere (tail-trim): the most
         # informative speech tends to sit late in the clip after the user
         # cleared their throat / leading silence.
+        pcm = pcm[-keep:]
+        duration = pcm.size / SAMPLE_RATE
+    canonical_b64 = pcm_to_wav_base64(pcm.astype(np.float32, copy=False))
+    return canonical_b64, duration
+
+
+def decode_and_validate_audio_bytes(
+    audio_bytes: bytes,
+    *,
+    audio_format: str,
+    min_sec: float,
+    max_sec: float,
+) -> tuple[str, float]:
+    """Decode uploaded enrollment audio and return canonical 16 kHz mono WAV.
+
+    Supported input formats are WAV, MP3, and raw 16 kHz mono s16le PCM. The
+    stored representation stays unchanged: base64 WAV for local cache and
+    float32 PCM for Triton enrollment upsert.
+    """
+    fmt = (audio_format or "").strip().lower()
+    if fmt in {"wav", "wave"}:
+        wav_base64 = base64.b64encode(audio_bytes).decode("ascii")
+        return decode_and_validate(wav_base64, min_sec=min_sec, max_sec=max_sec)
+    try:
+        if fmt == "mp3":
+            pcm = mp3_bytes_to_pcm_16k_mono(audio_bytes)
+        elif fmt in {"pcm", "raw", "s16le"}:
+            pcm = pcm_s16le_bytes_to_pcm_16k_mono(audio_bytes)
+        else:
+            raise EnrollmentError(
+                "unsupported_format",
+                "unsupported enrollment audio format; supported: wav, mp3, pcm",
+            )
+    except ValueError as exc:
+        raise EnrollmentError("decode_failed", str(exc)) from exc
+
+    if pcm.size == 0:
+        raise EnrollmentError("empty", "enrollment audio decoded to empty PCM")
+    duration = pcm.size / SAMPLE_RATE
+    if duration < float(min_sec):
+        raise EnrollmentError(
+            "too_short",
+            f"enrollment audio is {duration:.2f}s, need at least {min_sec:.2f}s",
+        )
+    if duration > float(max_sec):
+        keep = int(SAMPLE_RATE * float(max_sec))
         pcm = pcm[-keep:]
         duration = pcm.size / SAMPLE_RATE
     canonical_b64 = pcm_to_wav_base64(pcm.astype(np.float32, copy=False))
@@ -212,6 +264,7 @@ __all__ = [
     "EnrollmentError",
     "EnrollmentEntry",
     "decode_and_validate",
+    "decode_and_validate_audio_bytes",
     "get_enrollment_store",
     "reset_enrollment_store_for_tests",
 ]

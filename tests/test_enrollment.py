@@ -32,6 +32,7 @@ from backend.asr.enrollment import (  # noqa: E402
     EnrollmentError,
     _Store,
     decode_and_validate,
+    decode_and_validate_audio_bytes,
 )
 from backend.audio.utils import pcm_to_wav_base64  # noqa: E402
 from backend.config import SAMPLE_RATE  # noqa: E402
@@ -46,6 +47,13 @@ def _wav_b64(seconds: float, sr: int = SAMPLE_RATE) -> str:
     t = np.arange(n, dtype=np.float32) / sr
     sig = 0.3 * np.sin(2 * np.pi * 440 * t)
     return pcm_to_wav_base64(sig.astype(np.float32), sr)
+
+
+def _pcm_s16le_bytes(seconds: float, sr: int = SAMPLE_RATE) -> bytes:
+    n = max(1, int(round(sr * seconds)))
+    t = np.arange(n, dtype=np.float32) / sr
+    sig = 0.3 * np.sin(2 * np.pi * 440 * t)
+    return np.clip(sig * 32767, -32768, 32767).astype(np.int16).tobytes()
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +324,28 @@ def test_decode_and_validate_happy_path():
     b64, dur = decode_and_validate(_wav_b64(3.0), min_sec=1.0, max_sec=8.0)
     assert isinstance(b64, str) and b64
     assert dur == pytest.approx(3.0, abs=0.05)
+
+
+def test_decode_and_validate_audio_bytes_accepts_raw_pcm():
+    b64, dur = decode_and_validate_audio_bytes(
+        _pcm_s16le_bytes(2.0),
+        audio_format="pcm",
+        min_sec=1.0,
+        max_sec=8.0,
+    )
+    assert isinstance(b64, str) and b64
+    assert dur == pytest.approx(2.0, abs=0.05)
+
+
+def test_decode_and_validate_audio_bytes_rejects_unknown_format():
+    with pytest.raises(EnrollmentError) as exc:
+        decode_and_validate_audio_bytes(
+            _pcm_s16le_bytes(2.0),
+            audio_format="m4a",
+            min_sec=1.0,
+            max_sec=8.0,
+        )
+    assert exc.value.code == "unsupported_format"
 
 
 def test_decode_and_validate_too_short_raises():
