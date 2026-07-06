@@ -131,6 +131,12 @@ VAD / 分段（凡按帧计的字段，其帧时长由 VAD 后端 hop 决定：t
 | pseudo_stream_interval_ms | int | 500 | 相邻中间结果之间的最小间隔（仅节流首个之后的刷新，不影响首字） | 生效 |
 | pseudo_stream_first_partial_ms | int | 200 | 每段语音首个 partial 的触发门槛，从 min_segment_duration_ms 解耦（dataclass 兜底 350，config.yaml 默认设 200 走低延迟）；与 vad_start_frames 按 max 决定首字，min_segment_duration_ms 仍独立控制 final 段短噪声过滤 | 生效 |
 
+AST v3 协议兼容：
+
+| 字段 | 类型 | 默认 | 含义 | 本端点 |
+|---|---|---|---|---|
+| enable_role_separation | bool | false | 客户端角色分离开关。当前版本暂不支持角色分离；无论传 true 或 false，服务端都正常识别 | 接受但不改变识别行为；sentence 的 `cw[].rl` 固定返回 0 |
+
 ASR 模型组合 / 超时：
 
 | 字段 | 类型 | 默认 | 含义 | 本端点 |
@@ -301,6 +307,7 @@ TS-ASR 注册参数（约束注册接口的时长校验与缓存 TTL）：
 | ws[].cw | Array | 词语识别候选 |
 | cw[].w | String | 识别文本；msgtype=sentence（最终结果）默认已做 ITN 与车牌规范化，msgtype=Progressive（中间结果）保持口语形式。见“文本规范化”一节 |
 | cw[].lg | String | 语种，如 zh |
+| cw[].rl | int | 角色编号；当前版本暂不支持角色分离，仅在 msgtype=sentence 中固定返回 0，msgtype=Progressive 不返回该字段 |
 | cw[].wb | int | 词开始位置，单位 10 ms 帧（数值 ×10 为毫秒） |
 | cw[].we | int | 词结束位置，单位 10 ms 帧 |
 | cw[].wp | String | 顺滑词类型：s 顺滑词，n 普通字符，p 标点，g 语义分段标志 |
@@ -329,7 +336,7 @@ result 示例（最终结果）：
       "cw": [
         {
           "lg": "zh", "ng": "0.00", "ph": "phone", "sc": "0.00",
-          "w": "你好兄弟", "wb": 14, "wc": "0.00", "we": 323, "wp": "n"
+          "rl": 0, "w": "你好兄弟", "wb": 14, "wc": "0.00", "we": 323, "wp": "n"
         }
       ]
     }
@@ -360,6 +367,7 @@ result 示例（最终结果）：
 | cw.sc / cw.wc / cw.ng | 固定字符串 0.00 |
 | cw.ph | 固定字符串 phone |
 | cw.lg | 取段级检测/传入语种映射的短码 |
+| cw.rl | 仅 sentence 返回，固定整数 0；当前不做角色分离，Progressive 不返回该字段 |
 
 段级 bg/ed 为近似值：它基于流累计消费的样本数，会忽略 VAD 静音判定延迟与尾部裁剪，误差通常在百毫秒量级。
 
@@ -369,6 +377,7 @@ result 示例（最终结果）：
 |---|---|
 | resIdList | 已废弃，仅记录并忽略；目标说话人请使用 `parameter.asr_config.enrollment_id` |
 | parameter.engine | 讯飞引擎透传参数（如 wdec_param_LanguageTypeChoice、wrec_param_language_name）在本服务无对应能力，仅记录日志，不影响识别；如需按连接调参请改用 parameter.asr_config（见配置覆写章节） |
+| 角色分离 | 当前版本暂不支持角色分离；`parameter.asr_config.enable_role_separation` 会被接受但不改变识别行为，sentence 中 `cw[].rl` 固定为 0，Progressive 不返回 `cw[].rl` |
 | 词级时间戳 | 见降级说明，非逐词真实值 |
 | 鉴权 | 无内置鉴权，需在网关层实现访问控制 |
 
