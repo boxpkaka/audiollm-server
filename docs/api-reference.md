@@ -44,6 +44,8 @@
 | GET | `/api/asr/hotword-pool` | 查询热词池 | `hotword_pool_id`、`query`、`limit`、`offset` |
 | POST | `/api/asr/hotword-pool` | 向热词池添加热词 | JSON `hotword_pool_id`、`hotwords` |
 | DELETE | `/api/asr/hotword-pool` | 从热词池删除热词 | JSON `hotword_pool_id`、`hotwords` |
+| POST | `/api/asr/hotword-pool/delete` | 从热词池删除热词，兼容不稳定支持 DELETE body 的客户端 | JSON `hotword_pool_id`、`hotwords` |
+| POST | `/api/asr/hotword-pool/clear` | 清空指定热词池 | JSON 或 query `hotword_pool_id` |
 | POST | `/api/asr/hotword-pool/reload` | 让 RAG-ASR 从热词池文件 reload 热词 | `hotword_pool_id` |
 | POST | `/api/emotion/jobs` | 异步整段情感识别（202 + 轮询） | `audio`、`mode`、`language` |
 | GET | `/api/emotion/jobs/{job_id}` | 查询情感任务状态与结果 | — |
@@ -293,6 +295,9 @@ curl -X POST http://172.16.0.3:8080/api/asr/hotword-pool \
 curl -X DELETE http://172.16.0.3:8080/api/asr/hotword-pool \
   -H 'content-type: application/json' \
   -d '{"hotword_pool_id":"tenant-a","hotwords":["张硕"]}'
+curl -X POST http://172.16.0.3:8080/api/asr/hotword-pool/clear \
+  -H 'content-type: application/json' \
+  -d '{"hotword_pool_id":"tenant-a"}'
 curl -X POST 'http://172.16.0.3:8080/api/asr/hotword-pool/reload?hotword_pool_id=tenant-a'
 ```
 
@@ -301,6 +306,8 @@ curl -X POST 'http://172.16.0.3:8080/api/asr/hotword-pool/reload?hotword_pool_id
 | `GET /api/asr/hotword-pool` | query 参数 `hotword_pool_id`、`query`、`limit`、`offset` | RAG-ASR 返回的 `status`、`hotwords`、`total_count`、分页元信息 |
 | `POST /api/asr/hotword-pool` | JSON `{ "hotword_pool_id": "tenant-a", "hotwords": ["词1", "词2"] }` | 新增数量、重复/非法项、当前总量 |
 | `DELETE /api/asr/hotword-pool` | JSON `{ "hotword_pool_id": "tenant-a", "hotwords": ["词1", "词2"] }` | 删除数量、缺失项、当前总量 |
+| `POST /api/asr/hotword-pool/delete` | JSON `{ "hotword_pool_id": "tenant-a", "hotwords": ["词1", "词2"] }` | 与 `DELETE /api/asr/hotword-pool` 相同 |
+| `POST /api/asr/hotword-pool/clear` | JSON 或 query 参数 `hotword_pool_id` | 清空指定热词池后的总量；不影响其他池 |
 | `POST /api/asr/hotword-pool/reload` | query 参数 `hotword_pool_id` | 从 RAG-ASR 对应热词池文件重载后的总量 |
 
 ### 情感上传

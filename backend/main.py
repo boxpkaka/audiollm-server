@@ -44,6 +44,7 @@ from .asr.recall import (
 )
 from .asr.recall import (
     list_hotword_pool,
+    clear_hotword_pool,
     reload_hotword_pool,
 )
 from .asr.recall import (
@@ -601,6 +602,35 @@ def _resolve_hotword_pool_id(raw_hotword_pool_id: object | None, cfg) -> str:
         ) from exc
 
 
+def _resolve_hotword_pool_id_from_body_or_query(
+    body: dict | None,
+    query_hotword_pool_id: str,
+    cfg,
+) -> str:
+    raw_body_hotword_pool_id = None
+    if body is not None and "hotword_pool_id" in body:
+        raw_body_hotword_pool_id = body.get("hotword_pool_id")
+    query_value = str(query_hotword_pool_id or "").strip()
+    body_value = (
+        str(raw_body_hotword_pool_id or "").strip()
+        if raw_body_hotword_pool_id is not None
+        else ""
+    )
+    if query_value and body_value:
+        resolved_query = _resolve_hotword_pool_id(query_value, cfg)
+        resolved_body = _resolve_hotword_pool_id(body_value, cfg)
+        if resolved_query != resolved_body:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "invalid_hotword_pool_id",
+                    "message": "query and body hotword_pool_id must match",
+                },
+            )
+        return resolved_query
+    return _resolve_hotword_pool_id(body_value or query_value, cfg)
+
+
 def _reject_legacy_hotword_user_id(value: object) -> None:
     if isinstance(value, FormParam):
         return
@@ -672,6 +702,7 @@ async def asr_hotword_pool_add(body: dict = Body(...)):
 
 
 @app.delete("/api/asr/hotword-pool")
+@app.post("/api/asr/hotword-pool/delete")
 async def asr_hotword_pool_delete(body: dict = Body(...)):
     _reject_legacy_hotword_user_id(
         body.get("user_id") if "user_id" in body else None
@@ -688,6 +719,28 @@ async def asr_hotword_pool_delete(body: dict = Body(...)):
         )
     except HTTPException:
         raise
+    except Exception as exc:  # noqa: BLE001
+        raise _recall_error(exc) from exc
+
+
+@app.post("/api/asr/hotword-pool/clear")
+async def asr_hotword_pool_clear(
+    hotword_pool_id: str = "",
+    user_id: str | None = None,
+    body: dict | None = Body(default=None),
+):
+    _reject_legacy_hotword_user_id(user_id)
+    _reject_legacy_hotword_user_id(
+        body.get("user_id") if body is not None and "user_id" in body else None
+    )
+    cfg = load_config()
+    resolved_hotword_pool_id = _resolve_hotword_pool_id_from_body_or_query(
+        body,
+        hotword_pool_id,
+        cfg,
+    )
+    try:
+        return await clear_hotword_pool(hotword_pool_id=resolved_hotword_pool_id)
     except Exception as exc:  # noqa: BLE001
         raise _recall_error(exc) from exc
 

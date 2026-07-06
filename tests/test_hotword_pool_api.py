@@ -34,6 +34,61 @@ async def test_hotword_pool_add_proxies_to_recall(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_hotword_pool_delete_compat_route_proxies_to_recall(monkeypatch):
+    seen: dict[str, object] = {}
+
+    async def fake_delete(words, *, hotword_pool_id=None):
+        seen["words"] = words
+        seen["hotword_pool_id"] = hotword_pool_id
+        return {"status": "ok", "deleted": len(words), "total_count": 0}
+
+    monkeypatch.setattr(main_mod, "delete_recall_hotwords", fake_delete)
+
+    result = await main_mod.asr_hotword_pool_delete(
+        {"hotword_pool_id": "tenant-a", "hotwords": ["挚音科技"]}
+    )
+
+    assert seen["words"] == ["挚音科技"]
+    assert seen["hotword_pool_id"] == "tenant-a"
+    assert result == {"status": "ok", "deleted": 1, "total_count": 0}
+
+
+@pytest.mark.asyncio
+async def test_hotword_pool_clear_proxies_to_recall(monkeypatch):
+    seen: dict[str, object] = {}
+
+    async def fake_clear(*, hotword_pool_id=None):
+        seen["hotword_pool_id"] = hotword_pool_id
+        return {"status": "ok", "action": "clear", "cleared": 2, "total_count": 0}
+
+    monkeypatch.setattr(main_mod, "clear_hotword_pool", fake_clear)
+
+    result = await main_mod.asr_hotword_pool_clear(
+        body={"hotword_pool_id": "tenant-a"},
+    )
+
+    assert seen["hotword_pool_id"] == "tenant-a"
+    assert result == {"status": "ok", "action": "clear", "cleared": 2, "total_count": 0}
+
+
+@pytest.mark.asyncio
+async def test_hotword_pool_clear_rejects_query_body_mismatch(monkeypatch):
+    async def fake_clear(*, hotword_pool_id=None):  # pragma: no cover - must not run
+        raise AssertionError("clear should not be called")
+
+    monkeypatch.setattr(main_mod, "clear_hotword_pool", fake_clear)
+
+    with pytest.raises(HTTPException) as exc:
+        await main_mod.asr_hotword_pool_clear(
+            hotword_pool_id="tenant-a",
+            body={"hotword_pool_id": "tenant-b"},
+        )
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail["code"] == "invalid_hotword_pool_id"
+
+
+@pytest.mark.asyncio
 async def test_hotword_pool_rejects_empty_payload():
     with pytest.raises(HTTPException) as exc:
         await main_mod.asr_hotword_pool_add({"hotwords": []})
