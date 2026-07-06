@@ -27,12 +27,11 @@ def _frame(status: int, *, trace_id: str, app_id: str, biz_id: str,
         header["appId"] = app_id
     if biz_id:
         header["bizId"] = biz_id
-    # resIdList[0] carries the target-speaker enrollment id (register first via
-    # POST /api/asr/enrollment to obtain it).
-    if enrollment_id:
-        header["resIdList"] = [enrollment_id]
     # engine stays log-only; asr_config carries per-connection config overrides.
     parameter: dict[str, object] = {"engine": {}}
+    if enrollment_id:
+        asr_config = dict(asr_config or {})
+        asr_config["enrollment_id"] = enrollment_id
     if asr_config:
         parameter["asr_config"] = asr_config
     payload: dict[str, object] = {"audio": {"audio": base64.b64encode(audio).decode()}}

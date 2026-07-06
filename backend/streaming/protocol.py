@@ -229,11 +229,9 @@ class AstV3Protocol:
         if not self._inbound_started:
             self._inbound_started = True
             self.trace_id = str(header.get("traceId") or "")
-            # resIdList[0] is treated as the target-speaker enrollment id (the
-            # spec's "resource/speaker id" slot); appId/bizId stay log-only.
             logger.info(
                 "AST v3 session start: sid=%s traceId=%s appId=%s bizId=%s "
-                "resIdList=%s (resIdList[0] used as target-speaker enrollment)",
+                "resIdList=%s (ignored)",
                 self.sid,
                 self.trace_id,
                 header.get("appId"),
@@ -255,22 +253,19 @@ class AstV3Protocol:
             hotwords = _parse_hotword_text(self._payload_text(payload))
             if hotwords:
                 start_ctrl["hotwords"] = hotwords
-            # Target speaker (TS-ASR): the id must already be registered via
-            # POST /api/asr/enrollment. The session resolves it through the
-            # shared enrollment store and gracefully degrades to plain ASR on
-            # an unknown/expired id, so no extra error path is needed here.
-            enrollment_id = self._extract_enrollment_id(header)
-            if enrollment_id:
-                start_ctrl["enrollment_id"] = enrollment_id
             # parameter.asr_config is this service's per-connection tuning slot
             # (distinct from the log-only iFlytek engine block). language is not
             # a Config field so it rides start.language; the rest becomes
             # start.config and is whitelist-filtered downstream in the session.
-            language, hotword_pool_id, cfg_overrides = self._extract_asr_config(parameter)
+            language, hotword_pool_id, enrollment_id, cfg_overrides = (
+                self._extract_asr_config(parameter)
+            )
             if language:
                 start_ctrl["language"] = language
             if hotword_pool_id:
                 start_ctrl["hotword_pool_id"] = hotword_pool_id
+            if enrollment_id:
+                start_ctrl["enrollment_id"] = enrollment_id
             if cfg_overrides:
                 start_ctrl["config"] = cfg_overrides
             actions.append(ControlAction(start_ctrl))
@@ -292,43 +287,29 @@ class AstV3Protocol:
         return None
 
     @staticmethod
-    def _extract_enrollment_id(header: dict) -> str:
-        """Read the target-speaker enrollment id from ``header.resIdList[0]``.
-
-        Only the first entry is used; multi-speaker separation is not
-        supported. Returns "" when absent so the synthesized start omits the
-        field entirely (no enrollment).
-        """
-        res_ids = header.get("resIdList")
-        if isinstance(res_ids, list) and res_ids and res_ids[0] is not None:
-            return str(res_ids[0]).strip()
-        return ""
-
-    @staticmethod
-    def _extract_asr_config(parameter: dict) -> tuple[str, str, dict]:
-        """Split ``parameter.asr_config`` into language, pool id, and overrides.
+    def _extract_asr_config(parameter: dict) -> tuple[str, str, str, dict]:
+        """Split ``parameter.asr_config`` into routed fields and overrides.
 
         ``asr_config`` is this service's extension slot for per-connection
         tuning; the iFlytek ``parameter.engine`` block stays log-only. The
         ``language`` key is pulled out because it is not a ``Config`` field (the
         session maps it separately via ``start.language``), and
         ``hotword_pool_id`` is pulled out as the Triton hotword-pool isolation
-        key. The historical ``user_id`` key remains an alias. Every other key
-        is forwarded verbatim as ``start.config`` and is whitelist-filtered by
-        ``Config.override_client`` downstream, so no validation happens here.
+        key. ``enrollment_id`` is the only AST v3 target-speaker field. Every
+        other key is forwarded verbatim as ``start.config`` and is
+        whitelist-filtered by ``Config.override_client`` downstream, so no
+        validation happens here.
         Returns empty values when the slot is absent or not a dict.
         """
         cfg = parameter.get("asr_config")
         if not isinstance(cfg, dict) or not cfg:
-            return "", "", {}
+            return "", "", "", {}
         overrides = dict(cfg)
         language = str(overrides.pop("language", "") or "").strip()
         hotword_pool_id = str(overrides.pop("hotword_pool_id", "") or "").strip()
-        if not hotword_pool_id:
-            hotword_pool_id = str(overrides.pop("user_id", "") or "").strip()
-        else:
-            overrides.pop("user_id", None)
-        return language, hotword_pool_id, overrides
+        enrollment_id = str(overrides.pop("enrollment_id", "") or "").strip()
+        overrides.pop("user_id", None)
+        return language, hotword_pool_id, enrollment_id, overrides
 
     def _decode_audio(self, payload: dict) -> bytes:
         audio_obj = payload.get("audio")

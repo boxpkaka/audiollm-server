@@ -131,7 +131,6 @@ async def transcribe_pcm_i16(
     language: str = "",
     hotwords: list[str] | None = None,
     hotword_pool_id: str | None = None,
-    recall_user_id: str | None = None,
     on_segments_planned: Callable[[int], None] | None = None,
     on_segment_done: Callable[[int], None] | None = None,
     release_input: Callable[[], None] | None = None,
@@ -191,9 +190,7 @@ async def transcribe_pcm_i16(
             hotwords=hotwords,
             language=language,
             audio_pcm=pcm,
-            hotword_pool_id=hotword_pool_id
-            if hotword_pool_id is not None
-            else recall_user_id,
+            hotword_pool_id=hotword_pool_id,
         )
 
     async def run_one(seg: OfflineSegment) -> dict:

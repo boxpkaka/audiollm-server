@@ -578,7 +578,7 @@ async def test_session_dispatches_start_pcm_segment_and_stop():
     stream = _ScriptedStream(feed_events=[[seg]], flush_events=[])
     engine = _RecorderEngine()
     ws = FakeWebSocket([
-        {"text": '{"type":"start","format":"pcm_s16le","sample_rate_hz":16000,"channels":1,"language":"zh","user_id":"tenant-a","hotwords":["a","b"]}'},
+        {"text": '{"type":"start","format":"pcm_s16le","sample_rate_hz":16000,"channels":1,"language":"zh","hotword_pool_id":"tenant-a","hotwords":["a","b"]}'},
         {"bytes": _silent_pcm_bytes(160)},
         {"text": '{"type":"stop"}'},
     ])
@@ -593,11 +593,29 @@ async def test_session_dispatches_start_pcm_segment_and_stop():
 
     assert engine.starts and engine.starts[0]["type"] == "start"
     assert session.ctx.hotword_pool_id == "tenant-a"
-    assert session.ctx.recall_user_id == "tenant-a"
     assert len(engine.segments) == 1
     assert engine.segments[0].pcm.shape == (800,)
     assert engine.stop_calls == [(True, True)]
     assert stream.flush_calls and stream.flush_calls[-1] is True
+
+
+@pytest.mark.asyncio
+async def test_session_rejects_legacy_start_user_id():
+    stream = _ScriptedStream(feed_events=[], flush_events=[])
+    engine = _RecorderEngine()
+    ws = FakeWebSocket([
+        {"text": '{"type":"start","format":"pcm_s16le","sample_rate_hz":16000,"channels":1,"user_id":"tenant-a"}'},
+    ])
+
+    session = StreamingSession(ws, stream=stream, engine=engine)
+    await session.run()
+    await session.cleanup()
+
+    assert any(
+        msg.get("type") == "error" and msg.get("code") == "invalid_hotword_pool_id"
+        for msg in ws.sent
+    )
+    assert not engine.starts
 
 
 @pytest.mark.asyncio
@@ -1235,7 +1253,8 @@ def test_ast_v3_asr_config_injects_config_and_language():
             parameter={
                 "asr_config": {
                     "language": "en",
-                    "user_id": "tenant-a",
+                    "hotword_pool_id": "tenant-a",
+                    "enrollment_id": "enr-abc",
                     "vad_threshold": 0.3,
                     "enable_pseudo_stream": False,
                 }
@@ -1246,6 +1265,7 @@ def test_ast_v3_asr_config_injects_config_and_language():
     assert ctrl["type"] == "start"
     assert ctrl["language"] == "en"
     assert ctrl["hotword_pool_id"] == "tenant-a"
+    assert ctrl["enrollment_id"] == "enr-abc"
     assert ctrl["config"] == {"vad_threshold": 0.3, "enable_pseudo_stream": False}
 
 
@@ -1269,23 +1289,26 @@ def test_ast_v3_asr_config_language_only():
     assert "config" not in ctrl
 
 
-def test_ast_v3_residlist_maps_to_enrollment_id():
-    """header.resIdList[0] becomes the target-speaker enrollment id."""
+def test_ast_v3_residlist_is_ignored_for_enrollment_id():
+    """header.resIdList no longer enables target-speaker mode."""
     p = AstV3Protocol()
     acts = p.decode_inbound(
         _ast_frame(header={"traceId": "t", "status": 0, "resIdList": ["enr-abc"]})
     )
     assert acts[0].ctrl["type"] == "start"
-    assert acts[0].ctrl["enrollment_id"] == "enr-abc"
+    assert "enrollment_id" not in acts[0].ctrl
 
 
-def test_ast_v3_residlist_only_uses_first_entry():
-    """Multiple resIdList entries: only the first is used (no multi-speaker)."""
+def test_ast_v3_asr_config_enrollment_id_maps_to_start():
+    """parameter.asr_config.enrollment_id is the target-speaker enrollment id."""
     p = AstV3Protocol()
     acts = p.decode_inbound(
-        _ast_frame(header={"status": 0, "resIdList": ["one", "two", "three"]})
+        _ast_frame(
+            header={"status": 0, "resIdList": ["ignored"]},
+            parameter={"asr_config": {"enrollment_id": "enr-abc"}},
+        )
     )
-    assert acts[0].ctrl["enrollment_id"] == "one"
+    assert acts[0].ctrl["enrollment_id"] == "enr-abc"
 
 
 def test_ast_v3_no_enrollment_when_residlist_absent_or_empty():
@@ -1504,7 +1527,7 @@ async def test_session_ast_v3_asr_config_overrides_and_whitelist():
                 header={"status": 0},
                 parameter={
                     "asr_config": {
-                        "user_id": "tenant-a",
+                        "hotword_pool_id": "tenant-a",
                         "vad_threshold": 0.37,
                         "vllm_base_url": "http://evil:1",
                     }
@@ -1524,7 +1547,6 @@ async def test_session_ast_v3_asr_config_overrides_and_whitelist():
     assert session.cfg.vad_threshold == 0.37  # whitelisted -> applied
     assert session.cfg.vllm_base_url == base_url_before  # infra field dropped
     assert session.ctx.hotword_pool_id == "tenant-a"
-    assert session.ctx.recall_user_id == "tenant-a"
     assert stream.cfg.vad_threshold == 0.37  # stream reconfigured with new cfg
 
 

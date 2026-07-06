@@ -86,12 +86,11 @@ def _frame(status: int, *, trace_id: str, app_id: str, biz_id: str,
         header["appId"] = app_id
     if biz_id:
         header["bizId"] = biz_id
-    # resIdList[0] carries the target-speaker enrollment id (register first via
-    # POST /api/asr/enrollment to obtain it).
-    if enrollment_id:
-        header["resIdList"] = [enrollment_id]
     # engine stays log-only; asr_config carries per-connection config overrides.
     parameter: dict = {"engine": {}}
+    if enrollment_id:
+        asr_config = dict(asr_config or {})
+        asr_config["enrollment_id"] = enrollment_id
     if asr_config:
         parameter["asr_config"] = asr_config
     payload: dict = {}
@@ -250,7 +249,7 @@ def main():
     parser.add_argument("--hotwords", default="",
                         help='Comma-separated hotwords (e.g. "挚音科技,张硕")')
     parser.add_argument("--enrollment-id", default="",
-                        help="Target-speaker id from POST /api/asr/enrollment (-> resIdList[0])")
+                        help="Target-speaker id from POST /api/asr/enrollment (-> parameter.asr_config.enrollment_id)")
     parser.add_argument("--language", default="",
                         help="会话语言代码，写入 parameter.asr_config.language")
     parser.add_argument("--vad-threshold", type=float, default=None,

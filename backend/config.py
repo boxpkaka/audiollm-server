@@ -138,18 +138,16 @@ class Config:
     fusion_primary_score_margin: float = 0.08
 
     # ---- ASR: Triton hotword recall + vLLM encoder bypass -----------------
-    # Hotword biasing uses a hotword_pool_id. The historical user_id wire/config
-    # names are accepted as compatibility aliases only. Each audio segment
-    # retrieves a small top-K list from that pool, then appends a bounded number
-    # of per-request hotwords before building the ASR prompt. Encoder bypass
-    # additionally sends Triton's projector frames to vLLM as an
-    # ``audio_embeds`` block; it is only valid for the Amphion 1.7B
+    # Hotword biasing uses only hotword_pool_id as the public isolation key.
+    # Each audio segment retrieves a small top-K list from that pool, then
+    # appends a bounded number of per-request hotwords before building the ASR
+    # prompt. Encoder bypass additionally sends Triton's projector frames to
+    # vLLM as an ``audio_embeds`` block; it is only valid for the Amphion 1.7B
     # prompt/checkpoint family and falls back to raw audio when enrollment or a
     # different prompt template is used.
     enable_hotword_recall: bool = True
     recall_top_k: int = 50
     hotword_pool_id: str = DEFAULT_HOTWORD_POOL_ID
-    recall_user_id: str = DEFAULT_HOTWORD_POOL_ID
     recall_custom_hotword_limit: int = 8
     enable_encoder_bypass: bool = True
 
@@ -391,19 +389,8 @@ class Config:
             object.__setattr__(self, "recall_top_k", 0)
         if self.recall_custom_hotword_limit < 0:
             object.__setattr__(self, "recall_custom_hotword_limit", 0)
-        raw_hotword_pool_id = str(self.hotword_pool_id or "").strip()
-        raw_recall_user_id = str(self.recall_user_id or "").strip()
-        # ``recall_user_id`` is the historical config key. Prefer the clearer
-        # ``hotword_pool_id`` when present, otherwise keep old configs working.
-        pool_source = (
-            raw_recall_user_id
-            if raw_hotword_pool_id in {"", DEFAULT_HOTWORD_POOL_ID}
-            and raw_recall_user_id
-            else raw_hotword_pool_id
-        )
-        resolved_hotword_pool_id = normalize_hotword_pool_id(pool_source)
+        resolved_hotword_pool_id = normalize_hotword_pool_id(self.hotword_pool_id)
         object.__setattr__(self, "hotword_pool_id", resolved_hotword_pool_id)
-        object.__setattr__(self, "recall_user_id", resolved_hotword_pool_id)
         # 首个 partial 门槛若严于 final 段最小时长,partial 就会永远比 final 晚、失去
         # "中间结果"意义;夹到 <= min_segment_duration_ms。和 fusion 不变量一样下沉
         # 到 dataclass,确保 load/override/直接构造(测试)各路径都一致。

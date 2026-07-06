@@ -113,7 +113,7 @@ def _infer_sync(
     hotword_pool_id: str,
     enable_hotword_recall: bool = True,
     enrollment_id: str | None = None,
-    enrollment_user_id: str | None = None,
+    enrollment_scope_id: str | None = None,
     want_enrollment_audio_embeds: bool = False,
 ) -> RecallResult:
     upstream = _recall_upstream()
@@ -126,8 +126,8 @@ def _infer_sync(
     }
     if enrollment_id:
         control["enrollment_id"] = enrollment_id
-    if enrollment_user_id:
-        control["enrollment_user_id"] = enrollment_user_id
+    if enrollment_scope_id:
+        control["enrollment_scope_id"] = enrollment_scope_id
     inputs = [
         wav_input,
         _int_input(httpclient, "SAMPLE_RATE", sample_rate),
@@ -194,16 +194,15 @@ async def recall_audio(
     sample_rate: int = SAMPLE_RATE,
     want_audio_embeds: bool = True,
     hotword_pool_id: str | None = None,
-    user_id: str | None = None,
     enable_hotword_recall: bool = True,
     enrollment_id: str | None = None,
-    enrollment_user_id: str | None = None,
+    enrollment_scope_id: str | None = None,
     want_enrollment_audio_embeds: bool = False,
 ) -> RecallResult:
     """Recall hotwords for one audio segment."""
     top_k = max(int(cfg.recall_top_k), 0) if enable_hotword_recall else 0
     resolved_hotword_pool_id = normalize_hotword_pool_id(
-        hotword_pool_id if hotword_pool_id is not None else user_id,
+        hotword_pool_id,
         default=cfg.hotword_pool_id,
     )
     if top_k == 0 and not (enrollment_id or want_enrollment_audio_embeds):
@@ -222,7 +221,7 @@ async def recall_audio(
         hotword_pool_id=resolved_hotword_pool_id,
         enable_hotword_recall=enable_hotword_recall,
         enrollment_id=enrollment_id,
-        enrollment_user_id=enrollment_user_id,
+        enrollment_scope_id=enrollment_scope_id,
         want_enrollment_audio_embeds=want_enrollment_audio_embeds,
     )
 
@@ -231,15 +230,14 @@ def _enrollment_sync(
     action: str,
     *,
     enrollment_id: str,
-    enrollment_user_id: str | None = None,
-    user_id: str | None = None,
+    enrollment_scope_id: str | None = None,
     pcm: np.ndarray | None = None,
     sample_rate: int = SAMPLE_RATE,
 ) -> dict[str, object]:
     management = _management_upstream()
     if management is not None:
-        resolved_enrollment_user_id = normalize_hotword_pool_id(
-            enrollment_user_id if enrollment_user_id is not None else user_id,
+        resolved_enrollment_scope_id = normalize_hotword_pool_id(
+            enrollment_scope_id,
             default=DEFAULT_HOTWORD_POOL_ID,
         )
         with httpx.Client(timeout=management.timeout) as client:
@@ -250,7 +248,7 @@ def _enrollment_sync(
                 response = client.post(
                     _management_url(management, f"/enrollments/{enrollment_id}"),
                     data={
-                        "enrollment_user_id": resolved_enrollment_user_id,
+                        "enrollment_scope_id": resolved_enrollment_scope_id,
                         "sample_rate": str(int(sample_rate)),
                     },
                     files={
@@ -264,12 +262,12 @@ def _enrollment_sync(
             elif action == "get_enrollment":
                 response = client.get(
                     _management_url(management, f"/enrollments/{enrollment_id}"),
-                    params={"enrollment_user_id": resolved_enrollment_user_id},
+                    params={"enrollment_scope_id": resolved_enrollment_scope_id},
                 )
             elif action == "delete_enrollment":
                 response = client.delete(
                     _management_url(management, f"/enrollments/{enrollment_id}"),
-                    params={"enrollment_user_id": resolved_enrollment_user_id},
+                    params={"enrollment_scope_id": resolved_enrollment_scope_id},
                 )
             else:
                 raise ValueError(f"unknown enrollment action: {action}")
@@ -279,14 +277,14 @@ def _enrollment_sync(
 
     upstream = _recall_upstream()
     httpclient, client = _client_for(upstream)
-    resolved_enrollment_user_id = normalize_hotword_pool_id(
-        enrollment_user_id if enrollment_user_id is not None else user_id,
+    resolved_enrollment_scope_id = normalize_hotword_pool_id(
+        enrollment_scope_id,
         default=DEFAULT_HOTWORD_POOL_ID,
     )
     control: dict[str, object] = {
         "action": action,
         "enrollment_id": enrollment_id,
-        "enrollment_user_id": resolved_enrollment_user_id,
+        "enrollment_scope_id": resolved_enrollment_scope_id,
     }
     inputs = []
     if pcm is not None:
@@ -320,16 +318,14 @@ async def upsert_enrollment(
     pcm: np.ndarray,
     *,
     enrollment_id: str,
-    enrollment_user_id: str | None = None,
-    user_id: str | None = None,
+    enrollment_scope_id: str | None = None,
     sample_rate: int = SAMPLE_RATE,
 ) -> dict[str, object]:
     return await asyncio.to_thread(
         _enrollment_sync,
         "upsert_enrollment",
         enrollment_id=enrollment_id,
-        enrollment_user_id=enrollment_user_id,
-        user_id=user_id,
+        enrollment_scope_id=enrollment_scope_id,
         pcm=pcm,
         sample_rate=sample_rate,
     )
@@ -338,30 +334,26 @@ async def upsert_enrollment(
 async def get_enrollment(
     *,
     enrollment_id: str,
-    enrollment_user_id: str | None = None,
-    user_id: str | None = None,
+    enrollment_scope_id: str | None = None,
 ) -> dict[str, object]:
     return await asyncio.to_thread(
         _enrollment_sync,
         "get_enrollment",
         enrollment_id=enrollment_id,
-        enrollment_user_id=enrollment_user_id,
-        user_id=user_id,
+        enrollment_scope_id=enrollment_scope_id,
     )
 
 
 async def delete_enrollment(
     *,
     enrollment_id: str,
-    enrollment_user_id: str | None = None,
-    user_id: str | None = None,
+    enrollment_scope_id: str | None = None,
 ) -> dict[str, object]:
     return await asyncio.to_thread(
         _enrollment_sync,
         "delete_enrollment",
         enrollment_id=enrollment_id,
-        enrollment_user_id=enrollment_user_id,
-        user_id=user_id,
+        enrollment_scope_id=enrollment_scope_id,
     )
 
 
@@ -373,12 +365,11 @@ def _management_sync(
     limit: int | None = None,
     offset: int = 0,
     hotword_pool_id: str | None = None,
-    user_id: str | None = None,
 ) -> dict[str, object]:
     management = _management_upstream()
     if management is not None:
         resolved_hotword_pool_id = normalize_hotword_pool_id(
-            hotword_pool_id if hotword_pool_id is not None else user_id,
+            hotword_pool_id,
             default=DEFAULT_HOTWORD_POOL_ID,
         )
         with httpx.Client(timeout=management.timeout) as client:
@@ -423,7 +414,7 @@ def _management_sync(
     upstream = _recall_upstream()
     httpclient, client = _client_for(upstream)
     resolved_hotword_pool_id = normalize_hotword_pool_id(
-        hotword_pool_id if hotword_pool_id is not None else user_id,
+        hotword_pool_id,
         default=DEFAULT_HOTWORD_POOL_ID,
     )
     control: dict[str, object] = {
@@ -471,7 +462,6 @@ async def list_hotword_pool(
     limit: int | None = None,
     offset: int = 0,
     hotword_pool_id: str | None = None,
-    user_id: str | None = None,
 ) -> dict[str, object]:
     return await asyncio.to_thread(
         _management_sync,
@@ -480,7 +470,6 @@ async def list_hotword_pool(
         limit=limit,
         offset=offset,
         hotword_pool_id=hotword_pool_id,
-        user_id=user_id,
     )
 
 
@@ -488,14 +477,12 @@ async def add_hotwords(
     words: list[str],
     *,
     hotword_pool_id: str | None = None,
-    user_id: str | None = None,
 ) -> dict[str, object]:
     return await asyncio.to_thread(
         _management_sync,
         "add",
         hotwords=words,
         hotword_pool_id=hotword_pool_id,
-        user_id=user_id,
     )
 
 
@@ -503,25 +490,21 @@ async def delete_hotwords(
     words: list[str],
     *,
     hotword_pool_id: str | None = None,
-    user_id: str | None = None,
 ) -> dict[str, object]:
     return await asyncio.to_thread(
         _management_sync,
         "delete",
         hotwords=words,
         hotword_pool_id=hotword_pool_id,
-        user_id=user_id,
     )
 
 
 async def reload_hotword_pool(
     *,
     hotword_pool_id: str | None = None,
-    user_id: str | None = None,
 ) -> dict[str, object]:
     return await asyncio.to_thread(
         _management_sync,
         "reload",
         hotword_pool_id=hotword_pool_id,
-        user_id=user_id,
     )

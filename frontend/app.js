@@ -48,7 +48,7 @@
   const TRANSCRIBE_SAMPLE_RATE = 16000;
   const MAX_EXTRACTED_HOTWORD_LENGTH = 10;
   const HOTWORD_POOL_LIMIT = 1000;
-  const HOTWORD_USER_STORAGE_KEY = 'asr_hotword_user_id';
+  const HOTWORD_USER_STORAGE_KEY = 'asr_hotword_pool_id';
   const partialSeqMap = new Map(); // utterance_id -> highest seq seen
 
   // Last-known UI states so we can re-render strings after a language switch.
@@ -198,7 +198,7 @@
 
   function hotwordPoolQuery(params) {
     const query = new URLSearchParams(params || {});
-    query.set('user_id', currentHotwordUserId());
+    query.set('hotword_pool_id', currentHotwordUserId());
     return query.toString();
   }
 
@@ -298,7 +298,7 @@
       const resp = await fetch('/api/asr/hotword-pool', {
         method,
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ hotwords: clean, user_id: currentHotwordUserId() }),
+        body: JSON.stringify({ hotwords: clean, hotword_pool_id: currentHotwordUserId() }),
       });
       await readJsonResponse(resp);
       await loadHotwordPool();
@@ -337,7 +337,7 @@
           type: 'update_hotwords',
           hotwords: [],
           src_lang: apiLangFromUi(srcLangUi),
-          user_id: currentHotwordUserId(),
+          hotword_pool_id: currentHotwordUserId(),
           enrollment_id: enrollmentCtrl ? enrollmentCtrl.getEnrollmentId() : null,
         })
       );
@@ -657,7 +657,7 @@
         channels: 1,
         language: apiLangFromUi(srcLangUi),
         hotwords: [],
-        user_id: currentHotwordUserId(),
+        hotword_pool_id: currentHotwordUserId(),
         enrollment_id: (enrollmentCtrl && enrollmentCtrl.getEnrollmentId()) || null,
         config: {
           vad_start_frames: 10,
@@ -1382,7 +1382,7 @@
         wavBytes,
         {
           language: apiLangFromUi(srcLangUi) || '',
-          user_id: currentHotwordUserId(),
+          hotword_pool_id: currentHotwordUserId(),
           enrollment_id: (enrollmentCtrl && enrollmentCtrl.getEnrollmentId()) || '',
         },
         { signal: uploadController.signal, fileName: file.name || 'upload.wav' }

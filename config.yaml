@@ -108,8 +108,7 @@ defaults:
   recall:
     enable_hotword_recall: true
     recall_top_k: 50
-    hotword_pool_id: default                 # 未显式传 hotword_pool_id/user_id 时使用的热词池 ID
-    recall_user_id: default                  # 兼容旧配置键；语义同 hotword_pool_id
+    hotword_pool_id: default                 # 未显式传 hotword_pool_id 时使用的热词池 ID
     recall_custom_hotword_limit: 8           # 每次请求最多追加多少个临时 hotwords 到 prompt；不写入热词池
     enable_encoder_bypass: true
   itn:

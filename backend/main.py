@@ -17,6 +17,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
+from fastapi.params import Form as FormParam
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.types import Receive, Scope, Send
@@ -435,7 +436,7 @@ async def _resolve_enrollment_for_request(
     try:
         summary = await get_triton_enrollment(
             enrollment_id=ident,
-            enrollment_user_id=_enrollment_store_owner_id(cfg),
+            enrollment_scope_id=_enrollment_store_owner_id(cfg),
         )
     except Exception as exc:
         logger.warning("Triton enrollment lookup failed; falling back to plain ASR: %s", exc)
@@ -455,9 +456,8 @@ async def _run_dual_asr_upload(
     audio_pcm: np.ndarray,
     enrollment_b64: str | None = None,
     enrollment_id: str | None = None,
-    enrollment_user_id: str | None = None,
+    enrollment_scope_id: str | None = None,
     hotword_pool_id: str | None = None,
-    recall_user_id: str | None = None,
 ) -> dict:
     """Route-facing wrapper over :func:`run_oneshot_asr`.
 
@@ -473,8 +473,8 @@ async def _run_dual_asr_upload(
             audio_pcm=audio_pcm,
             enrollment_b64=enrollment_b64,
             enrollment_id=enrollment_id,
-            enrollment_user_id=enrollment_user_id,
-            hotword_pool_id=hotword_pool_id if hotword_pool_id is not None else recall_user_id,
+            enrollment_scope_id=enrollment_scope_id,
+            hotword_pool_id=hotword_pool_id,
         )
     except OneshotAsrError as exc:
         raise HTTPException(status_code=502, detail=exc.to_detail()) from exc
@@ -513,7 +513,7 @@ async def asr_enrollment_create(audio: UploadFile = File(...)):
             await upsert_triton_enrollment(
                 pcm,
                 enrollment_id=enrollment_id,
-                enrollment_user_id=_enrollment_store_owner_id(cfg),
+                enrollment_scope_id=_enrollment_store_owner_id(cfg),
                 sample_rate=SAMPLE_RATE,
             )
         except Exception as exc:
@@ -554,7 +554,7 @@ async def asr_enrollment_delete(enrollment_id: str):
         try:
             await delete_triton_enrollment(
                 enrollment_id=enrollment_id,
-                enrollment_user_id=_enrollment_store_owner_id(cfg),
+                enrollment_scope_id=_enrollment_store_owner_id(cfg),
             )
         except Exception:
             logger.warning("Triton enrollment delete failed", exc_info=True)
@@ -595,22 +595,23 @@ def _resolve_hotword_pool_id(raw_hotword_pool_id: object | None, cfg) -> str:
         raise HTTPException(
             status_code=400,
             detail={
-                "code": "invalid_user_id",
+                "code": "invalid_hotword_pool_id",
                 "message": str(exc),
             },
         ) from exc
 
 
-def _resolve_recall_user_id(raw_user_id: object | None, cfg) -> str:
-    return _resolve_hotword_pool_id(raw_user_id, cfg)
-
-
-def _route_id_value(value: object) -> str:
-    return value if isinstance(value, str) else ""
-
-
-def _route_hotword_pool_id(hotword_pool_id: object, user_id: object) -> str:
-    return _route_id_value(hotword_pool_id) or _route_id_value(user_id)
+def _reject_legacy_hotword_user_id(value: object) -> None:
+    if isinstance(value, FormParam):
+        return
+    if value is not None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_hotword_pool_id",
+                "message": "user_id is no longer supported; use hotword_pool_id",
+            },
+        )
 
 
 def _recall_error(exc: Exception) -> HTTPException:
@@ -630,11 +631,12 @@ async def asr_hotword_pool_list(
     limit: int = 50,
     offset: int = 0,
     hotword_pool_id: str = "",
-    user_id: str = "",
+    user_id: str | None = None,
 ):
+    _reject_legacy_hotword_user_id(user_id)
     cfg = load_config()
     resolved_hotword_pool_id = _resolve_hotword_pool_id(
-        _route_hotword_pool_id(hotword_pool_id, user_id),
+        hotword_pool_id,
         cfg,
     )
     try:
@@ -650,9 +652,12 @@ async def asr_hotword_pool_list(
 
 @app.post("/api/asr/hotword-pool")
 async def asr_hotword_pool_add(body: dict = Body(...)):
+    _reject_legacy_hotword_user_id(
+        body.get("user_id") if "user_id" in body else None
+    )
     cfg = load_config()
     resolved_hotword_pool_id = _resolve_hotword_pool_id(
-        body.get("hotword_pool_id", body.get("user_id")),
+        body.get("hotword_pool_id"),
         cfg,
     )
     try:
@@ -668,9 +673,12 @@ async def asr_hotword_pool_add(body: dict = Body(...)):
 
 @app.delete("/api/asr/hotword-pool")
 async def asr_hotword_pool_delete(body: dict = Body(...)):
+    _reject_legacy_hotword_user_id(
+        body.get("user_id") if "user_id" in body else None
+    )
     cfg = load_config()
     resolved_hotword_pool_id = _resolve_hotword_pool_id(
-        body.get("hotword_pool_id", body.get("user_id")),
+        body.get("hotword_pool_id"),
         cfg,
     )
     try:
@@ -685,10 +693,14 @@ async def asr_hotword_pool_delete(body: dict = Body(...)):
 
 
 @app.post("/api/asr/hotword-pool/reload")
-async def asr_hotword_pool_reload(hotword_pool_id: str = "", user_id: str = ""):
+async def asr_hotword_pool_reload(
+    hotword_pool_id: str = "",
+    user_id: str | None = None,
+):
+    _reject_legacy_hotword_user_id(user_id)
     cfg = load_config()
     resolved_hotword_pool_id = _resolve_hotword_pool_id(
-        _route_hotword_pool_id(hotword_pool_id, user_id),
+        hotword_pool_id,
         cfg,
     )
     try:
@@ -704,7 +716,7 @@ async def asr_upload(
     hotwords: str = Form(""),
     enrollment_id: str = Form(""),
     hotword_pool_id: str = Form(""),
-    user_id: str = Form(""),
+    user_id: str | None = Form(None),
 ):
     """One-shot ASR over an uploaded clip.
 
@@ -721,8 +733,9 @@ async def asr_upload(
     wav_bytes, audio_pcm, duration_sec = _wav_to_pcm_capped(raw, _ASR_MAX_SECONDS)
     wav_b64 = base64.b64encode(wav_bytes).decode("ascii")
     cfg = load_config()
+    _reject_legacy_hotword_user_id(user_id)
     resolved_hotword_pool_id = _resolve_hotword_pool_id(
-        _route_hotword_pool_id(hotword_pool_id, user_id),
+        hotword_pool_id,
         cfg,
     )
     hw_list = _parse_csv(hotwords)
@@ -738,7 +751,7 @@ async def asr_upload(
         audio_pcm=audio_pcm,
         enrollment_b64=enrollment_b64,
         enrollment_id=triton_enrollment_id,
-        enrollment_user_id=_enrollment_store_owner_id(cfg)
+        enrollment_scope_id=_enrollment_store_owner_id(cfg)
         if triton_enrollment_id
         else None,
         hotword_pool_id=resolved_hotword_pool_id,
@@ -760,7 +773,7 @@ async def asr_transcription_create(
     language: str = Form(""),
     hotwords: str = Form(""),
     hotword_pool_id: str = Form(""),
-    user_id: str = Form(""),
+    user_id: str | None = Form(None),
 ):
     """Enqueue offline transcription of a long recording (meeting minutes).
 
@@ -782,8 +795,9 @@ async def asr_transcription_create(
     # Transcription-specific view: rest.routes.transcribe bindings (model
     # choice, fusion switch) layered over the shared REST defaults.
     cfg = load_transcribe_config()
+    _reject_legacy_hotword_user_id(user_id)
     resolved_hotword_pool_id = _resolve_hotword_pool_id(
-        _route_hotword_pool_id(hotword_pool_id, user_id),
+        hotword_pool_id,
         cfg,
     )
     raw = await _read_audio_bytes(audio, max_bytes=cfg.transcribe_max_upload_bytes)
@@ -819,7 +833,7 @@ async def asr_transcription_create(
             duration_sec=duration_sec,
             language=language,
             hotwords=_parse_csv(hotwords),
-            recall_user_id=resolved_hotword_pool_id,
+            hotword_pool_id=resolved_hotword_pool_id,
             cfg=cfg,
         )
     except JobQueueFullError as exc:
@@ -968,13 +982,14 @@ async def audio_analyze(
     emotion_mode: str = Form("both"),
     enrollment_id: str = Form(""),
     hotword_pool_id: str = Form(""),
-    user_id: str = Form(""),
+    user_id: str | None = Form(None),
 ):
     """One-shot audio analysis: ASR raw output + cleaned text + emotion."""
     raw = await _read_audio_bytes(audio)
     cfg = load_config()
+    _reject_legacy_hotword_user_id(user_id)
     resolved_hotword_pool_id = _resolve_hotword_pool_id(
-        _route_hotword_pool_id(hotword_pool_id, user_id),
+        hotword_pool_id,
         cfg,
     )
     hw_list = _parse_csv(hotwords)
@@ -999,7 +1014,7 @@ async def audio_analyze(
             audio_pcm=asr_pcm,
             enrollment_b64=enrollment_b64,
             enrollment_id=triton_enrollment_id,
-            enrollment_user_id=_enrollment_store_owner_id(cfg)
+            enrollment_scope_id=_enrollment_store_owner_id(cfg)
             if triton_enrollment_id
             else None,
             hotword_pool_id=resolved_hotword_pool_id,

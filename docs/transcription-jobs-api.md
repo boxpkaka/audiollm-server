@@ -29,7 +29,6 @@
 | `audio` | file | 是 | WAV 文件（PCM 8/16/24/32-bit，任意采样率与声道数，服务端重采样到 16 kHz mono）。压缩格式（flac/mp3/m4a）需客户端先转码，例如 `ffmpeg -i in.flac -ac 1 -ar 16000 -sample_fmt s16 out.wav` |
 | `language` | string | 否 | 语言提示，如 `zh`、`en`；空为自动检测 |
 | `hotword_pool_id` | string | 否 | 推荐字段，热词池隔离 ID，默认 `default`；每段 ASR 都使用该热词池召回 |
-| `user_id` | string | 否 | 兼容字段，语义同 `hotword_pool_id` |
 | `hotwords` | string | 否 | 临时请求热词；每段 ASR 会把去重后的前 `recall_custom_hotword_limit` 个优先注入 prompt，并覆盖精确重复或整词同音（忽略声调）的 RAG-ASR 召回热词，不写入热词池 |
 
 不支持 `enrollment_id`：目标说话人过滤只保留单一说话人的语音，与多人会议转写语义相反。

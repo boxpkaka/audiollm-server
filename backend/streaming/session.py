@@ -27,7 +27,7 @@ from ..asr.enrollment import get_enrollment_store
 from ..asr.hotword import query_text_hotwords, sanitize_hotwords
 from ..config import Config, load_config
 from ..debug_dump import SessionDumper, new_session_id
-from ..recall_user import RecallUserIdError, normalize_recall_user_id
+from ..recall_user import HotwordPoolIdError, normalize_hotword_pool_id
 from .audio_stream import AudioStream, VadSegmentedStream
 from .events import (
     PartialSnapshot,
@@ -91,7 +91,6 @@ class SessionContext:
     src_lang: str = "N/A"
     hotwords: list[str] = field(default_factory=list)
     hotword_pool_id: str = "default"
-    recall_user_id: str = "default"
     gateway_trace_id: str = ""
     # Optional cached target-speaker enrollment (base64 WAV). The session
     # resolves the opaque ``enrollment_id`` once at start / on every
@@ -167,11 +166,7 @@ class StreamingSession:
             language=language,
             src_lang=map_language(language),
             hotwords=[],
-            hotword_pool_id=normalize_recall_user_id(
-                None,
-                default=self.cfg.hotword_pool_id,
-            ),
-            recall_user_id=normalize_recall_user_id(
+            hotword_pool_id=normalize_hotword_pool_id(
                 None,
                 default=self.cfg.hotword_pool_id,
             ),
@@ -367,33 +362,36 @@ class StreamingSession:
                 self.ctx.cfg = self.cfg
                 self.stream.configure(self.cfg)
 
-        hotword_pool_raw = (
-            ctrl.get("hotword_pool_id")
-            if "hotword_pool_id" in ctrl
-            else ctrl.get("user_id", _SENTINEL)
-        )
+        if "user_id" in ctrl and "hotword_pool_id" not in ctrl:
+            await self._send_json(
+                {
+                    "type": "error",
+                    "code": "invalid_hotword_pool_id",
+                    "message": "user_id is no longer supported; use hotword_pool_id",
+                }
+            )
+            return
+        hotword_pool_raw = ctrl.get("hotword_pool_id", _SENTINEL)
         if hotword_pool_raw is not _SENTINEL:
             try:
-                self.ctx.hotword_pool_id = normalize_recall_user_id(
+                self.ctx.hotword_pool_id = normalize_hotword_pool_id(
                     hotword_pool_raw,
                     default=self.cfg.hotword_pool_id,
                 )
-                self.ctx.recall_user_id = self.ctx.hotword_pool_id
-            except RecallUserIdError as exc:
+            except HotwordPoolIdError as exc:
                 await self._send_json(
                     {
                         "type": "error",
-                        "code": "invalid_user_id",
+                        "code": "invalid_hotword_pool_id",
                         "message": str(exc),
                     }
                 )
                 return
         else:
-            self.ctx.hotword_pool_id = normalize_recall_user_id(
+            self.ctx.hotword_pool_id = normalize_hotword_pool_id(
                 None,
                 default=self.cfg.hotword_pool_id,
             )
-            self.ctx.recall_user_id = self.ctx.hotword_pool_id
 
         for key in (
             "gateway_trace_id",
@@ -440,23 +438,27 @@ class StreamingSession:
 
     async def _handle_update_hotwords(self, ctrl: dict) -> None:
         self.ctx.hotwords = sanitize_hotwords(ctrl.get("hotwords", []))
-        hotword_pool_raw = (
-            ctrl.get("hotword_pool_id")
-            if "hotword_pool_id" in ctrl
-            else ctrl.get("user_id", _SENTINEL)
-        )
+        if "user_id" in ctrl and "hotword_pool_id" not in ctrl:
+            await self._send_json(
+                {
+                    "type": "error",
+                    "code": "invalid_hotword_pool_id",
+                    "message": "user_id is no longer supported; use hotword_pool_id",
+                }
+            )
+            return
+        hotword_pool_raw = ctrl.get("hotword_pool_id", _SENTINEL)
         if hotword_pool_raw is not _SENTINEL:
             try:
-                self.ctx.hotword_pool_id = normalize_recall_user_id(
+                self.ctx.hotword_pool_id = normalize_hotword_pool_id(
                     hotword_pool_raw,
                     default=self.cfg.hotword_pool_id,
                 )
-                self.ctx.recall_user_id = self.ctx.hotword_pool_id
-            except RecallUserIdError as exc:
+            except HotwordPoolIdError as exc:
                 await self._send_json(
                     {
                         "type": "error",
-                        "code": "invalid_user_id",
+                        "code": "invalid_hotword_pool_id",
                         "message": str(exc),
                     }
                 )
