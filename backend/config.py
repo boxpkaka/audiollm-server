@@ -196,6 +196,18 @@ class Config:
     k2_voice_gate_threshold: float = 0.65
     k2_voice_gate_start_frames: int = 10
 
+    # ---- ASR: final-segment voice gate ------------------------------------
+    # A second, segment-level admission check before LLM ASR final inference.
+    # Endpointing gates (local VAD / k2 voice gate) answer "should a segment
+    # exist?". This gate answers "does the completed segment contain enough
+    # speech evidence to spend an LLM ASR request on it?". It is intentionally
+    # statistical over the whole segment, not a boundary trimmer.
+    asr_segment_voice_gate_enabled: bool = True
+    asr_segment_voice_gate_threshold: float = 0.65
+    asr_segment_voice_gate_min_ratio: float = 0.05
+    asr_segment_voice_gate_min_ms: int = 120
+    asr_segment_voice_gate_min_rms: float = 0.001
+
     # ---- ASR: target speaker enrollment ----------------------------------
     # When a target-speaker enrollment is uploaded the primary ASR prompt
     # switches to a two-audio shape (enrollment first, target second). The
@@ -413,6 +425,18 @@ class Config:
             object.__setattr__(self, "k2_voice_gate_threshold", 1.0)
         if self.k2_voice_gate_start_frames < 1:
             object.__setattr__(self, "k2_voice_gate_start_frames", 1)
+        if self.asr_segment_voice_gate_threshold < 0:
+            object.__setattr__(self, "asr_segment_voice_gate_threshold", 0.0)
+        elif self.asr_segment_voice_gate_threshold > 1:
+            object.__setattr__(self, "asr_segment_voice_gate_threshold", 1.0)
+        if self.asr_segment_voice_gate_min_ratio < 0:
+            object.__setattr__(self, "asr_segment_voice_gate_min_ratio", 0.0)
+        elif self.asr_segment_voice_gate_min_ratio > 1:
+            object.__setattr__(self, "asr_segment_voice_gate_min_ratio", 1.0)
+        if self.asr_segment_voice_gate_min_ms < 0:
+            object.__setattr__(self, "asr_segment_voice_gate_min_ms", 0)
+        if self.asr_segment_voice_gate_min_rms < 0:
+            object.__setattr__(self, "asr_segment_voice_gate_min_rms", 0.0)
         # An empty dump dir would write into the project root; fall back to the
         # documented default so the invariant holds on every construction path.
         if not str(self.debug_dump_dir).strip():
@@ -492,6 +516,11 @@ CLIENT_OVERRIDABLE_FIELDS: frozenset[str] = frozenset({
     "primary_asr_timeout",
     "asr_request_timeout",
     "debug_show_dual_asr",
+    "asr_segment_voice_gate_enabled",
+    "asr_segment_voice_gate_threshold",
+    "asr_segment_voice_gate_min_ratio",
+    "asr_segment_voice_gate_min_ms",
+    "asr_segment_voice_gate_min_rms",
     # Dual-model fusion thresholds
     "fusion_similarity_threshold",
     "fusion_min_primary_score",

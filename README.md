@@ -330,6 +330,18 @@ SERVICE=my-demo scripts/restart_service.sh   # 指定其他 systemd 服务名
 
 k2 模式下，切段权威是 k2 的 endpoint；本服务只用 `k2_idle_keep_ms` 限制起音前旧静音、用 `k2_max_segment_sec` 防止无 endpoint 时缓冲无限增长，并用 `k2_voice_gate_*` 在 partial/final 进入下游前确认有人声证据。voice gate 只决定放行或丢弃，不再用本地 VAD 裁剪段首/段尾。`silence_duration_ms` / `vad_start_frames` / `pseudo_stream_interval_ms` / `pseudo_stream_first_partial_ms` 不再决定这两个端点的切点或首字时机；`enable_pseudo_stream=false` 仍会抑制 partial 下发。
 
+#### LLM ASR 前整段人声门控
+
+实时 final 送入 LLM ASR 前会再做一次整段人声证据判断，覆盖本地 VAD 切段和 k2 endpoint 切段后的 final。该门控只决定是否调用 LLM ASR，不裁剪音频，也不影响 k2 已经下发的 partial。
+
+| 参数 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `asr_segment_voice_gate_enabled` | bool | `true` | 是否启用 final LLM ASR 前的整段人声门控 |
+| `asr_segment_voice_gate_threshold` | float | `0.65` | 复用本地 VAD 的人声概率阈值 |
+| `asr_segment_voice_gate_min_ratio` | float | `0.05` | 整段中超过阈值的人声帧占比下限 |
+| `asr_segment_voice_gate_min_ms` | int | `120` | 整段累计人声证据时长下限（毫秒） |
+| `asr_segment_voice_gate_min_rms` | float | `0.001` | 低于该 RMS 的近数字静音直接丢弃 |
+
 #### 调试落盘 (debug dump)
 
 运维级排查开关（不可客户端覆写），用于核对“前端回放音频 / 最终文本”是否一致这类问题。配置在 `config.yaml` 的 `defaults.debug` 分组：

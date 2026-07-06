@@ -15,6 +15,7 @@ from ..asr.client import (
 from ..asr.fusion import choose_fused_result
 from ..asr.itn import normalize_final_text
 from ..audio.utils import pcm_to_wav_base64
+from ..audio.vad import segment_voice_evidence
 from ..config import SAMPLE_RATE
 from ..streaming.events import PartialSnapshot, SegmentReady
 from ..streaming.session import SessionContext
@@ -47,6 +48,24 @@ class AsrTaskEngine(BaseTaskEngine):
         cfg = ctx.cfg
         segment = seg.pcm
         audio_duration = len(segment) / SAMPLE_RATE
+        voice = segment_voice_evidence(segment, cfg)
+        if not voice.accepted:
+            logger.info(
+                "Final ASR skipped by segment voice gate: reason=%s "
+                "segment_id=%s audio=%.2fs speech_ms=%.0f ratio=%.3f "
+                "frames=%d/%d max_prob=%.3f mean_prob=%.3f rms=%.5f",
+                voice.reason,
+                seg.id or "n/a",
+                audio_duration,
+                voice.speech_ms,
+                voice.speech_ratio,
+                voice.speech_frames,
+                voice.total_frames,
+                voice.max_prob,
+                voice.mean_prob,
+                voice.rms,
+            )
+            return False
         t0 = time.monotonic()
         wav_b64 = pcm_to_wav_base64(segment)
         hw_snapshot = ctx.hotwords

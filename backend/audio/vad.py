@@ -266,6 +266,95 @@ class VADProcessor:
         self.smoothed_prob = None
 
 
+class SegmentVoiceEvidence(NamedTuple):
+    accepted: bool
+    reason: str
+    speech_frames: int
+    total_frames: int
+    speech_ratio: float
+    speech_ms: float
+    max_prob: float
+    mean_prob: float
+    rms: float
+
+
+def segment_voice_evidence(pcm: np.ndarray, cfg: Config) -> SegmentVoiceEvidence:
+    """Summarize whole-segment speech evidence before final ASR inference.
+
+    This is an admission gate, not endpointing. Local VAD and k2 decide where a
+    segment starts/ends; this pass decides whether the completed segment has
+    enough speech-like frames to justify an LLM ASR call.
+    """
+    if not cfg.asr_segment_voice_gate_enabled:
+        return SegmentVoiceEvidence(True, "disabled", 0, 0, 1.0, 0.0, 1.0, 1.0, 0.0)
+
+    pcm = np.asarray(pcm, dtype=np.float32).reshape(-1)
+    if pcm.size == 0:
+        return SegmentVoiceEvidence(False, "empty", 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+    rms = float(np.sqrt(np.mean(np.square(pcm), dtype=np.float32)))
+    if rms < cfg.asr_segment_voice_gate_min_rms:
+        return SegmentVoiceEvidence(False, "low_rms", 0, 0, 0.0, 0.0, 0.0, 0.0, rms)
+
+    processor = VADProcessor(
+        threshold=cfg.asr_segment_voice_gate_threshold,
+        silence_duration_ms=cfg.silence_duration_ms,
+        sample_rate=SAMPLE_RATE,
+        smoothing_alpha=cfg.vad_smoothing_alpha,
+        start_frames=1,
+        pre_speech_ms=cfg.vad_pre_speech_ms,
+        keep_tail_ms=cfg.vad_keep_tail_ms,
+    )
+    hop = processor.hop_size
+    used = (pcm.size // hop) * hop
+    if used <= 0:
+        return SegmentVoiceEvidence(False, "too_short", 0, 0, 0.0, 0.0, 0.0, 0.0, rms)
+
+    threshold = cfg.asr_segment_voice_gate_threshold
+    alpha = processor.smoothing_alpha
+    smoothed: float | None = None
+    probs: list[float] = []
+    speech_frames = 0
+    for i in range(0, used, hop):
+        frame = pcm[i : i + hop]
+        vad_input = processor._prepare_vad_input(frame)
+        raw_prob = processor._extract_prob(processor.vad.process(vad_input))
+        smoothed = raw_prob if smoothed is None else (alpha * smoothed) + ((1.0 - alpha) * raw_prob)
+        probs.append(smoothed)
+        if smoothed > threshold:
+            speech_frames += 1
+
+    total_frames = len(probs)
+    frame_ms = processor.frame_ms
+    speech_ms = speech_frames * frame_ms
+    speech_ratio = speech_frames / total_frames if total_frames else 0.0
+    max_prob = max(probs) if probs else 0.0
+    mean_prob = float(sum(probs) / total_frames) if total_frames else 0.0
+    min_frames = max(1, math.ceil(cfg.asr_segment_voice_gate_min_ms / frame_ms))
+
+    if speech_frames < min_frames:
+        reason = "too_few_voice_frames"
+        accepted = False
+    elif speech_ratio < cfg.asr_segment_voice_gate_min_ratio:
+        reason = "low_voice_ratio"
+        accepted = False
+    else:
+        reason = "accepted"
+        accepted = True
+
+    return SegmentVoiceEvidence(
+        accepted,
+        reason,
+        speech_frames,
+        total_frames,
+        speech_ratio,
+        speech_ms,
+        max_prob,
+        mean_prob,
+        rms,
+    )
+
+
 def vad_trim_audio(
     pcm: np.ndarray,
     target_sec: float,
