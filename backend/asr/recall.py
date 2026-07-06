@@ -400,6 +400,11 @@ def _management_sync(
                         "hotwords": hotwords or [],
                     },
                 )
+            elif action == "clear":
+                response = client.post(
+                    _management_url(management, "/hotword-pool/clear"),
+                    json={"hotword_pool_id": resolved_hotword_pool_id},
+                )
             elif action == "reload":
                 response = client.post(
                     _management_url(management, "/hotword-pool/reload"),
@@ -495,6 +500,17 @@ async def delete_hotwords(
         _management_sync,
         "delete",
         hotwords=words,
+        hotword_pool_id=hotword_pool_id,
+    )
+
+
+async def clear_hotword_pool(
+    *,
+    hotword_pool_id: str | None = None,
+) -> dict[str, object]:
+    return await asyncio.to_thread(
+        _management_sync,
+        "clear",
         hotword_pool_id=hotword_pool_id,
     )
 
