@@ -212,6 +212,11 @@ def test_shipped_config_projects_rest_bindings() -> None:
     assert cfg.k2_voice_gate_enabled is True
     assert cfg.k2_voice_gate_threshold == 0.65
     assert cfg.k2_voice_gate_start_frames == 10
+    assert cfg.asr_segment_voice_gate_enabled is True
+    assert cfg.asr_segment_voice_gate_threshold == 0.65
+    assert cfg.asr_segment_voice_gate_min_ratio == 0.05
+    assert cfg.asr_segment_voice_gate_min_ms == 120
+    assert cfg.asr_segment_voice_gate_min_rms == 0.001
     assert cfg.debug_dump_enabled is False
     assert cfg.debug_dump_dir == "debug_dumps"
     assert (
@@ -468,6 +473,25 @@ def test_k2_requires_target_and_clamps_bounds() -> None:
     assert cfg.k2_voice_gate_start_frames == 1
 
 
+def test_asr_segment_voice_gate_clamps_bounds() -> None:
+    high = Config(
+        asr_segment_voice_gate_threshold=2.0,
+        asr_segment_voice_gate_min_ratio=2.0,
+    )
+    low = Config(
+        asr_segment_voice_gate_threshold=-1.0,
+        asr_segment_voice_gate_min_ratio=-1.0,
+        asr_segment_voice_gate_min_ms=-1,
+        asr_segment_voice_gate_min_rms=-1.0,
+    )
+    assert high.asr_segment_voice_gate_threshold == 1.0
+    assert high.asr_segment_voice_gate_min_ratio == 1.0
+    assert low.asr_segment_voice_gate_threshold == 0.0
+    assert low.asr_segment_voice_gate_min_ratio == 0.0
+    assert low.asr_segment_voice_gate_min_ms == 0
+    assert low.asr_segment_voice_gate_min_rms == 0.0
+
+
 # --------------------------------------------------------------------------- #
 # override / override_client whitelist contract
 # --------------------------------------------------------------------------- #
@@ -507,6 +531,29 @@ def test_recall_knobs_client_overridable() -> None:
     assert {"enable_hotword_recall", "recall_top_k"} <= CLIENT_OVERRIDABLE_FIELDS
     out = load_config().override_client(recall_top_k=3)
     assert out.recall_top_k == 3
+
+
+def test_asr_segment_voice_gate_client_overridable() -> None:
+    fields = {
+        "asr_segment_voice_gate_enabled",
+        "asr_segment_voice_gate_threshold",
+        "asr_segment_voice_gate_min_ratio",
+        "asr_segment_voice_gate_min_ms",
+        "asr_segment_voice_gate_min_rms",
+    }
+    assert fields <= CLIENT_OVERRIDABLE_FIELDS
+    out = load_config().override_client(
+        asr_segment_voice_gate_enabled=False,
+        asr_segment_voice_gate_threshold=0.7,
+        asr_segment_voice_gate_min_ratio=0.1,
+        asr_segment_voice_gate_min_ms=200,
+        asr_segment_voice_gate_min_rms=0.002,
+    )
+    assert out.asr_segment_voice_gate_enabled is False
+    assert out.asr_segment_voice_gate_threshold == 0.7
+    assert out.asr_segment_voice_gate_min_ratio == 0.1
+    assert out.asr_segment_voice_gate_min_ms == 200
+    assert out.asr_segment_voice_gate_min_rms == 0.002
 
 
 def test_recall_user_id_default_and_validation() -> None:

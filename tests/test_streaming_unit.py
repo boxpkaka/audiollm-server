@@ -20,6 +20,7 @@ import json
 import math
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -912,6 +913,61 @@ async def test_asr_engine_on_stop_silent_on_disconnect():
 
 
 @pytest.mark.asyncio
+async def test_asr_final_segment_voice_gate_skips_llm(monkeypatch):
+    calls: list[str] = []
+
+    async def fail_primary(*_args, **_kwargs):
+        calls.append("primary")
+        raise AssertionError("primary ASR should be skipped")
+
+    async def fail_secondary(*_args, **_kwargs):
+        calls.append("secondary")
+        raise AssertionError("secondary ASR should be skipped")
+
+    monkeypatch.setattr(asr_task_mod, "query_audio_model", fail_primary)
+    monkeypatch.setattr(asr_task_mod, "query_audio_model_secondary", fail_secondary)
+    monkeypatch.setattr(
+        asr_task_mod,
+        "segment_voice_evidence",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            accepted=False,
+            reason="low_voice_ratio",
+            speech_ms=0.0,
+            speech_ratio=0.0,
+            speech_frames=0,
+            total_frames=100,
+            max_prob=0.1,
+            mean_prob=0.05,
+            rms=0.02,
+        ),
+    )
+
+    sent: list[dict] = []
+
+    async def _send_json(payload):
+        sent.append(payload)
+        return True
+
+    cfg = load_config().override(
+        enable_primary_asr=True,
+        enable_secondary_asr=True,
+        enable_dual_asr_fusion=True,
+        asr_segment_voice_gate_enabled=True,
+    )
+    ctx = SessionContext(cfg=cfg, language="zh", src_lang="Chinese", send_json=_send_json)
+    engine = AsrTaskEngine()
+
+    ok = await engine.handle_segment(
+        SegmentReady(pcm=np.zeros(1600, dtype=np.float32), id="noise-1"),
+        ctx,
+    )
+
+    assert ok is False
+    assert calls == []
+    assert sent == []
+
+
+@pytest.mark.asyncio
 async def test_asr_final_preserves_segment_id(monkeypatch):
     async def fake_query_audio_model(*_args, **_kwargs):
         return {
@@ -936,6 +992,7 @@ async def test_asr_final_preserves_segment_id(monkeypatch):
         enable_primary_asr=True,
         enable_secondary_asr=False,
         enable_dual_asr_fusion=False,
+        asr_segment_voice_gate_enabled=False,
     )
     ctx = SessionContext(cfg=cfg, language="zh", src_lang="Chinese", send_json=_send_json)
     engine = AsrTaskEngine()
