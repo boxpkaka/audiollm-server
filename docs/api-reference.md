@@ -28,7 +28,7 @@
 
 `/transcribe-streaming` 的 `final` / `final_asr` 消息除文本外会带当前语音分段的 `audio_b64`（WAV base64）、`duration_sec` 和 `effective_hotwords`（本段音频经 RAG-ASR/Triton 实际召回的热词列表，不含临时请求热词），主前端用音频字段做分段回放、可用 `effective_hotwords` 展示本段召回命中。k2 模式下该音频是同一段送入 LLM ASR 的 k2 段缓冲，不再经过本地 VAD 段首/段尾二次裁剪；完整字段见 [实时转写 WebSocket 协议](transcribe-streaming-protocol.md)。服务端开启 `debug_dump_enabled`（`defaults.debug`，运维级、不在客户端覆写白名单）后，`ready` 带 `session_id`/`dump_dir`、`final` 带 `dump_id`，并把每段音频+元信息落盘到 `<dump_dir>/<session_id>/<seg_id>.{wav,json}`，前端在气泡上显示可复制的 `dump_id`，用于回放/最终结果对账，详见协议文档“调试落盘”小节。
 
-`/tuling/ast/v3` 与上面两个任务接口的线上协议不同：音频以 base64 放在 JSON 帧，`header.status`（0/1/2）驱动状态机，无 `ready`/`start`/`stop`，结果为词图结构。模型组合上也不同：本端点恒为 primary-only（强制关闭副模型/本地 Qwen/融合，客户端无法经 `parameter.asr_config` 重开），主模型由 `astv3_vllm_*` 指定（当前留空，回退全局 primary `vllm_base_url`），而 `/transcribe-streaming` 仍按 `config.yaml` 走双模型。它兼容旧热词字段（`payload.text.text`，作为临时请求热词限量优先注入 prompt，并覆盖精确重复或整词同音的召回词）、热词池隔离（首帧 `parameter.asr_config.hotword_pool_id`，旧字段 `user_id` 继续兼容，默认 `default`）、目标说话人（先经 `POST /api/asr/enrollment` 注册，再把 id 放进首帧 `header.resIdList[0]`）与配置覆写（首帧 `parameter.asr_config`，等价于其他端点的 `start.config`）。它不遵循下文“WebSocket 调用流程”，详见 [实时转写 AST v3 WebSocket](tuling-ast-v3-protocol.md)。
+`/tuling/ast/v3` 与上面两个任务接口的线上协议不同：音频以 base64 放在 JSON 帧，`header.status`（0/1/2）驱动状态机，无 `ready`/`start`/`stop`，结果为词图结构。模型组合上也不同：本端点恒为 primary-only（强制关闭副模型/本地 Qwen/融合，客户端无法经 `parameter.asr_config` 重开），主模型由 `astv3_vllm_*` 指定（当前留空，回退全局 primary `vllm_base_url`），而 `/transcribe-streaming` 仍按 `config.yaml` 走双模型。临时热词放 `payload.text.text`；热词池隔离只用首帧 `parameter.asr_config.hotword_pool_id`；目标说话人先经 `POST /api/asr/enrollment` 注册，再把 id 放进首帧 `parameter.asr_config.enrollment_id`。`header.resIdList` 仅记录并忽略。它不遵循下文“WebSocket 调用流程”，详见 [实时转写 AST v3 WebSocket](tuling-ast-v3-protocol.md)。
 
 `/astv3-test-proxy` 是为「实时语音识别（测试用）」前端页面临时搭的同源 WebSocket 代理。该页经 HTTPS 提供，浏览器 mixed-content 策略禁止它直接打开明文 `ws://` 的远程 AST v3 后端；由后端在同源 `wss://`（经反向代理）接入后，把每一帧原样双向转发到写死的上游 `ws://159.138.9.106:18082/tuling/ast/v3`。它不解析 AST v3 信封，线上协议与 `/tuling/ast/v3` 完全一致（见 [实时转写 AST v3 WebSocket](tuling-ast-v3-protocol.md)）；上游连接失败时服务端以 close code 1011 关闭连接。临时测试设施：上游地址写死、前端不暴露任何可选项，外部集成请直接使用 `/tuling/ast/v3`。
 
@@ -36,15 +36,15 @@
 
 | 方法 | 路径 | 任务 | 表单字段 |
 |---|---|---|---|
-| POST | `/api/asr/upload` | 上传整段音频做 ASR（短音频，尾截 60 秒） | `audio`、`language`、`hotwords`、`hotword_pool_id`/`user_id`、`enrollment_id` |
-| POST | `/api/asr/transcriptions` | 异步长音频离线转写（202 + 轮询，会议纪要场景） | `audio`、`language`、`hotwords`、`hotword_pool_id`/`user_id` |
+| POST | `/api/asr/upload` | 上传整段音频做 ASR（短音频，尾截 60 秒） | `audio`、`language`、`hotwords`、`hotword_pool_id`、`enrollment_id` |
+| POST | `/api/asr/transcriptions` | 异步长音频离线转写（202 + 轮询，会议纪要场景） | `audio`、`language`、`hotwords`、`hotword_pool_id` |
 | GET | `/api/asr/transcriptions/{job_id}` | 查询转写任务状态、进度与分段结果 | — |
 | POST | `/api/asr/enrollment` | 上传目标说话人音频（1-8 秒）注册 | `audio` |
 | DELETE | `/api/asr/enrollment/{enrollment_id}` | 删除注册音频 | — |
-| GET | `/api/asr/hotword-pool` | 查询热词池 | `hotword_pool_id`/`user_id`、`query`、`limit`、`offset` |
-| POST | `/api/asr/hotword-pool` | 向热词池添加热词 | JSON `hotword_pool_id`/`user_id`、`hotwords` |
-| DELETE | `/api/asr/hotword-pool` | 从热词池删除热词 | JSON `hotword_pool_id`/`user_id`、`hotwords` |
-| POST | `/api/asr/hotword-pool/reload` | 让 RAG-ASR 从热词池文件 reload 热词 | `hotword_pool_id`/`user_id` |
+| GET | `/api/asr/hotword-pool` | 查询热词池 | `hotword_pool_id`、`query`、`limit`、`offset` |
+| POST | `/api/asr/hotword-pool` | 向热词池添加热词 | JSON `hotword_pool_id`、`hotwords` |
+| DELETE | `/api/asr/hotword-pool` | 从热词池删除热词 | JSON `hotword_pool_id`、`hotwords` |
+| POST | `/api/asr/hotword-pool/reload` | 让 RAG-ASR 从热词池文件 reload 热词 | `hotword_pool_id` |
 | POST | `/api/emotion/jobs` | 异步整段情感识别（202 + 轮询） | `audio`、`mode`、`language` |
 | GET | `/api/emotion/jobs/{job_id}` | 查询情感任务状态与结果 | — |
 | POST | `/api/audio/analyze` | 非实时聚合分析：ASR 原始结果、文本清洗、情感标签和情感描述 | `audio`、`language`、`hotwords`、`enrollment_id` |
@@ -79,7 +79,7 @@ bytes_per_ms = 16000 * 1 * 2 / 1000 = 32
 }
 ```
 
-各任务可以在此基础上增加字段，例如 ASR 的 `language` / `hotword_pool_id` / `user_id` / `hotwords` / `enrollment_id`、情感识别的 `mode`。`hotword_pool_id` 是推荐的热词池隔离 ID，默认 `default`；`user_id` 是旧字段兼容别名。`hotwords` 是兼容旧客户端的临时请求热词字段，当前 ASR 偏置来自该热词池召回。`/transcribe-streaming` 携带 `enrollment_id` 时会切换为目标说话人模式，详见 [通用流式 ASR WebSocket](transcribe-streaming-protocol.md)。
+各任务可以在此基础上增加字段，例如 ASR 的 `language` / `hotword_pool_id` / `hotwords` / `enrollment_id`、情感识别的 `mode`。`hotword_pool_id` 是热词池隔离 ID，默认 `default`；`hotwords` 是临时请求热词字段，当前 ASR 偏置来自该热词池召回。`/transcribe-streaming` 携带 `enrollment_id` 时会切换为目标说话人模式，详见 [通用流式 ASR WebSocket](transcribe-streaming-protocol.md)。
 
 ### 临时配置覆写
 
@@ -244,7 +244,7 @@ curl -X POST http://172.16.0.3:8080/api/asr/transcriptions \
 
 ### 目标说话人注册
 
-`POST /api/asr/enrollment` 上传一段目标说话人音频，返回不透明的 `enrollment_id` 供后续请求复用：`/transcribe-streaming` 放进 `start.enrollment_id`、`/tuling/ast/v3` 放进首帧 `header.resIdList[0]`、REST 的 `/api/asr/upload` 与 `/api/audio/analyze` 作为表单字段 `enrollment_id`。
+`POST /api/asr/enrollment` 上传一段目标说话人音频，返回不透明的 `enrollment_id` 供后续请求复用：`/transcribe-streaming` 放进 `start.enrollment_id`、`/tuling/ast/v3` 放进首帧 `parameter.asr_config.enrollment_id`、REST 的 `/api/asr/upload` 与 `/api/audio/analyze` 作为表单字段 `enrollment_id`。
 
 ```bash
 curl -X POST http://172.16.0.3:8080/api/asr/enrollment \
@@ -279,11 +279,11 @@ curl -X POST http://172.16.0.3:8080/api/asr/enrollment \
 
 `enrollment_id` 失效（过期 / 重启 / 被 LRU 淘汰 / 删除，或灰度下沉链路中 RAG-ASR 管理服务缺失对应 embedding）后再被使用时，默认兼容语义是静默回退为普通 ASR、不返回 error：WS 路径仅记 WARN（见“WebSocket 错误消息”），REST `/api/asr/upload` 响应 `enrollment_used` 为 `false`。集成方应对失效有预期，必要时重新注册并更新所携带的 id。
 
-`asr_enrollment_min_sec` / `asr_enrollment_max_sec` / `asr_enrollment_ttl_sec` 虽在客户端覆写白名单内（见“临时配置覆写”），但注册是独立的 REST 调用、恒按服务端默认执行；流式端点首帧覆写这些值不会改变已注册 id 的行为。通用流式端点的 `start.enrollment_id` / `update_hotwords.enrollment_id` 用法与 TS-ASR 双音频 prompt 模板见 [通用流式 ASR WebSocket](transcribe-streaming-protocol.md)；AST v3 集成只需按本节注册，并按 [实时转写 AST v3 WebSocket](tuling-ast-v3-protocol.md) 把 id 放入 `header.resIdList[0]`。
+`asr_enrollment_min_sec` / `asr_enrollment_max_sec` / `asr_enrollment_ttl_sec` 虽在客户端覆写白名单内（见“临时配置覆写”），但注册是独立的 REST 调用、恒按服务端默认执行；流式端点首帧覆写这些值不会改变已注册 id 的行为。通用流式端点的 `start.enrollment_id` / `update_hotwords.enrollment_id` 用法与 TS-ASR 双音频 prompt 模板见 [通用流式 ASR WebSocket](transcribe-streaming-protocol.md)；AST v3 集成只需按本节注册，并按 [实时转写 AST v3 WebSocket](tuling-ast-v3-protocol.md) 把 id 放入 `parameter.asr_config.enrollment_id`。
 
 ### 热词池管理
 
-ASR 热词偏置按 `hotword_pool_id` 维护热词池，旧字段 `user_id` 继续兼容。final 段先在当前热词池内召回 `recall_top_k` 个相关热词，再让少量请求临时 `hotwords`（默认 `recall_custom_hotword_limit=8`，去重、不写入热词池）优先进入主 ASR prompt，并过滤与请求热词精确重复或整词同音（忽略声调）的召回词；伪流式 partial 不执行召回、不注入热词、也不走 encoder bypass，只使用纯 vLLM raw-audio 推理。池管理接口优先代理 `services.recall_management` 指向的 RAG-ASR HTTP 管理服务；未配置管理服务时回退旧 Triton 管理兼容路径，不在 demo 进程内复制热词状态。未传热词池 ID 时使用 `config.yaml` 的 `hotword_pool_id` / `recall_user_id`，默认 `default`。
+ASR 热词偏置按 `hotword_pool_id` 维护热词池。final 段先在当前热词池内召回 `recall_top_k` 个相关热词，再让少量请求临时 `hotwords`（默认 `recall_custom_hotword_limit=8`，去重、不写入热词池）优先进入主 ASR prompt，并过滤与请求热词精确重复或整词同音（忽略声调）的召回词；伪流式 partial 不执行召回、不注入热词、也不走 encoder bypass，只使用纯 vLLM raw-audio 推理。池管理接口优先代理 `services.recall_management` 指向的 RAG-ASR HTTP 管理服务；未配置管理服务时使用 Triton 管理路径，不在 demo 进程内复制热词状态。未传热词池 ID 时使用 `config.yaml` 的 `hotword_pool_id`，默认 `default`。
 
 ```bash
 curl 'http://172.16.0.3:8080/api/asr/hotword-pool?hotword_pool_id=tenant-a&limit=20'
@@ -298,10 +298,10 @@ curl -X POST 'http://172.16.0.3:8080/api/asr/hotword-pool/reload?hotword_pool_id
 
 | 接口 | 请求 | 响应 |
 |---|---|---|
-| `GET /api/asr/hotword-pool` | query 参数 `hotword_pool_id`（或兼容 `user_id`）、`query`、`limit`、`offset` | RAG-ASR 返回的 `status`、`hotwords`、`total_count`、分页元信息 |
-| `POST /api/asr/hotword-pool` | JSON `{ "hotword_pool_id": "tenant-a", "hotwords": ["词1", "词2"] }`，兼容 `user_id` | 新增数量、重复/非法项、当前总量 |
-| `DELETE /api/asr/hotword-pool` | JSON `{ "hotword_pool_id": "tenant-a", "hotwords": ["词1", "词2"] }`，兼容 `user_id` | 删除数量、缺失项、当前总量 |
-| `POST /api/asr/hotword-pool/reload` | query 参数 `hotword_pool_id`（或兼容 `user_id`） | 从 RAG-ASR 对应热词池文件重载后的总量 |
+| `GET /api/asr/hotword-pool` | query 参数 `hotword_pool_id`、`query`、`limit`、`offset` | RAG-ASR 返回的 `status`、`hotwords`、`total_count`、分页元信息 |
+| `POST /api/asr/hotword-pool` | JSON `{ "hotword_pool_id": "tenant-a", "hotwords": ["词1", "词2"] }` | 新增数量、重复/非法项、当前总量 |
+| `DELETE /api/asr/hotword-pool` | JSON `{ "hotword_pool_id": "tenant-a", "hotwords": ["词1", "词2"] }` | 删除数量、缺失项、当前总量 |
+| `POST /api/asr/hotword-pool/reload` | query 参数 `hotword_pool_id` | 从 RAG-ASR 对应热词池文件重载后的总量 |
 
 ### 情感上传
 

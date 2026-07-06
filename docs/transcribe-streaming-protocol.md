@@ -73,15 +73,14 @@ Client                                      Server
 | `sample_rate_hz` | integer | 是 | 固定为 `16000` |
 | `channels` | integer | 是 | 固定为 `1` |
 | `language` | string | 否 | 语言代码；与 query 参数二选一即可 |
-| `hotword_pool_id` | string | 否 | 推荐字段，热词池隔离 ID，默认 `default`；只召回该热词池 |
-| `user_id` | string | 否 | 兼容字段，语义同 `hotword_pool_id`；两者同时传时优先使用 `hotword_pool_id` |
+| `hotword_pool_id` | string | 否 | 热词池隔离 ID，默认 `default`；只召回该热词池 |
 | `hotwords` | string[] | 否 | 临时请求热词；final 段会把去重后的前 `recall_custom_hotword_limit` 个优先注入 prompt，并覆盖精确重复或整词同音（忽略声调）的 RAG-ASR 召回热词，不写入热词池 |
 | `enrollment_id` | string | 否 | 由 `POST /api/asr/enrollment` 返回的目标说话人 id；传 `null` 或省略表示普通 ASR |
 | `config` | object | 否 | 当前连接的服务端配置覆写，仅白名单字段生效（见“可覆写配置”） |
 
 ### update_hotwords
 
-兼容旧客户端的控制消息。`hotwords` 字段会被接收为后续 final 段的临时请求热词：服务端会把去重后的前 `recall_custom_hotword_limit` 个优先注入 prompt，并过滤当前热词池中精确重复或整词同音（忽略声调）的召回词，但不会写入热词池。该消息仍可用于切换/清除目标说话人，也可用 `hotword_pool_id` 或兼容字段 `user_id` 切换热词池。
+`hotwords` 字段会被接收为后续 final 段的临时请求热词：服务端会把去重后的前 `recall_custom_hotword_limit` 个优先注入 prompt，并过滤当前热词池中精确重复或整词同音（忽略声调）的召回词，但不会写入热词池。该消息仍可用于切换/清除目标说话人，也可用 `hotword_pool_id` 切换热词池。
 
 ```json
 {
@@ -98,8 +97,7 @@ Client                                      Server
 | `type` | string | 是 | 固定为 `update_hotwords` |
 | `hotwords` | string[] | 是 | 临时请求热词；空数组表示清空后续 final 段的临时热词，不会改变 RAG-ASR 热词池 |
 | `src_lang` | string | 否 | 语言代码或语言名称 |
-| `hotword_pool_id` | string | 否 | 切换后续 final 段使用的热词池；非法值会返回 `invalid_user_id` 错误并保持原热词池 |
-| `user_id` | string | 否 | 兼容字段，语义同 `hotword_pool_id` |
+| `hotword_pool_id` | string | 否 | 切换后续 final 段使用的热词池；非法值会返回 `invalid_hotword_pool_id` 错误并保持原热词池 |
 | `enrollment_id` | string \| null | 否 | 切换或清除目标说话人；缺省字段则保持原状，显式传 `null` 表示清除 |
 
 ### 二进制音频帧
@@ -265,8 +263,7 @@ python docs/examples/ws_transcribe.py sample.wav \
 |---|---|---|---|
 | `audio` | file | 是 | WAV 音频文件 |
 | `language` | string | 否 | 语言代码 |
-| `hotword_pool_id` | string | 否 | 推荐字段，热词池隔离 ID，默认 `default` |
-| `user_id` | string | 否 | 兼容字段，语义同 `hotword_pool_id` |
+| `hotword_pool_id` | string | 否 | 热词池隔离 ID，默认 `default` |
 | `hotwords` | string | 否 | 临时请求热词；去重限量后优先进入 prompt，并覆盖精确重复或整词同音（忽略声调）的 RAG-ASR 召回热词，不写入热词池 |
 | `enrollment_id` | string | 否 | 由 `POST /api/asr/enrollment` 返回的目标说话人 id；不传或失效时静默回退到普通 ASR |
 
@@ -392,7 +389,7 @@ print(r.json())
 
 ## ASR Prompt 模板
 
-后端按主模型 upstream 的 `prompt_template` 选择 prompt 结构。热词偏置来自当前 `hotword_pool_id` 的 RAG-ASR 热词池召回 top-K 结果（旧字段 `user_id` 兼容），以及优先进入 prompt 的少量请求临时 `hotwords`（默认最多 8 个，去重后不写入热词池）；与临时热词精确重复或整词同音（忽略声调）的召回词会被过滤。模板选择是服务端模型配置，不可客户端覆写。两套模板都支持普通 ASR、召回热词、TS-ASR、TS-ASR + 召回热词。
+后端按主模型 upstream 的 `prompt_template` 选择 prompt 结构。热词偏置来自当前 `hotword_pool_id` 的 RAG-ASR 热词池召回 top-K 结果，以及优先进入 prompt 的少量请求临时 `hotwords`（默认最多 8 个，去重后不写入热词池）；与临时热词精确重复或整词同音（忽略声调）的召回词会被过滤。模板选择是服务端模型配置，不可客户端覆写。两套模板都支持普通 ASR、召回热词、TS-ASR、TS-ASR + 召回热词。
 
 ### `amphion_asr`（Amphion 4B）
 

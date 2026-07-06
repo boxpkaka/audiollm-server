@@ -334,7 +334,7 @@ def test_transcription_http_create_poll_succeeds(fake_vad, monkeypatch):
         create = client.post(
             "/api/asr/transcriptions",
             files={"audio": ("meeting.wav", wav, "audio/wav")},
-            data={"language": "zh", "hotwords": "挚音科技", "user_id": "tenant-a"},
+            data={"language": "zh", "hotwords": "挚音科技", "hotword_pool_id": "tenant-a"},
         )
         assert create.status_code == 202
         body = create.json()

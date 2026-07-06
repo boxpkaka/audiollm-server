@@ -88,7 +88,7 @@ async def test_audio_analyze_returns_asr_cleanup_and_emotion(monkeypatch):
         audio=upload,
         language="zh",
         hotwords="挚音科技,张硕",
-        user_id="tenant-a",
+        hotword_pool_id="tenant-a",
     )
 
     assert result["type"] == "audio_analysis"
@@ -130,7 +130,7 @@ async def test_asr_upload_passes_hotword_pool_id(monkeypatch):
         audio=upload,
         language="zh",
         hotwords="",
-        user_id="tenant-a",
+        hotword_pool_id="tenant-a",
     )
 
     assert result["type"] == "final"

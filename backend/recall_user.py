@@ -5,16 +5,11 @@ from __future__ import annotations
 import re
 
 DEFAULT_HOTWORD_POOL_ID = "default"
-DEFAULT_RECALL_USER_ID = DEFAULT_HOTWORD_POOL_ID
 _HOTWORD_POOL_ID_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]*$")
-_USER_ID_RE = _HOTWORD_POOL_ID_RE
 
 
 class HotwordPoolIdError(ValueError):
     """Raised when a hotword-pool id is not safe to forward."""
-
-
-RecallUserIdError = HotwordPoolIdError
 
 
 def normalize_hotword_pool_id(
@@ -30,16 +25,7 @@ def normalize_hotword_pool_id(
         or not _HOTWORD_POOL_ID_RE.fullmatch(hotword_pool_id)
     ):
         raise HotwordPoolIdError(
-            "HOTWORD_POOL_ID/USER_ID must contain only letters, digits, dot, "
+            "HOTWORD_POOL_ID must contain only letters, digits, dot, "
             "underscore, or hyphen"
         )
     return hotword_pool_id
-
-
-def normalize_recall_user_id(
-    value: object | None = None,
-    *,
-    default: str = DEFAULT_RECALL_USER_ID,
-) -> str:
-    """Backward-compatible alias for hotword-pool id normalization."""
-    return normalize_hotword_pool_id(value, default=default)

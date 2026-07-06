@@ -145,12 +145,12 @@ async def test_query_audio_model_uses_triton_enrollment_embeds(monkeypatch):
             vllm_prompt_template="amphion_asr_1.7b",
         ),
         enrollment_id="speaker-1",
-        enrollment_user_id="default",
+        enrollment_scope_id="default",
     )
 
     recall_kwargs = captured["recall_kwargs"]
     assert recall_kwargs["enrollment_id"] == "speaker-1"
-    assert recall_kwargs["enrollment_user_id"] == "default"
+    assert recall_kwargs["enrollment_scope_id"] == "default"
     assert recall_kwargs["want_enrollment_audio_embeds"] is True
     messages = captured["messages"]
     assert isinstance(messages, list)

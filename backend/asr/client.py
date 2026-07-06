@@ -361,9 +361,8 @@ async def query_audio_model(
     timeout: float | None = None,
     runtime_config: Config | None = None,
     hotword_pool_id: str | None = None,
-    recall_user_id: str | None = None,
     enrollment_id: str | None = None,
-    enrollment_user_id: str | None = None,
+    enrollment_scope_id: str | None = None,
     session_id: str = "",
     gateway_trace_id: str = "",
 ) -> ASRResult:
@@ -377,7 +376,7 @@ async def query_audio_model(
     _ = src_lang  # noqa: F841 — preserved for compatibility, see docstring
     cfg = runtime_config or default_config
     template = prompt_template or cfg.vllm_prompt_template
-    resolved_hotword_pool_id = hotword_pool_id or recall_user_id
+    resolved_hotword_pool_id = hotword_pool_id
     request_hotwords = list(hotwords or [])
     effective_hotwords = request_hotwords
     recalled_hotwords: list[str] = []
@@ -419,7 +418,7 @@ async def query_audio_model(
                 want_audio_embeds=want_bypass,
                 hotword_pool_id=resolved_hotword_pool_id,
                 enrollment_id=enrollment_id if want_enrollment_bypass else None,
-                enrollment_user_id=enrollment_user_id if want_enrollment_bypass else None,
+                enrollment_scope_id=enrollment_scope_id if want_enrollment_bypass else None,
                 want_enrollment_audio_embeds=want_enrollment_bypass,
             )
             recall_latency_ms = (time.monotonic() - recall_t0) * 1000.0
@@ -441,7 +440,7 @@ async def query_audio_model(
             if want_enrollment_bypass and recalled_enrollment_embeds:
                 enrollment_audio_embeds_b64 = recalled_enrollment_embeds
                 enrollment_owner = (
-                    enrollment_user_id
+                    enrollment_scope_id
                     or resolved_hotword_pool_id
                     or cfg.hotword_pool_id
                 )

@@ -2,7 +2,7 @@
 
 `POST /api/audio/analyze` 面向离线音频处理场景。调用方上传一段 WAV 音频，服务端返回 ASR 识别文本、清洗后的转写文本，以及情感理解结果。情感理解默认同时返回分类标签和文本描述。
 
-热词偏置来自当前 `hotword_pool_id` 对应的 RAG-ASR 热词池对音频召回的 top-K 结果，并让少量表单 `hotwords` 临时热词优先进入 ASR prompt（默认最多 8 个，去重后不写入热词池），同时过滤与临时热词精确重复或整词同音（忽略声调）的召回词。旧字段 `user_id` 继续作为兼容别名。`hotwords` 不会传给文本清洗阶段；文本清洗只负责标点、空格、重复词和明显文本格式问题，不做基于热词的事后替换。
+热词偏置来自当前 `hotword_pool_id` 对应的 RAG-ASR 热词池对音频召回的 top-K 结果，并让少量表单 `hotwords` 临时热词优先进入 ASR prompt（默认最多 8 个，去重后不写入热词池），同时过滤与临时热词精确重复或整词同音（忽略声调）的召回词。`hotwords` 不会传给文本清洗阶段；文本清洗只负责标点、空格、重复词和明显文本格式问题，不做基于热词的事后替换。
 
 ## 接口信息
 
@@ -20,7 +20,6 @@
 | `audio` | file | 是 | WAV 音频文件 |
 | `language` | string | 否 | 语言代码，如 `zh`、`en` |
 | `hotword_pool_id` | string | 否 | 推荐字段，热词池隔离 ID，默认 `default` |
-| `user_id` | string | 否 | 兼容字段，语义同 `hotword_pool_id` |
 | `hotwords` | string | 否 | 临时请求热词；去重限量后优先进入 ASR prompt，并覆盖精确重复或整词同音（忽略声调）的 RAG-ASR 召回热词，不写入热词池 |
 
 ## 调用示例

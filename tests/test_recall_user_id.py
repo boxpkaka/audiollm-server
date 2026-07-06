@@ -44,7 +44,7 @@ class _FakeResult:
         if name == "STATUS":
             return np.array(["ok"], dtype=object)
         if name == "MESSAGE":
-            return np.array(['{"user_id":"tenant-a"}'], dtype=object)
+            return np.array(['{"hotword_pool_id":"tenant-a"}'], dtype=object)
         if name == "HOTWORD_COUNT":
             return np.array([1], dtype=np.int32)
         if name == "HOTWORD_LIST":
@@ -135,7 +135,7 @@ async def test_recall_audio_sends_hotword_pool_id(monkeypatch):
 
     result = await recall_mod.recall_audio(
         np.zeros(160, dtype=np.float32),
-        Config(recall_top_k=1, recall_user_id="default"),
+        Config(recall_top_k=1, hotword_pool_id="default"),
         want_audio_embeds=False,
         hotword_pool_id="tenant-a",
     )

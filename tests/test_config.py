@@ -556,16 +556,11 @@ def test_asr_segment_voice_gate_client_overridable() -> None:
     assert out.asr_segment_voice_gate_min_rms == 0.002
 
 
-def test_recall_user_id_default_and_validation() -> None:
+def test_hotword_pool_id_default_and_validation() -> None:
     cfg = load_config()
     assert cfg.hotword_pool_id == "default"
-    assert cfg.recall_user_id == "default"
     out = cfg.override(hotword_pool_id="tenant-a")
     assert out.hotword_pool_id == "tenant-a"
-    assert out.recall_user_id == "tenant-a"
-    legacy = cfg.override(recall_user_id="tenant-b")
-    assert legacy.hotword_pool_id == "tenant-b"
-    assert legacy.recall_user_id == "tenant-b"
     with pytest.raises(ValueError, match="HOTWORD_POOL_ID"):
         cfg.override(hotword_pool_id="../escape")
 

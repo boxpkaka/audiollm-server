@@ -64,7 +64,7 @@
 
     const SYNC_PILL_BASE = 'status-pill';
     const HOTWORD_POOL_LIMIT = 1000;
-    const HOTWORD_USER_STORAGE_KEY = 'asr_hotword_user_id';
+    const HOTWORD_USER_STORAGE_KEY = 'asr_hotword_pool_id';
     const UI_TO_API_LANG = {
       chinese: 'Chinese',
       english: 'English',
@@ -147,7 +147,7 @@
 
     function hotwordPoolQuery(params) {
       const query = new URLSearchParams(params || {});
-      query.set('user_id', currentHotwordUserId());
+      query.set('hotword_pool_id', currentHotwordUserId());
       return query.toString();
     }
 
@@ -243,7 +243,7 @@
         const resp = await fetch('/api/asr/hotword-pool', {
           method,
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ hotwords: clean, user_id: currentHotwordUserId() }),
+          body: JSON.stringify({ hotwords: clean, hotword_pool_id: currentHotwordUserId() }),
         });
         await readJsonResponse(resp);
         await loadHotwordPool();
@@ -429,7 +429,7 @@
         parameter: {
           asr_config: {
             language: apiLangFromUi(srcLangUi),
-            user_id: currentHotwordUserId(),
+            hotword_pool_id: currentHotwordUserId(),
             vad_start_frames: 10,
             pseudo_stream_first_partial_ms: 100,
           },

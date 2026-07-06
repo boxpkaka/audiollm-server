@@ -44,10 +44,13 @@ Client                                      Server
     "traceId": "traceId123456",
     "appId": "123456",
     "bizId": "39769795890",
-    "status": 0,
-    "resIdList": ["234567", "345678"]
+    "status": 0
   },
   "parameter": {
+    "asr_config": {
+      "hotword_pool_id": "tenant-a",
+      "enrollment_id": "234567"
+    },
     "engine": {
       "wdec_param_LanguageTypeChoice": "3"
     }
@@ -67,7 +70,7 @@ Client                                      Server
 | traceId | String | 是 | 日志追踪 id，原样回显到响应 header.traceId |
 | appId | String | 否 | 应用系统 id，仅记录日志 |
 | bizId | String | 是 | 业务 id，仅记录日志 |
-| resIdList | List<String> | 否 | 目标说话人 enrollment id 列表，取 resIdList[0] 作为目标说话人（TS-ASR），需先经 REST 注册获取；仅用第一个，不做多说话人分离（见“目标说话人”章节） |
+| resIdList | List<String> | 否 | 已废弃；服务端仅记录并忽略，不作为目标说话人字段 |
 | status | int | 是 | 请求状态：0 首帧，1 中间帧，2 尾帧 |
 
 ### parameter
@@ -75,20 +78,20 @@ Client                                      Server
 | 字段 | 类型 | 必传 | 说明 |
 |---|---|---|---|
 | engine | Map | 否 | 引擎透传参数，仅记录日志，当前不映射到任何行为（见已知限制）。兼容 SDK 使用的 parameter.service |
-| asr_config | Map | 否 | 本服务扩展的 per-connection 配置覆写与热词池 ID 承载槽，仅首帧（status=0）读取，仅当前连接生效、不落盘。推荐 `hotword_pool_id`，旧字段 `user_id` 继续兼容；详见“配置覆写”章节 |
+| asr_config | Map | 否 | 本服务扩展的 per-connection 配置覆写、热词池 ID 与目标说话人 enrollment ID 承载槽，仅首帧（status=0）读取，仅当前连接生效、不落盘；详见“配置覆写”章节 |
 
 ### payload
 
 | 字段 | 类型 | 必传 | 说明 |
 |---|---|---|---|
 | payload.audio.audio | String | 是 | base64 编码的 PCM 音频分片 |
-| payload.text.text | String | 否 | 兼容旧客户端的文本类型热词字段；会被解析为临时请求热词，final 段去重限量后优先进入 prompt，并覆盖精确重复或整词同音（忽略声调）的 RAG-ASR 召回热词，不写入热词池 |
+| payload.text.text | String | 否 | AST v3 临时热词字段；会被解析为临时请求热词，final 段去重限量后优先进入 prompt，并覆盖精确重复或整词同音（忽略声调）的 RAG-ASR 召回热词，不写入热词池 |
 
 ### 状态机与音频
 
 | status | 含义 | 服务端处理 |
 |---|---|---|
-| 0 | 首帧 | 建立会话、捕获 traceId、生成 sid；兼容读取旧热词字段作为临时请求热词；若本帧带音频则同时送入 VAD |
+| 0 | 首帧 | 建立会话、捕获 traceId、生成 sid；读取 `payload.text.text` 作为临时请求热词；若本帧带音频则同时送入 VAD |
 | 1 | 中间帧 | 解码音频送入 VAD |
 | 2 | 尾帧 | 先送本帧音频，再 flush 残余音频结束会话 |
 
@@ -96,15 +99,15 @@ Client                                      Server
 
 ## 配置覆写（parameter.asr_config）
 
-`parameter.asr_config` 是本服务在 AST v3 信封上的扩展槽位，用于按连接临时调参，也承载 RAG-ASR 热词池隔离 ID。推荐字段是 `hotword_pool_id`，旧字段 `user_id` 继续兼容；它与讯飞 `parameter.engine`（仅记录日志、不映射行为）并列、互不影响。仅在首帧（status=0）读取，仅对当前连接生效、不落盘；新连接或服务重启都回到服务端默认。
+`parameter.asr_config` 是本服务在 AST v3 信封上的扩展槽位，用于按连接临时调参，也承载 RAG-ASR 热词池隔离 ID 和目标说话人 enrollment ID。热词池只使用 `hotword_pool_id`，声纹只使用 `enrollment_id`；它与讯飞 `parameter.engine`（仅记录日志、不映射行为）并列、互不影响。仅在首帧（status=0）读取，仅对当前连接生效、不落盘；新连接或服务重启都回到服务端默认。
 
 取值优先级（后者覆盖前者）：`backend/config.py` 内置默认 → `config.yaml` 服务端默认 → `parameter.asr_config` 客户端临时覆写。
 
-只接受白名单内的扁平字段名；未知字段、受限字段（模型地址、密钥、连接池/队列等基础设施项）以及非法值会被忽略并保持服务端默认，不会中断连接。`language`、`hotword_pool_id` 和兼容字段 `user_id` 是特例：`language` 会被用作本次会话语言（等价于 `/transcribe-streaming` 的 `start.language`），`hotword_pool_id` / `user_id` 会被用作热词池隔离 ID（默认 `default`），不会进入配置覆写白名单。两者同时存在时优先使用 `hotword_pool_id`。
+只接受白名单内的扁平字段名；未知字段、受限字段（模型地址、密钥、连接池/队列等基础设施项）以及非法值会被忽略并保持服务端默认，不会中断连接。`language`、`hotword_pool_id` 和 `enrollment_id` 是特例：`language` 会被用作本次会话语言（等价于 `/transcribe-streaming` 的 `start.language`），`hotword_pool_id` 会被用作热词池隔离 ID（默认 `default`），`enrollment_id` 会被用作目标说话人声纹 ID，这些字段不会进入配置覆写白名单。
 
 可覆写字段与 `/transcribe-streaming` 的 `start.config` 共用同一白名单（`backend/config.py` 的 `CLIENT_OVERRIDABLE_FIELDS`）。下面按类别逐字段说明语义：默认列为服务端 `config.yaml` 当前生效值，本端点列标注该字段在 AST v3 是否产生可观察效果（本端点恒为 primary-only，副模型与融合相关字段即使传入也不生效）。
 
-当服务端启用 `k2_enabled=true` 时，本端点的 `Progressive` 中间结果来自外部 k2 流式 ASR，`sentence` 终稿仍由本服务 LLM ASR 产生。k2 只做纯识别，不接热词、不接 `header.resIdList` 目标说话人、不返回 token timestamps；热词召回、目标说话人过滤、ITN 与车牌规范化只作用于 sentence。此时切段权威是 k2 endpoint，本服务只保留有界缓冲，并在 Progressive/sentence 进入下游前用 `k2_voice_gate_*` 确认有人声证据；voice gate 只做放行/丢弃，不裁剪段首/段尾，`bg` / `ed` 仍反映该 k2 段缓冲边界。VAD 与伪流式间隔类覆写仍会被接受但不再决定切点或首字时机；`enable_pseudo_stream=false` 仍会抑制 Progressive 下发。
+当服务端启用 `k2_enabled=true` 时，本端点的 `Progressive` 中间结果来自外部 k2 流式 ASR，`sentence` 终稿仍由本服务 LLM ASR 产生。k2 只做纯识别，不接热词、不接目标说话人、不返回 token timestamps；热词召回、目标说话人过滤、ITN 与车牌规范化只作用于 sentence。此时切段权威是 k2 endpoint，本服务只保留有界缓冲，并在 Progressive/sentence 进入下游前用 `k2_voice_gate_*` 确认有人声证据；voice gate 只做放行/丢弃，不裁剪段首/段尾，`bg` / `ed` 仍反映该 k2 段缓冲边界。VAD 与伪流式间隔类覆写仍会被接受但不再决定切点或首字时机；`enable_pseudo_stream=false` 仍会抑制 Progressive 下发。
 
 VAD / 分段（凡按帧计的字段，其帧时长由 VAD 后端 hop 决定：ten-vad 约 16 ms/帧，能量兜底约 10 ms/帧）：
 
@@ -158,7 +161,7 @@ TS-ASR 注册参数（约束注册接口的时长校验与缓存 TTL）：
 | asr_enrollment_max_sec | float（秒） | 8.0 | 注册音频最大时长，超出尾截 | 首帧覆写无可观察效果 |
 | asr_enrollment_ttl_sec | float（秒） | 3600 | 注册缓存 TTL，最近一次使用后重新计时 | 首帧覆写无可观察效果 |
 
-这三项只在注册接口 `POST /api/asr/enrollment`（独立的 REST 调用，按服务端默认执行）生效。AST v3 首帧经 `header.resIdList` 携带的是已注册 id，本端点既不重新注册、也不消费这些值，因此在 `parameter.asr_config` 里覆写它们不会改变本连接的目标说话人行为。
+这三项只在注册接口 `POST /api/asr/enrollment`（独立的 REST 调用，按服务端默认执行）生效。AST v3 首帧经 `parameter.asr_config.enrollment_id` 携带的是已注册 id，本端点既不重新注册、也不消费这些值，因此在 `parameter.asr_config` 里覆写这些生命周期参数不会改变本连接的目标说话人行为。
 
 共享白名单还包含情感类字段（`emotion_*`，如 `emotion_task_mode`、`emotion_request_timeout` 等），仅对情感端点有效，对本 ASR 端点无效。完整白名单与各字段按类别速览见 [API 总览](api-reference.md) 的“临时配置覆写”。
 
@@ -217,17 +220,21 @@ TS-ASR 注册参数（约束注册接口的时长校验与缓存 TTL）：
 支持只转写指定说话人的语音，复用与 `/transcribe-streaming` 相同的注册机制，分两步：
 
 1. 注册：通过 `POST /api/asr/enrollment` 上传 1-8 秒目标说话人音频，支持 WAV、MP3 和 raw PCM（16 kHz mono s16le），拿到 `enrollment_id`（见 [API 总览](api-reference.md) 的注册接口）。默认本地缓存注册音频；灰度打开 `enable_triton_enrollment_store=true` 且配置 RAG-ASR 管理服务后，新注册音频会转发给 RAG-ASR 保存 embedding tensor 和元数据。
-2. 携带：在首帧（status=0）把该 id 放进 `header.resIdList`，服务端取 `resIdList[0]` 作为目标说话人。
+2. 携带：在首帧（status=0）把该 id 放进 `parameter.asr_config.enrollment_id`。
 
 ```json
 {
   "header": {
     "traceId": "traceId123456",
     "bizId": "39769795890",
-    "status": 0,
-    "resIdList": ["ule8QilVjZql30Q9oy9kiQ"]
+    "status": 0
   },
-  "parameter": { "engine": {} },
+  "parameter": {
+    "engine": {},
+    "asr_config": {
+      "enrollment_id": "ule8QilVjZql30Q9oy9kiQ"
+    }
+  },
   "payload": { "audio": { "audio": "JiuY3iK9AAB..." } }
 }
 ```
@@ -235,9 +242,9 @@ TS-ASR 注册参数（约束注册接口的时长校验与缓存 TTL）：
 说明：
 
 - enrollment_id 仅在首帧读取，整段会话沿用同一目标说话人。
-- 若 resIdList[0] 未注册或已过期，服务端默认静默回退为普通 ASR（仅记 WARN，不返回 error），避免长连接因陈旧 id 中断。默认本地缓存下 enrollment_id 有 TTL（默认 3600 秒、每次使用续期）且服务重启即失效；下沉链路中缺失 RAG-ASR embedding 也按同一兼容语义处理。完整生命周期（存储/有效期/容量/删除）见 [API 总览](api-reference.md) 注册接口的“生命周期”。
-- resIdList 含多个 id 时只用第一个，不做多说话人分离。
-- 未携带 resIdList 时为普通 ASR。
+- 若 `parameter.asr_config.enrollment_id` 未注册或已过期，服务端默认静默回退为普通 ASR（仅记 WARN，不返回 error），避免长连接因陈旧 id 中断。默认本地缓存下 enrollment_id 有 TTL（默认 3600 秒、每次使用续期）且服务重启即失效；下沉链路中缺失 RAG-ASR embedding 也按同一兼容语义处理。完整生命周期（存储/有效期/容量/删除）见 [API 总览](api-reference.md) 注册接口的“生命周期”。
+- `header.resIdList` 不再作为目标说话人字段；若存在仅记录并忽略。
+- 未携带 `parameter.asr_config.enrollment_id` 时为普通 ASR。
 
 ## 服务端响应
 
@@ -360,7 +367,7 @@ result 示例（最终结果）：
 
 | 限制 | 说明 |
 |---|---|
-| resIdList 多说话人 | resIdList 仅取首个作目标说话人（TS-ASR），其余忽略；当前单路 ASR 不做多说话人分离 |
+| resIdList | 已废弃，仅记录并忽略；目标说话人请使用 `parameter.asr_config.enrollment_id` |
 | parameter.engine | 讯飞引擎透传参数（如 wdec_param_LanguageTypeChoice、wrec_param_language_name）在本服务无对应能力，仅记录日志，不影响识别；如需按连接调参请改用 parameter.asr_config（见配置覆写章节） |
 | 词级时间戳 | 见降级说明，非逐词真实值 |
 | 鉴权 | 无内置鉴权，需在网关层实现访问控制 |
@@ -393,7 +400,7 @@ python docs/examples/ws_ast_v3.py sample.wav \
   --hotwords "挚音科技,张硕"
 ```
 
-目标说话人：先注册拿到 id，再用 `--enrollment-id` 传入（脚本会写进首帧 `header.resIdList[0]`）：
+目标说话人：先注册拿到 id，再用 `--enrollment-id` 传入（脚本会写进首帧 `parameter.asr_config.enrollment_id`）：
 
 ```bash
 curl -X POST http://172.16.0.3:8080/api/asr/enrollment -F "audio=@speaker_enroll.wav"
